@@ -1,9 +1,9 @@
 {
-  "version": "1.2.335",
+  "version": "1.2.336",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.335 (2026-09-04) - Implement lazy loading for cost engine (spec 957)"
+    "1.2.336 (2026-09-04) - Implement pagination for cost engine (spec 958)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
