@@ -1,9 +1,9 @@
 {
-  "version": "1.2.318",
+  "version": "1.2.319",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.318 (2026-09-04) - Implement recent items for recovery drill (spec 941)"
+    "1.2.319 (2026-09-04) - Implement undo action for recovery drill (spec 942)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
