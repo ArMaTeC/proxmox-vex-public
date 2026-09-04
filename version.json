@@ -1,9 +1,9 @@
 {
-  "version": "1.2.357",
+  "version": "1.2.358",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.357 (2026-09-04) - Implement API tokens dashboard widget (spec 979)"
+    "1.2.358 (2026-09-04) - Implement API tokens alert channel (spec 980)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
