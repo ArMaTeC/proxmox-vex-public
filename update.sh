@@ -3,10 +3,10 @@
 # --------------------------------------------------------------------
 # File:        update.sh
 # Project:     ProxmoxVEx
-# Version:     1.2.303
+# Version:     1.2.304
 # Build:       2026.09.04
 # Description: Update SH source
-# Docs:        https://proxmoxvex.local/docs
+# Docs:        https://github.com/ArMaTeC/proxmox-vex-public#readme
 # Generated:   2026-09-04
 # --------------------------------------------------------------------
 # --- ProxmoxVEx auto-header end ---
@@ -52,8 +52,8 @@ NC='\033[0m'
 GITHUB_BRANCH="${ProxmoxVEx_BRANCH:-main}"
 
 # Raw content and archive URLs for the selected branch.
+# 1000-local-release-mirror: update via the local ProxmoxVEx mirror.
 GITHUB_RAW="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/${GITHUB_BRANCH}"
-# Local release mirror placeholder (see speckit for endpoint implementation)
 GITHUB_ARCHIVE="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/${GITHUB_BRANCH}/dist/ProxmoxVEx-latest.tar.gz"
 
 
@@ -105,7 +105,7 @@ LATEST_VERSION=$(curl -s "$GITHUB_RAW/version.json" 2>/dev/null | grep -o '"vers
 
 if [ -z "$LATEST_VERSION" ]; then
     echo -e "${RED}Failed${NC}"
-    echo "Could not reach GitHub. Check your internet connection."
+    echo "Could not reach the update server. Check your ProxmoxVEx mirror."
     exit 1
 fi
 
@@ -171,7 +171,7 @@ TMPDIR=$(mktemp -d)
 ARCHIVE="$TMPDIR/ProxmoxVEx.tar.gz"
 
 if curl -sfL "$GITHUB_ARCHIVE" -o "$ARCHIVE" 2>/dev/null; then
-    echo -e "${GREEN}OK (GitHub)${NC}"
+    echo -e "${GREEN}OK (mirror)${NC}"
 else
     echo -e "${YELLOW}Archive not found, falling back to individual files...${NC}"
     # Fallback: download individual files (for repos without releases)
@@ -186,7 +186,7 @@ else
         echo -n "  $file... "
         if curl -sfL "$GITHUB_RAW/$file" -o "$file.tmp" 2>/dev/null; then
             mv "$file.tmp" "$file"
-            echo -e "${GREEN}OK (GitHub)${NC}"
+            echo -e "${GREEN}OK (mirror)${NC}"
             return 0
         else
             rm -f "$file.tmp"
