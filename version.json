@@ -1,9 +1,9 @@
 {
-  "version": "1.2.307",
+  "version": "1.2.308",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.307 (2026-09-04) - Implement step-by-step wizard for recovery drill (spec 939)"
+    "1.2.308 (2026-09-04) - Implement context menu for recovery drill (spec 940)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
