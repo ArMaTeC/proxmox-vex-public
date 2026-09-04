@@ -1,9 +1,9 @@
 {
-  "version": "1.2.353",
+  "version": "1.2.354",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.353 (2026-09-04) - Implement API tokens connector (spec 975)"
+    "1.2.354 (2026-09-04) - Implement API tokens sync (spec 976)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
