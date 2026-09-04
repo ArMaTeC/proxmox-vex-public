@@ -1,9 +1,9 @@
 {
-  "version": "1.2.342",
+  "version": "1.2.343",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.342 (2026-09-04) - Implement memory optimisation for cost engine (spec 964)"
+    "1.2.343 (2026-09-04) - Implement incremental updates for cost engine (spec 965)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
