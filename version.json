@@ -1,9 +1,9 @@
 {
-  "version": "1.2.351",
+  "version": "1.2.352",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.351 (2026-09-04) - Implement webhooks automation workflow (spec 973)"
+    "1.2.352 (2026-09-04) - Implement API tokens export (spec 974)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
