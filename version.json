@@ -1,9 +1,9 @@
 {
-  "version": "1.2.363",
+  "version": "1.2.364",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.363 (2026-09-04) - Implement single-node replicated service (spec 985)"
+    "1.2.364 (2026-09-04) - Implement single-node signed images (spec 986)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
