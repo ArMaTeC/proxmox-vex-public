@@ -1,9 +1,9 @@
 {
-  "version": "1.2.337",
+  "version": "1.2.338",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.337 (2026-09-04) - Implement batching for cost engine (spec 959)"
+    "1.2.338 (2026-09-04) - Implement indexing for cost engine (spec 960)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
