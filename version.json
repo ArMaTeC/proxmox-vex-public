@@ -1,9 +1,9 @@
 {
-  "version": "1.2.367",
+  "version": "1.2.368",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.367 (2026-09-04) - Implement single-node CD pipeline (spec 989)"
+    "1.2.368 (2026-09-04) - Implement single-node upgrade path (spec 990)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
