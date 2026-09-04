@@ -1,9 +1,9 @@
 {
-  "version": "1.2.340",
+  "version": "1.2.341",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.340 (2026-09-04) - Implement connection pooling for cost engine (spec 962)"
+    "1.2.341 (2026-09-04) - Implement async workers for cost engine (spec 963)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
