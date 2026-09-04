@@ -1,9 +1,9 @@
 {
-  "version": "1.2.312",
+  "version": "1.2.313",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.312 (2026-09-04) - Implement one-click apply for recovery drill (spec 944)"
+    "1.2.313 (2026-09-04) - Implement smart defaults for recovery drill (spec 945)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
