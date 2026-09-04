@@ -6,7 +6,7 @@
 # Version:     1.2.304
 # Build:       2026.09.04
 # Description: Update SH source
-# Docs:        https://github.com/ArMaTeC/proxmox-vex-public#readme
+# Docs:        https://proxmoxvex.local/docs
 # Generated:   2026-09-04
 # --------------------------------------------------------------------
 # --- ProxmoxVEx auto-header end ---
@@ -54,7 +54,7 @@ GITHUB_BRANCH="${ProxmoxVEx_BRANCH:-main}"
 # Raw content and archive URLs for the selected branch.
 # 1000-local-release-mirror: update via the local ProxmoxVEx mirror.
 GITHUB_RAW="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/${GITHUB_BRANCH}"
-GITHUB_ARCHIVE="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/${GITHUB_BRANCH}/dist/ProxmoxVEx-latest.tar.gz"
+GITHUB_ARCHIVE="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/main/dist/ProxmoxVEx-latest.tar.gz"
 
 
 

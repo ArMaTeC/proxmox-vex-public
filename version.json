@@ -1,9 +1,9 @@
 {
-  "version": "1.2.304",
+  "version": "1.2.305",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.304 (2026-09-04) - Local release and documentation mirror (spec 1000)"
+    "1.2.305 (2026-09-04) - Implement compare view for update rollout (spec 937)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
