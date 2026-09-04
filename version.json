@@ -1,9 +1,9 @@
 {
-  "version": "1.2.377",
+  "version": "1.2.378",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.377 (2026-09-04) - Implement HA CI pipeline (spec 998)"
+    "1.2.378 (2026-09-04) - Implement HA CD pipeline (spec 999)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
