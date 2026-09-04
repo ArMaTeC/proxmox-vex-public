@@ -1,9 +1,9 @@
 {
-  "version": "1.2.359",
+  "version": "1.2.360",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.359 (2026-09-04) - Implement API tokens policy adapter (spec 981)"
+    "1.2.360 (2026-09-04) - Implement API tokens role mapping (spec 982)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
