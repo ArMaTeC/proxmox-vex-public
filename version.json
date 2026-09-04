@@ -3,7 +3,9 @@
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.320 (2026-09-04) - Implement quick filter for recovery drill (spec 943)"
+    "1.2.320 (2026-09-04) - Increase VM/CT indent under sidebar host nodes",
+    "1.2.320 (2026-09-04) - Fix license key not persisting: anchor CONFIG_DIR to the project root (overridable via PROXMOXVEX_CONFIG_DIR) so the AES-256 key file is stable across launch directories, and promote keys left in a CWD-relative ./config instead of generating a fresh key that orphans the encrypted license",
+    "1.2.320 (2026-09-04) - Implement one-click apply for recovery drill (spec 944)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
