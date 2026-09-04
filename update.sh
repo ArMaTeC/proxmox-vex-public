@@ -201,7 +201,7 @@ else
     # it (e.g. a freshly-added sponsor logo). update_files is now only the
     # degraded-degraded path when the Trees API itself is unreachable.
     echo "Fetching file list (full tree)..."
-    PACKAGE_FILES=$(curl -s "https://proxmoxvex.local/api/trees/${GITHUB_BRANCH}?recursive=1" 2>/dev/null | python3 -c "
+    PACKAGE_FILES=$(curl -s "https://api.github.com/repos/ArMaTeC/proxmox-vex-public/git/trees/${GITHUB_BRANCH}?recursive=1" 2>/dev/null | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
