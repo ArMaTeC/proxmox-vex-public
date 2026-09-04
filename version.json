@@ -1,9 +1,9 @@
 {
-  "version": "1.2.322",
+  "version": "1.2.323",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.322 (2026-09-04) - Implement live preview for recovery drill (spec 946)"
+    "1.2.323 (2026-09-04) - Implement compare view for recovery drill (spec 947)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
