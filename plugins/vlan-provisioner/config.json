@@ -1,5 +1,0 @@
-{
-    "default_per_page": 20,
-    "max_import_rows": 1000,
-    "audit_retention": 5000
-}

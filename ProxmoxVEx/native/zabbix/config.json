@@ -1,5 +1,0 @@
-{
-  "zabbix_hosts": [],
-  "poll_interval": 30,
-  "read_only": false
-}

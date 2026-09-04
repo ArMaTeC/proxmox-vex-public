@@ -1,8 +1,0 @@
-{
-    "default_ttl": 300,
-    "primary_ns": "ns1",
-    "admin_email": "admin",
-    "_help": {
-        "_note": "default_ttl, primary_ns and admin_email control BIND zone file generation."
-    }
-}
