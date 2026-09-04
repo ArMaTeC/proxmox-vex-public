@@ -1,9 +1,9 @@
 {
-  "version": "1.2.325",
+  "version": "1.2.326",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.325 (2026-09-04) - Full build pipeline"
+    "1.2.326 (2026-09-04) - Implement batching for realtime graph (spec 949)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
