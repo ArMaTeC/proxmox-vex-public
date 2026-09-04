@@ -1,0 +1,13 @@
+{
+  "id": "ups-monitor",
+  "name": "UPS Monitor",
+  "version": "1.0.0",
+  "author": "ProxmoxVEx Team",
+  "description": "Paid datacenter UPS monitoring via NUT. Live battery, load and power readings with configurable thresholds and event history.",
+  "min_ProxmoxVEx": "1.2.23",
+  "has_frontend": true,
+  "frontend_route": "ui",
+  "category": "Monitoring & Health",
+  "min_license_tier": "corporate",
+  "is_paid": true
+}

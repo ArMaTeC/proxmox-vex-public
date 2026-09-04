@@ -1,0 +1,129 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/truenas/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrueNAS</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>TrueNAS</h1>
+            <div style="display:flex;gap:12px;align-items:center">
+                <select id="instanceSelect"></select>
+                <span id="connChip" class="chip">Healthy</span>
+            </div>
+        </header>
+        <div id="message"></div>
+
+        <div class="tabs">
+            <div class="tab active" data-tab="overview" data-i18n="overview">Overview</div>
+            <div class="tab" data-tab="pools" data-i18n="pools">Pools & Disks</div>
+            <div class="tab" data-tab="datasets" data-i18n="datasets">Datasets</div>
+            <div class="tab" data-tab="snapshots" data-i18n="snapshots">Snapshots</div>
+            <div class="tab" data-tab="shares" data-i18n="shares">Shares</div>
+            <div class="tab" data-tab="replication" data-i18n="replication">Replication</div>
+            <div class="tab" data-tab="services" data-i18n="services">Services</div>
+        </div>
+
+        <div class="panel active" id="overviewPanel">
+            <div class="grid" id="overviewStats"></div>
+        </div>
+
+        <div class="panel" id="poolsPanel">
+            <div class="card">
+                <h2 data-i18n="pools">Pools & Disks</h2>
+                <div id="poolsList">
+                    <p class="empty">No pools.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="datasetsPanel">
+            <div class="card">
+                <h2 data-i18n="datasets">Datasets</h2>
+                <form class="form" id="datasetForm">
+                    <label>Name <input type="text" name="name" required /></label>
+                    <button type="submit" data-i18n="add">Add</button>
+                </form>
+                <div class="toolbar"><input type="text" id="datasetSearch" placeholder="Search datasets..." /></div>
+                <div id="datasetsList">
+                    <p class="empty">No datasets.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="snapshotsPanel">
+            <div class="card">
+                <h2 data-i18n="snapshots">Snapshots</h2>
+                <form class="form" id="snapshotForm">
+                    <label>Dataset <input type="text" name="dataset" required /></label>
+                    <label>Name <input type="text" name="name" required /></label>
+                    <label><input type="checkbox" name="recursive" /> Recursive</label>
+                    <button type="submit" data-i18n="add">Add</button>
+                </form>
+                <div class="toolbar"><input type="text" id="snapshotSearch" placeholder="Search snapshots..." /></div>
+                <div id="snapshotsList">
+                    <p class="empty">No snapshots.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="sharesPanel">
+            <div class="card">
+                <h2 data-i18n="shares">Shares</h2>
+                <form class="form" id="shareForm">
+                    <label>Type <select name="type">
+                            <option value="smb">SMB</option>
+                            <option value="nfs">NFS</option>
+                        </select></label>
+                    <label>Name <input type="text" name="name" required /></label>
+                    <label>Path <input type="text" name="path" required /></label>
+                    <button type="submit" data-i18n="add">Add</button>
+                </form>
+                <div id="sharesList">
+                    <p class="empty">No shares.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="replicationPanel">
+            <div class="card">
+                <h2 data-i18n="replication">Replication</h2>
+                <div id="replicationsList">
+                    <p class="empty">No replication tasks.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="servicesPanel">
+            <div class="card">
+                <h2 data-i18n="services">Services</h2>
+                <div id="servicesList">
+                    <p class="empty">No services.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

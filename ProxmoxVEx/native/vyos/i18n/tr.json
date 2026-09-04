@@ -1,0 +1,16 @@
+{
+  "cancel": "İptal",
+  "configured": "Yapılandırıldı",
+  "loading": "Yükleniyor...",
+  "overview": "Genel Bakış",
+  "save": "Kaydet",
+  "status": "Durum",
+  "title": "VyOS",
+  "unconfigured": "Yapılandırılmadı",
+  "interfaces": "Arayüzler",
+  "routes": "Yollar",
+  "loaded_status": "Loaded %s (%s)",
+  "failed_to_load": "Failed to load %s: %s",
+  "error_loading": "Error loading %s: %s",
+  "unknown_error": "unknown error"
+}

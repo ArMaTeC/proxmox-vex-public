@@ -1,0 +1,12 @@
+{
+  "zabbix_hosts": [
+    {
+      "name": "zabbix-01",
+      "url": "https://zabbix.local",
+      "api_token": "REPLACE_WITH_ZABBIX_TOKEN",
+      "verify_tls": true
+    }
+  ],
+  "poll_interval": 30,
+  "read_only": false
+}

@@ -1,0 +1,16 @@
+{
+  "cancel": "إلغاء",
+  "configured": "مُهيأ",
+  "loading": "جاري التحميل...",
+  "overview": "نظرة عامة",
+  "save": "حفظ",
+  "status": "الحالة",
+  "title": "VyOS",
+  "unconfigured": "غير مُهيأ",
+  "interfaces": "الواجهات",
+  "routes": "المسارات",
+  "loaded_status": "Loaded %s (%s)",
+  "failed_to_load": "Failed to load %s: %s",
+  "error_loading": "Error loading %s: %s",
+  "unknown_error": "unknown error"
+}

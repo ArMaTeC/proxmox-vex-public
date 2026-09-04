@@ -1,0 +1,12 @@
+{
+    "id": "maintenance-windows",
+    "name": "Maintenance Windows",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Define maintenance windows that suppress alerts and block disruptive operations.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Automation",
+    "min_license_tier": "basic"
+}

@@ -1,0 +1,1224 @@
+/* --- ProxmoxVEx auto-header start ---
+ * -------------------------------------------------------------------
+ * File:        ProxmoxVEx/native/opnsense/ui.css
+ * Project:     ProxmoxVEx
+ * Version:     1.2.303
+ * Build:       2026.09.04
+ * Description: Ui CSS source
+ * Docs:        https://proxmoxvex.local/docs
+ * Generated:   2026-09-04
+ * -------------------------------------------------------------------
+ * --- ProxmoxVEx auto-header end --- */
+:root {
+  --accent: #FF4500;
+  --bg: #09090B;
+  --card: #18181B;
+  --border: #27272A;
+  --text: #FAFAFA;
+  --muted: #A1A1AA;
+  --green: #10B981;
+  --red: #EF4444;
+  --yellow: #F59E0B;
+  --blue: #3B82F6;
+  --row-hover: rgba(255, 69, 0, 0.05);
+}
+
+html.theme-light {
+  --bg: #F4F4F5;
+  --card: #FFFFFF;
+  --border: #E4E4E7;
+  --text: #18181B;
+  --muted: #71717A;
+  --accent: #FF4500;
+  --row-hover: rgba(255, 69, 0, 0.05);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- shell ----------------------------------------------------- */
+.shell {
+  padding: 20px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.header h1 {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.header h1 .accent {
+  color: var(--accent);
+}
+
+.conn {
+  flex: 1;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conn b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* ---------- buttons --------------------------------------------------- */
+.btn {
+  appearance: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+  transition: border-color .15s ease, background .15s ease, transform .1s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn:hover {
+  border-color: var(--accent);
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn[aria-busy="true"] {
+  color: var(--muted);
+  border-color: var(--border);
+  cursor: wait;
+}
+
+/* Bumped from --accent (#e57000) to a deeper orange so #fff text clears WCAG AA. */
+.btn-primary {
+  background: #b75300;
+  border-color: #b75300;
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn-primary:hover {
+  background: #9a4500;
+  border-color: #9a4500;
+}
+
+/* ---------- tabs ------------------------------------------------------ */
+.tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+  overflow-x: auto;
+}
+
+.tab {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 10px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease;
+  white-space: nowrap;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+/* ---------- cards ----------------------------------------------------- */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.card .title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+
+.card .lead {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--text);
+  margin: 0 0 4px;
+  word-break: break-word;
+}
+
+.card .lead .accent {
+  color: var(--accent);
+}
+
+.card .sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+/* ---------- grid system ---------------------------------------------- */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 12px;
+}
+
+.span-3 {
+  grid-column: span 3;
+}
+
+.span-4 {
+  grid-column: span 4;
+}
+
+.span-6 {
+  grid-column: span 6;
+}
+
+.span-8 {
+  grid-column: span 8;
+}
+
+.span-12 {
+  grid-column: span 12;
+}
+
+.section-title {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 12px 0 4px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.section-title b {
+  color: var(--text);
+  font-weight: 700;
+  margin-right: 6px;
+}
+
+/* ---------- badges (status chips) ------------------------------------ */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 600;
+  gap: 6px;
+}
+
+.badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: currentColor;
+}
+
+/* Badge foreground colours are slightly lighter than the raw token so the
+     low-opacity rgba background still clears WCAG AA on --card. */
+.badge-green {
+  background: rgba(16, 185, 129, 0.15);
+  color: #10B981;
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.4);
+}
+
+.badge-red {
+  background: rgba(239, 68, 68, 0.15);
+  color: #EF4444;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.4);
+}
+
+.badge-yellow {
+  background: rgba(245, 158, 11, 0.15);
+  color: #F59E0B;
+  box-shadow: 0 0 8px rgba(245, 158, 11, 0.4);
+}
+
+.badge-blue {
+  background: rgba(59, 130, 246, 0.15);
+  color: #3B82F6;
+  box-shadow: 0 0 8px rgba(59, 130, 246, 0.4);
+}
+
+.badge-muted {
+  background: rgba(113, 113, 122, .18);
+  color: var(--muted);
+}
+
+html.theme-light .badge-green {
+  color: #15803d;
+}
+
+html.theme-light .badge-red {
+  color: #b91c1c;
+}
+
+html.theme-light .badge-yellow {
+  color: #92400e;
+}
+
+html.theme-light .badge-blue {
+  color: #1d4ed8;
+}
+
+.chip-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* ---------- meters ---------------------------------------------------- */
+.meter {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: baseline;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.meter .label {
+  color: var(--muted);
+}
+
+.meter .value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.meter .bar {
+  grid-column: 1 / -1;
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.meter .bar>i {
+  display: block;
+  height: 100%;
+  background: var(--green);
+  transition: width .6s ease;
+}
+
+.meter.high .bar>i {
+  background: var(--yellow);
+}
+
+.meter.crit .bar>i {
+  background: var(--red);
+}
+
+/* ---------- tables ---------------------------------------------------- */
+.tt {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 4px;
+}
+
+.tt caption {
+  display: none;
+}
+
+.tt th,
+.tt td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  vertical-align: top;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.tt th {
+  font-size: 11px;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+.tt tbody tr:hover {
+  background: var(--row-hover);
+}
+
+.tt td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.tt td.dim {
+  color: var(--muted);
+}
+
+.tt b {
+  font-weight: 600;
+}
+
+.tt code,
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+/* ---------- sparklines + chart -------------------------------------- */
+.spark {
+  display: block;
+  height: 18px;
+  width: 80px;
+}
+
+.spark path.rx {
+  fill: rgba(34, 197, 94, .15);
+  stroke: var(--green);
+  stroke-width: 1;
+}
+
+.spark path.tx {
+  fill: rgba(59, 130, 246, .15);
+  stroke: var(--blue);
+  stroke-width: 1;
+}
+
+.rate {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+/* Use lighter green/blue tones so rate readings clear WCAG AA on --card. */
+.rate .rx {
+  color: #4ade80;
+}
+
+.rate .tx {
+  color: #93c5fd;
+}
+
+html.theme-light .rate .rx {
+  color: #15803d;
+}
+
+html.theme-light .rate .tx {
+  color: #1d4ed8;
+}
+
+.chart-card svg.area-chart {
+  width: 100%;
+  height: 240px;
+  display: block;
+}
+
+.chart-card .legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 8px;
+}
+
+.chart-card .legend .dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+.chart-card .axis text {
+  fill: var(--muted);
+  font-size: 10px;
+  font-family: inherit;
+}
+
+.chart-card .axis line {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.chart-card .grid-line {
+  stroke: var(--border);
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+  opacity: .6;
+}
+
+/* ---------- drilldown dialog --------------------------------------- */
+dialog.drilldown {
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 0;
+  width: min(960px, 92vw);
+  max-height: 90vh;
+  overflow: auto;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+dialog.drilldown::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+dialog.drilldown .dl-head {
+  position: sticky;
+  top: 0;
+  background: var(--card);
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+dialog.drilldown .dl-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+dialog.drilldown .dl-head h2 .label {
+  color: var(--muted);
+  font-weight: 500;
+  margin-left: 6px;
+  font-size: 12px;
+}
+
+dialog.drilldown .dl-body {
+  padding: 18px;
+}
+
+dialog.drilldown .dl-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+dialog.drilldown .stat {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+dialog.drilldown .stat .k {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+dialog.drilldown .stat .v {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  margin-top: 4px;
+  word-break: break-word;
+}
+
+dialog.drilldown svg.dl-chart {
+  width: 100%;
+  height: 220px;
+  display: block;
+}
+
+dialog.drilldown .dl-empty {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 20px;
+  text-align: center;
+}
+
+@media (max-width: 768px) {
+  dialog.drilldown .dl-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.iface-link {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  transition: text-decoration-color .15s ease, color .15s ease;
+}
+
+.iface-link:hover {
+  color: var(--accent);
+  text-decoration-color: var(--accent);
+}
+
+.iface-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ---------- log viewer ----------------------------------------------- */
+.log-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.log-toolbar input[type="search"],
+.log-toolbar select {
+  appearance: none;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  padding: 6px 10px;
+  font-family: inherit;
+}
+
+.log-toolbar input[type="search"] {
+  min-width: 220px;
+}
+
+.log-toolbar input:focus-visible,
+.log-toolbar select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.log-toolbar .summary {
+  color: var(--muted);
+  font-size: 12px;
+  margin-left: auto;
+}
+
+/* ---------- banners (errors / empty) -------------------------------- */
+.banner {
+  grid-column: 1 / -1;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--red);
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--red);
+  font-size: 13px;
+}
+
+.banner b {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.banner.dim {
+  border-color: var(--border);
+  background: var(--card);
+  color: var(--muted);
+}
+
+/* ---------- skeletons ------------------------------------------------ */
+.skeleton {
+  background: linear-gradient(90deg, var(--border) 0%, var(--row-hover) 50%, var(--border) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+  height: 14px;
+  border-radius: 4px;
+}
+
+.skeleton.lg {
+  height: 24px;
+  width: 60%;
+}
+
+.skeleton.xl {
+  height: 36px;
+  width: 80%;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
+
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+  }
+}
+
+/* ---------- responsive ----------------------------------------------- */
+@media (max-width: 1280px) {
+  .span-3 {
+    grid-column: span 4;
+  }
+
+  .span-4 {
+    grid-column: span 6;
+  }
+}
+
+@media (max-width: 1024px) {
+  .grid {
+    grid-template-columns: repeat(6, 1fr);
+  }
+
+  .span-3 {
+    grid-column: span 3;
+  }
+
+  .span-4 {
+    grid-column: span 6;
+  }
+
+  .span-6 {
+    grid-column: span 6;
+  }
+
+  .span-8 {
+    grid-column: span 6;
+  }
+
+  .conn {
+    display: none;
+  }
+}
+
+@media (max-width: 768px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .span-3,
+  .span-4,
+  .span-6,
+  .span-8 {
+    grid-column: span 1;
+  }
+
+  .shell {
+    padding: 14px;
+  }
+
+  .header h1 {
+    font-size: 16px;
+  }
+}
+
+.vh {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ============== v1.13.0 polish + cluster mode ====================== */
+
+/* Stronger focus ring — applies uniformly to interactive surfaces.
+     Double-shadow trick: inner shadow == bg (gap), outer == accent ring.
+     :focus-visible only so mouse clicks don't trail rings around. */
+.btn:focus-visible,
+.tab:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[role="tab"]:focus-visible,
+[role="button"]:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--bg),
+    0 0 0 4px var(--accent);
+}
+
+/* Override the older `.tab:focus-visible { outline: ... }` declarations to
+     stop them painting a second ring inside the tab strip. */
+.tab:focus-visible {
+  outline: none;
+}
+
+.btn:focus-visible {
+  outline: none;
+}
+
+/* Tactile press — Emil rule: real buttons depress under the cursor.
+     Custom ease-out curve (0.23, 1, 0.32, 1) — punchier than the default. */
+.btn {
+  transition: border-color .15s ease, background .15s ease,
+    transform 120ms cubic-bezier(0.23, 1, 0.32, 1),
+    box-shadow 120ms ease;
+}
+
+.btn:active:not([disabled]):not([aria-busy="true"]) {
+  transform: scale(0.97);
+}
+
+/* Tab switch — micro fade-in on the grid panel so the swap doesn't feel
+     instantaneous-but-jarring. 140ms is below human perception of slowness. */
+#grid {
+  transition: opacity 140ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+#grid[aria-busy="true"] {
+  opacity: 0.6;
+}
+
+/* Refresh button spins while loading. Only when it's actually busy. */
+@keyframes refresh-spin {
+  from {
+    transform: rotate(0);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+#btn-refresh[aria-busy="true"] svg,
+#btn-refresh[aria-busy="true"] .refresh-glyph {
+  animation: refresh-spin 1s linear infinite;
+}
+
+/* Card title — bump weight and tighten letterspacing so the label/value
+     hierarchy reads from across the room. */
+.card .title {
+  letter-spacing: 0.08em;
+}
+
+.card .lead {
+  letter-spacing: -0.015em;
+  font-feature-settings: "tnum" 1, "cv11" 1;
+}
+
+/* Tables — make all numeric columns tabular by default. The plugin
+     mixes hand-tagged `.num` cells with un-tagged ones; this catches the
+     stragglers without per-cell churn. */
+.tt td {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Host-selector dropdown (multi-host / cluster mode only) ──────────
+     Shown in the header bar when ≥2 OPNsense hosts are configured.
+     Single-host setups never see this element.                          */
+.host-selector {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.host-selector-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+  white-space: nowrap;
+}
+
+.host-selector-btn:hover {
+  border-color: var(--accent);
+}
+
+.host-selector-btn .hs-role {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-left: 2px;
+}
+
+.host-selector-btn .hs-role.master {
+  background: rgba(229, 112, 0, .18);
+  color: var(--accent);
+}
+
+.host-selector-btn .hs-role.backup {
+  background: rgba(59, 130, 246, .18);
+  color: #93c5fd;
+}
+
+.host-selector-btn .hs-role.unknown,
+.host-selector-btn .hs-role.disabled {
+  background: rgba(113, 113, 122, .18);
+  color: var(--muted);
+}
+
+.host-selector-caret {
+  width: 10px;
+  height: 6px;
+  fill: var(--muted);
+  transition: transform .15s;
+  flex-shrink: 0;
+}
+
+.host-selector-btn[aria-expanded="true"] .host-selector-caret {
+  transform: rotate(180deg);
+}
+
+/* Divergence pill next to the button */
+.hs-diverge-pill {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.hs-diverge-pill.has-error {
+  color: #fca5a5;
+}
+
+.hs-diverge-pill.has-warning {
+  color: #fcd34d;
+}
+
+html.theme-light .hs-diverge-pill.has-error {
+  color: #b91c1c;
+}
+
+html.theme-light .hs-diverge-pill.has-warning {
+  color: #92400e;
+}
+
+/* Dropdown menu */
+.host-selector-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 200px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 999;
+  padding: 4px;
+  animation: hs-in .13s ease-out;
+  transform-origin: top right;
+}
+
+@keyframes hs-in {
+  from {
+    opacity: 0;
+    transform: scale(.95) translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.host-selector-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: none;
+  background: none;
+  color: var(--text-secondary, var(--muted));
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  transition: background .12s, color .12s;
+  white-space: nowrap;
+}
+
+.host-selector-item:hover {
+  background: var(--row-hover);
+  color: var(--text);
+}
+
+.host-selector-item.active {
+  background: rgba(229, 112, 0, .1);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.host-selector-item .hs-item-role {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  margin-left: auto;
+}
+
+.host-selector-item .hs-item-role.master {
+  background: rgba(229, 112, 0, .18);
+  color: var(--accent);
+}
+
+.host-selector-item .hs-item-role.backup {
+  background: rgba(59, 130, 246, .18);
+  color: #93c5fd;
+}
+
+.host-selector-item .hs-item-role.unknown,
+.host-selector-item .hs-item-role.disabled {
+  background: rgba(113, 113, 122, .18);
+  color: var(--muted);
+}
+
+/* Cluster overview — dual-column wrapper. Each node card is a full
+     column on its own grid; divergence card sits below spanning both. */
+.cluster-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 900px) {
+  .cluster-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.node-col {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+}
+
+.node-col .col-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 6px 4px 0;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+  margin-bottom: 2px;
+}
+
+.node-col .col-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.node-col .col-head h2 .accent {
+  color: var(--accent);
+}
+
+.node-col[data-role="master"] .col-head {
+  border-bottom-color: var(--accent);
+}
+
+.node-col .err-card {
+  background: var(--card);
+  border: 1px solid var(--red);
+  border-radius: 8px;
+  padding: 14px;
+  font-size: 12px;
+}
+
+.node-col .err-card b {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--red);
+}
+
+.diverge-card {
+  grid-column: 1 / -1;
+}
+
+.diverge-card .tt tr[data-severity="error"] {
+  background: rgba(239, 68, 68, .07);
+}
+
+.diverge-card .tt tr[data-severity="warning"] {
+  background: rgba(234, 179, 8, .07);
+}
+
+.diverge-card .tt tr[data-severity="info"] {
+  background: transparent;
+}
+
+.diverge-card .tt td.sev {
+  font-weight: 700;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.diverge-card .tt td.sev[data-severity="error"] {
+  color: #fca5a5;
+}
+
+.diverge-card .tt td.sev[data-severity="warning"] {
+  color: #fcd34d;
+}
+
+.diverge-card .tt td.sev[data-severity="info"] {
+  color: var(--muted);
+}
+
+html.theme-light .diverge-card .tt td.sev[data-severity="error"] {
+  color: #b91c1c;
+}
+
+html.theme-light .diverge-card .tt td.sev[data-severity="warning"] {
+  color: #92400e;
+}
+
+/* Per-tab skeleton scaffolds painted BEFORE the fetch settles. They share
+     the existing .skeleton class — these wrappers just give them card-shaped
+     containers so the layout reserves space and content doesn't jump. */
+.skel-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.skel-card .skeleton+.skeleton {
+  margin-top: 8px;
+}
+
+.skel-table .skeleton {
+  height: 28px;
+  margin-top: 4px;
+}
+
+.skel-table .skeleton:first-child {
+  height: 18px;
+  width: 40%;
+  margin-bottom: 8px;
+}
+
+/* Stagger cards in on first paint of each tab. CSS-cascade variant of
+     Framer's staggerChildren — driven entirely by --i, no JS state. */
+@keyframes card-stagger-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+#grid>.card,
+#grid>.cluster-grid>.node-col>.card,
+#grid>.diverge-card {
+  animation: card-stagger-in 280ms cubic-bezier(0.23, 1, 0.32, 1) backwards;
+  animation-delay: calc(var(--i, 0) * 35ms);
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+  #grid>.card,
+  #grid>.cluster-grid>.node-col>.card,
+  #grid>.diverge-card {
+    animation: none;
+  }
+}

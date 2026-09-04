@@ -1,0 +1,12 @@
+{
+    "id": "power-manager",
+    "name": "Power Manager",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Control PDU and IPMI power outlets for nodes and document power events.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Infrastructure",
+    "min_license_tier": "advanced"
+}

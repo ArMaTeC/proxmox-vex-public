@@ -1,0 +1,12 @@
+{
+    "id": "webhook-router",
+    "name": "Webhook Router",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Route ProxmoxVEx events to arbitrary HTTP endpoints with filtering, retries, and signatures.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Automation",
+    "min_license_tier": "advanced"
+}

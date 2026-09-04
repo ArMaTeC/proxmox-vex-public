@@ -1,0 +1,12 @@
+{
+    "id": "vm-update-manager",
+    "name": "VM Update Manager",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Manage and automate OS updates for VMs and containers",
+    "min_ProxmoxVEx": "1.2.36",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Compute",
+    "min_license_tier": "advanced"
+}

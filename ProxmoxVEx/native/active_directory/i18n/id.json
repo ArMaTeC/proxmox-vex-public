@@ -1,0 +1,15 @@
+{
+  "cancel": "Batal",
+  "configured": "Terkonfigurasi",
+  "loading": "Memuat...",
+  "overview": "Tinjauan",
+  "save": "Simpan",
+  "status": "Status",
+  "title": "Active Directory",
+  "unconfigured": "Belum dikonfigurasi",
+  "users": "Pengguna",
+  "groups": "Grup",
+  "error": "Error: %s",
+  "loaded": "Loaded %s",
+  "request_failed": "Request failed: %s"
+}

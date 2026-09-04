@@ -1,0 +1,10 @@
+{
+    "interval": 60,
+    "format": "prometheus",
+    "path": "/metrics",
+    "_help": {
+        "interval": "Export/scrape interval in seconds.",
+        "format": "Metrics output format.",
+        "path": "Metrics endpoint path."
+    }
+}

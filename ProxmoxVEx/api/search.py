@@ -1,0 +1,1085 @@
+# --- ProxmoxVEx auto-header start ---
+# --------------------------------------------------------------------
+# File:        ProxmoxVEx/api/search.py
+# Project:     ProxmoxVEx
+# Version:     1.2.303
+# Build:       2026.09.04
+# Description: search, favorites & tags routes - split from monolith...
+# Docs:        https://proxmoxvex.local/docs
+# Generated:   2026-09-04
+# --------------------------------------------------------------------
+# --- ProxmoxVEx auto-header end ---
+"""search, favorites & tags routes - split from monolith dec 2025"""
+
+import gzip
+import json
+import logging
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+from flask import Blueprint, jsonify, request
+
+from ProxmoxVEx.api.helpers import check_cluster_access, safe_error
+from ProxmoxVEx.constants import CONFIG_DIR
+from ProxmoxVEx.core.db import get_db
+from ProxmoxVEx.globals import cluster_managers
+from ProxmoxVEx.models.permissions import ROLE_ADMIN
+from ProxmoxVEx.utils.audit import log_audit
+from ProxmoxVEx.utils.auth import load_users, require_auth
+from ProxmoxVEx.utils.rbac import get_user_clusters
+
+bp = Blueprint("search", __name__)
+
+
+# Search index cache
+class SearchIndexCache:
+    """In-memory TTL cache for search index results."""
+
+    def __init__(self, ttl=300):
+        self._ttl = ttl
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        """Return a cached value if it has not expired."""
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            if time.time() > entry["expires"]:
+                self._cache.pop(key, None)
+                return None
+            raw = entry["value"]
+            if isinstance(raw, bytes):
+                return decompress_search_index(raw)
+            return raw
+
+    def set(self, key, value):
+        """Store a value in the cache with TTL."""
+        with self._lock:
+            if isinstance(value, list):
+                value = compress_search_index(value)
+            self._cache[key] = {"value": value, "expires": time.time() + self._ttl}
+
+
+search_index_cache = SearchIndexCache()
+
+# In-memory search index keyed by normalized token for faster lookups.
+search_index = {}
+
+
+def build_search_index(results):
+    """Build an in-memory inverted index from search results."""
+    index = {}
+    for i, result in enumerate(results):
+        tokens = []
+        for key in ("name", "vmid", "node", "type", "status"):
+            value = result.get(key)
+            if value:
+                tokens.append(str(value).lower())
+        for tag in result.get("tags") or []:
+            tag_name = tag.get("name") if isinstance(tag, dict) else tag
+            if tag_name:
+                tokens.append(str(tag_name).lower())
+        for token in set(tokens):
+            index.setdefault(token, []).append(i)
+    return index
+
+
+# Async worker pool for building search indexes.
+search_index_executor = ThreadPoolExecutor(max_workers=4)
+
+
+def build_search_index_async(results, callback=None):
+    """Build the search index asynchronously using a worker thread."""
+    future = search_index_executor.submit(build_search_index, results)
+    if callback:
+        future.add_done_callback(lambda f: callback(f.result()))
+    return future
+
+
+class SearchIndexEntry:
+    """Memory-optimised search result entry with __slots__."""
+
+    __slots__ = ("name", "vmid", "node", "type", "status", "tags")
+
+    def __init__(self, name=None, vmid=None, node=None, type=None, status=None, tags=None):
+        self.name = name
+        self.vmid = vmid
+        self.node = node
+        self.type = type
+        self.status = status
+        self.tags = tags
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "vmid": self.vmid,
+            "node": self.node,
+            "type": self.type,
+            "status": self.status,
+            "tags": self.tags,
+        }
+
+
+def compact_search_results(results):
+    """Convert raw result dicts to memory-optimised SearchIndexEntry objects."""
+    return [
+        SearchIndexEntry(
+            name=r.get("name"),
+            vmid=r.get("vmid"),
+            node=r.get("node"),
+            type=r.get("type"),
+            status=r.get("status"),
+            tags=r.get("tags"),
+        )
+        for r in results
+    ]
+
+
+# Version timestamp for incremental search index updates.
+search_index_version = 0
+
+
+def update_search_index_incrementally(existing, new_entries, removed_ids):
+    """Update the search index with new/changed entries and removed ids."""
+    global search_index_version
+    lookup = {r.get("id") or r.get("vmid"): r for r in existing if r.get("id") or r.get("vmid")}
+    for entry in new_entries:
+        key = entry.get("id") or entry.get("vmid")
+        if key:
+            lookup[key] = entry
+    for rid in removed_ids:
+        lookup.pop(rid, None)
+    search_index_version += 1
+    return list(lookup.values())
+
+
+def compress_search_index(data):
+    """Compress search index data with gzip."""
+    return gzip.compress(json.dumps(data).encode("utf-8"))
+
+
+def decompress_search_index(compressed):
+    """Decompress gzip-compressed search index data."""
+    return json.loads(gzip.decompress(compressed).decode("utf-8"))
+
+
+# Connection pool for search index backend queries.
+search_connection_pool = {}
+
+
+def get_search_connection_pool(cluster_id, factory):
+    """Return a cached connection for the given cluster, creating it if absent."""
+    if cluster_id not in search_connection_pool:
+        search_connection_pool[cluster_id] = factory()
+    return search_connection_pool[cluster_id]
+
+
+def get_cached_search_index(cache_key, generator):
+    """Return a cached search index or build and cache it."""
+    cached = search_index_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = generator()
+    search_index_cache.set(cache_key, result)
+    return result
+
+
+class LazySearchIndexLoader:
+    """Lazy loader that defers search index chunk generation until requested."""
+
+    def __init__(self, generator, chunk_size=50):
+        self._generator = generator
+        self._chunk_size = chunk_size
+        self._chunks = []
+
+    def get_chunk(self, index):
+        """Return a specific chunk, materializing up to that point."""
+        while len(self._chunks) <= index:
+            chunk = []
+            try:
+                for _ in range(self._chunk_size):
+                    chunk.append(next(self._generator))
+            except StopIteration:
+                break
+            if not chunk:
+                break
+            self._chunks.append(chunk)
+        if index < len(self._chunks):
+            return self._chunks[index]
+        return []
+
+    def total_chunks(self):
+        """Materialize all chunks and return the total count."""
+        i = 0
+        while True:
+            chunk = self.get_chunk(i)
+            if not chunk:
+                break
+            i += 1
+        return i
+
+
+def load_search_index_lazy(data, chunk_size=50):
+    """Wrap a search index data list in a lazy chunk loader."""
+    if not isinstance(data, list):
+        data = []
+    return LazySearchIndexLoader(iter(data), chunk_size=chunk_size)
+
+
+# ============================================
+
+# User favorites storage
+FAVORITES_FILE = os.path.join(CONFIG_DIR, "user_favorites.json")  # Legacy
+
+
+def load_favorites():
+    """Load user favorites from SQLite database
+
+    SQLite migration
+    """
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT * FROM user_favorites")
+
+        favorites = {}
+        for row in cursor.fetchall():
+            username = row["username"]
+            if username not in favorites:
+                favorites[username] = []
+            favorites[username].append({
+                "cluster_id": row["cluster_id"],
+                "vmid": row["vmid"],
+                "vm_type": row["vm_type"],
+                "vm_name": row["vm_name"],
+            })
+
+        return favorites
+    except Exception as e:
+        logging.error(f"Error loading favorites from database: {e}")
+        # Legacy fallback
+        try:
+            if os.path.exists(FAVORITES_FILE):
+                with open(FAVORITES_FILE) as f:
+                    return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_favorites(favorites):
+    """Save user favorites to SQLite database
+
+    SQLite migration
+    """
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+
+        # Clear existing favorites
+        cursor.execute("DELETE FROM user_favorites")
+
+        now = datetime.now().isoformat()
+        for username, user_favs in favorites.items():
+            for fav in user_favs:
+                cursor.execute(
+                    """
+                    INSERT INTO user_favorites
+                    (username, cluster_id, vmid, vm_type, vm_name, added_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        username,
+                        fav.get("cluster_id"),
+                        fav.get("vmid"),
+                        fav.get("vm_type", fav.get("type", "")),
+                        fav.get("vm_name", fav.get("name", "")),
+                        now,
+                    ),
+                )
+
+        db.conn.commit()
+    except Exception as e:
+        logging.error(f"Error saving favorites: {e}")
+
+
+@bp.route("/api/global/search", methods=["GET"])
+@require_auth()
+def global_search():
+    """Search across all clusters for VMs, containers, nodes, storage, and users
+
+    Query params:
+    - q: search query (name, vmid, ip, node name, tags, storage name, username)
+    - type: filter by type (vm, ct, node, storage, user, all) - default: all
+
+    Also supports prefix filters like tag:web, node:pve1, ip:192.168, status:running
+    You can combine tags with comma: tag:web,production (AND logic)
+    """
+    raw_query = request.args.get("q", "").strip()
+    search_type = request.args.get("type", "all").lower()
+
+    if not raw_query or len(raw_query) < 2:
+        return jsonify({"error": "Search query must be at least 2 characters"}), 400
+
+    # Prefix filters - type tag:xxx to search only tags, node:xxx for nodes etc
+    prefix_filter = None
+    query = raw_query.lower()
+    for prefix in ["tag:", "node:", "ip:", "status:"]:
+        if query.startswith(prefix):
+            prefix_filter = prefix[:-1]  # 'tag', 'node', 'ip', 'status'
+            query = query[len(prefix) :].strip()
+            break
+
+    if not query:
+        return jsonify({"error": "Search query is empty after prefix"}), 400
+
+    # You can do tag:web,production to filter by multiple tags at once
+    tag_queries = [t.strip() for t in query.split(",")] if prefix_filter == "tag" else [query]
+
+    results = []
+    user = request.session.get("user", "")
+    users_db = load_users()
+    user_data = users_db.get(user, {})
+    user_data["username"] = user
+    # #285: cluster access is tenant/group-based — resolve via the RBAC helper,
+    # not a non-existent user['clusters'] field. The old read was always [] so
+    # the filter below never fired and non-admins saw every cluster.
+    accessible_clusters = get_user_clusters(user_data)  # None = admin / all
+
+    # Collect tags for the autocomplete dropdown in the frontend
+    all_tags = set()
+
+    for cluster_id, mgr in cluster_managers.items():
+        # Check cluster access - Important for multi-tenant setups
+        if accessible_clusters is not None and cluster_id not in accessible_clusters:
+            continue
+
+        if not mgr.is_connected:
+            continue
+
+        cluster_name = mgr.config.name or cluster_id
+
+        # Search VMs and Containers
+        if search_type in ["all", "vm", "ct"]:
+            try:
+                resources = mgr.get_vm_resources()
+                for r in resources:
+                    name = (r.get("name") or "").lower()
+                    vmid = str(r.get("vmid", ""))
+                    node = (r.get("node") or "").lower()
+                    ip = (r.get("ip") or "").lower()
+                    tags_str = (r.get("tags") or "").lower()
+                    tags_list = [t.strip() for t in tags_str.split(";") if t.strip()] if tags_str else []
+                    status = (r.get("status") or "").lower()
+
+                    # collect tags for autocomplete
+                    for t in tags_list:
+                        all_tags.add(t)
+
+                    # Match based on prefix filter or global search
+                    matched = False
+                    match_field = None
+
+                    if prefix_filter == "tag":
+                        # All tag queries must match (AND logic for multi-tag)
+                        matched = all(any(tq in tag for tag in tags_list) for tq in tag_queries)
+                        if matched:
+                            match_field = "tag"
+                    elif prefix_filter == "node":
+                        matched = query in node
+                        if matched:
+                            match_field = "node"
+                    elif prefix_filter == "ip":
+                        matched = query in ip
+                        if matched:
+                            match_field = "ip"
+                    elif prefix_filter == "status":
+                        matched = status.startswith(query)
+                        if matched:
+                            match_field = "status"
+                    else:
+                        # Global search: match name, vmid, node, ip, AND tags
+                        if query in name:
+                            matched, match_field = True, "name"
+                        elif query == vmid or query in vmid:
+                            matched, match_field = True, "vmid"
+                        elif query in node:
+                            matched, match_field = True, "node"
+                        elif query in ip:
+                            matched, match_field = True, "ip"
+                        elif any(query in tag for tag in tags_list):
+                            matched, match_field = True, "tag"
+
+                    if not matched:
+                        continue
+
+                    # Type filter
+                    vm_type = r.get("type", "qemu")
+                    if search_type == "vm" and vm_type != "qemu":
+                        continue
+                    if search_type == "ct" and vm_type != "lxc":
+                        continue
+
+                    results.append({
+                        "type": "vm" if vm_type == "qemu" else "ct",
+                        "cluster_id": cluster_id,
+                        "cluster_name": cluster_name,
+                        "vmid": r.get("vmid"),
+                        "name": r.get("name"),
+                        "node": r.get("node"),
+                        "status": r.get("status"),
+                        "ip": r.get("ip"),
+                        "tags": r.get("tags", ""),
+                        "cpu": r.get("cpu"),
+                        "mem": r.get("mem"),
+                        "maxmem": r.get("maxmem"),
+                        "match_field": match_field,
+                    })
+            except Exception as e:
+                logging.debug(f"Error searching cluster {cluster_id}: {e}")
+
+        # Search Nodes
+        if search_type in ["all", "node"] and prefix_filter in [None, "node"]:
+            try:
+                for node_name, node_data in (mgr.nodes or {}).items():
+                    if query in node_name.lower():
+                        results.append({
+                            "type": "node",
+                            "cluster_id": cluster_id,
+                            "cluster_name": cluster_name,
+                            "name": node_name,
+                            "status": node_data.get("status", "unknown"),
+                            "cpu": node_data.get("cpu"),
+                            "mem": node_data.get("mem"),
+                            "maxmem": node_data.get("maxmem"),
+                            "match_field": "name",
+                        })
+            except Exception as e:
+                logging.debug(f"Error searching nodes in {cluster_id}: {e}")
+
+        # Search Storage volumes (033: vCenter-style redesign, FR-016 — global
+        # search must cover storage as one of the vCenter "Search in all
+        # environments" object types, not just VMs/CTs/nodes).
+        if search_type in ["all", "storage"] and prefix_filter in [None, "node"]:
+            try:
+                for s in mgr.get_storage_resources():
+                    storage_name = (s.get("storage") or "").lower()
+                    node_name = (s.get("node") or "").lower()
+                    if prefix_filter == "node":
+                        matched, match_field = query in node_name, "node"
+                    else:
+                        matched, match_field = query in storage_name, "name"
+                    if not matched:
+                        continue
+                    results.append({
+                        "type": "storage",
+                        "cluster_id": cluster_id,
+                        "cluster_name": cluster_name,
+                        "name": s.get("storage"),
+                        "node": s.get("node"),
+                        "status": s.get("status", "unknown"),
+                        "disk": s.get("disk"),
+                        "maxdisk": s.get("maxdisk"),
+                        "disk_percent": s.get("disk_percent"),
+                        "match_field": match_field,
+                    })
+            except Exception as e:
+                logging.debug(f"Error searching storage in {cluster_id}: {e}")
+
+    # Search Users (033: vCenter-style redesign, FR-016). Cluster-independent —
+    # only admins searching by name/username; non-admins won't usually need
+    # this but it's harmless since only public profile fields are returned.
+    # Restrict to admins — the user directory (usernames + roles) shouldn't be
+    # exposed to every authenticated user just because global search covers it.
+    if search_type in ["all", "user"] and prefix_filter is None and user_data.get("role") == ROLE_ADMIN:
+        try:
+            for username, udata in users_db.items():
+                display_name = (udata.get("display_name") or "").lower()
+                if query in username.lower() or query in display_name:
+                    results.append({
+                        "type": "user",
+                        "name": username,
+                        "full_name": udata.get("display_name", ""),
+                        "role": udata.get("role", ""),
+                        "match_field": "name" if query in username.lower() else "full_name",
+                    })
+        except Exception as e:
+            logging.debug(f"Error searching users: {e}")
+
+    # Sort by relevance (exact matches first, then partial)
+    def sort_key(r):
+        name = (r.get("name") or str(r.get("vmid", ""))).lower()
+        mf = r.get("match_field", "")
+        # Exact name matches first, then name prefix, then tag matches, then rest
+        if name == query:
+            return (0, name)
+        elif name.startswith(query):
+            return (1, name)
+        elif mf == "tag":
+            return (2, name)
+        elif mf == "vmid":
+            return (3, name)
+        else:
+            return (4, name)
+
+    results.sort(key=sort_key)
+
+    # Show matching tags as clickable suggestions in the UI
+    tag_suggestions = (
+        sorted([t for t in all_tags if query in t])[:10] if not prefix_filter or prefix_filter == "tag" else []
+    )
+
+    # Pagination for search index
+    page = max(1, int(request.args.get("page", 1)))
+    page_size = max(1, min(1000, int(request.args.get("page_size", 100))))
+    total = len(results)
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_results = results[start:end]
+
+    # Batching for search index
+    batch_size = max(1, min(1000, int(request.args.get("batch_size", 0))))
+    batches = None
+    if batch_size:
+        batches = [page_results[i : i + batch_size] for i in range(0, len(page_results), batch_size)]
+
+    return jsonify({
+        "query": raw_query,
+        "count": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size,
+        "batch_size": batch_size if batch_size else None,
+        "batches": batches,
+        "results": page_results,
+        "tag_suggestions": tag_suggestions,
+    })
+
+
+@bp.route("/api/global/summary", methods=["GET"])
+@require_auth()
+def global_summary():
+    """Get summary statistics across all accessible clusters
+
+    Returns aggregate stats for a datacenter-level overview
+    """
+    try:
+        user = request.session.get("user", "")
+        users_db = load_users()
+        user_data = users_db.get(user, {})
+        user_data["username"] = user
+        accessible_clusters = get_user_clusters(user_data)  # None = admin / all
+
+        summary = {
+            "clusters": {"total": 0, "online": 0, "offline": 0},
+            "nodes": {"total": 0, "online": 0, "offline": 0},
+            "vms": {"total": 0, "running": 0, "stopped": 0, "paused": 0},
+            "containers": {"total": 0, "running": 0, "stopped": 0},
+            "resources": {
+                "cpu_total": 0,
+                "cpu_used": 0,
+                "mem_total": 0,
+                "mem_used": 0,
+                "storage_total": 0,
+                "storage_used": 0,
+            },
+            "by_cluster": [],
+        }
+
+        for cluster_id, mgr in cluster_managers.items():
+            # Check cluster access
+            if accessible_clusters is not None and cluster_id not in accessible_clusters:
+                continue
+
+            summary["clusters"]["total"] += 1
+
+            cluster_stats = {
+                "id": cluster_id,
+                "name": getattr(mgr.config, "name", None) or cluster_id,
+                "online": mgr.is_connected if mgr else False,
+                "nodes": 0,
+                "vms": 0,
+                "containers": 0,
+            }
+
+            if mgr and mgr.is_connected:
+                summary["clusters"]["online"] += 1
+
+                # Count nodes - safely handle None
+                nodes = getattr(mgr, "nodes", None) or {}
+                for _node_name, node_data in nodes.items():
+                    if not node_data:
+                        continue
+                    summary["nodes"]["total"] += 1
+                    cluster_stats["nodes"] += 1
+
+                    if node_data.get("status") == "online":
+                        summary["nodes"]["online"] += 1
+                        # Aggregate resources from online nodes
+                        summary["resources"]["cpu_total"] += node_data.get("maxcpu", 0) or 0
+                        cpu_val = node_data.get("cpu", 0) or 0
+                        maxcpu_val = node_data.get("maxcpu", 0) or 0
+                        summary["resources"]["cpu_used"] += cpu_val * maxcpu_val
+                        summary["resources"]["mem_total"] += node_data.get("maxmem", 0) or 0
+                        summary["resources"]["mem_used"] += node_data.get("mem", 0) or 0
+                    else:
+                        summary["nodes"]["offline"] += 1
+
+                # Count VMs
+                try:
+                    resources = mgr.get_vm_resources() or []
+                    for r in resources:
+                        if not r:
+                            continue
+                        if r.get("type") == "qemu":
+                            summary["vms"]["total"] += 1
+                            cluster_stats["vms"] += 1
+                            status = (r.get("status") or "").lower()
+                            if status == "running":
+                                summary["vms"]["running"] += 1
+                            elif status == "paused":
+                                summary["vms"]["paused"] += 1
+                            else:
+                                summary["vms"]["stopped"] += 1
+                        else:
+                            summary["containers"]["total"] += 1
+                            cluster_stats["containers"] += 1
+                            status = (r.get("status") or "").lower()
+                            if status == "running":
+                                summary["containers"]["running"] += 1
+                            else:
+                                summary["containers"]["stopped"] += 1
+                except Exception as e:
+                    logging.warning(f"Error getting VM resources for {cluster_id}: {e}")
+            else:
+                summary["clusters"]["offline"] += 1
+
+            summary["by_cluster"].append(cluster_stats)
+
+        return jsonify(summary)
+    except Exception as e:
+        logging.error(f"global_summary error: {e}")
+        _ = safe_error(e, "Search failed")
+        return jsonify({"error": "Search failed"}), 500
+
+
+@bp.route("/api/user/favorites", methods=["GET"])
+@require_auth()
+def get_favorites():
+    """Get user's favorite/pinned VMs and nodes"""
+    user = request.session.get("user", "")
+    favorites = load_favorites()
+
+    user_favs = favorites.get(
+        user,
+        {
+            "vms": [],  # [{cluster_id, vmid, type}]
+            "nodes": [],  # [{cluster_id, node}]
+            "clusters": [],  # [cluster_id]
+        },
+    )
+
+    return jsonify(user_favs)
+
+
+@bp.route("/api/user/favorites", methods=["POST"])
+@require_auth()
+def update_favorites():
+    """Add or remove a favorite
+
+    Body:
+    - action: 'add' or 'remove'
+    - type: 'vm', 'node', or 'cluster'
+    - cluster_id: Cluster ID
+    - vmid: (for vm) VM ID
+    - vm_type: (for vm) 'qemu' or 'lxc'
+    - node: (for node) Node name
+    """
+    user = request.session.get("user", "")
+    data = request.json or {}
+
+    action = data.get("action", "add")
+    fav_type = data.get("type")
+    cluster_id = data.get("cluster_id")
+
+    if not fav_type or not cluster_id:
+        return jsonify({"error": "type and cluster_id required"}), 400
+
+    favorites = load_favorites()
+
+    if user not in favorites:
+        favorites[user] = {"vms": [], "nodes": [], "clusters": []}
+
+    user_favs = favorites[user]
+
+    if fav_type == "vm":
+        vmid = data.get("vmid")
+        vm_type = data.get("vm_type", "qemu")
+        if not vmid:
+            return jsonify({"error": "vmid required for vm favorites"}), 400
+
+        fav_entry = {"cluster_id": cluster_id, "vmid": vmid, "type": vm_type}
+
+        if action == "add":
+            # Check if already exists
+            if not any(f["cluster_id"] == cluster_id and f["vmid"] == vmid for f in user_favs["vms"]):
+                user_favs["vms"].append(fav_entry)
+        else:
+            user_favs["vms"] = [
+                f for f in user_favs["vms"] if not (f["cluster_id"] == cluster_id and f["vmid"] == vmid)
+            ]
+
+    elif fav_type == "node":
+        node = data.get("node")
+        if not node:
+            return jsonify({"error": "node required for node favorites"}), 400
+
+        fav_entry = {"cluster_id": cluster_id, "node": node}
+
+        if action == "add":
+            if not any(f["cluster_id"] == cluster_id and f["node"] == node for f in user_favs["nodes"]):
+                user_favs["nodes"].append(fav_entry)
+        else:
+            user_favs["nodes"] = [
+                f for f in user_favs["nodes"] if not (f["cluster_id"] == cluster_id and f["node"] == node)
+            ]
+
+    elif fav_type == "cluster":
+        if action == "add":
+            if cluster_id not in user_favs["clusters"]:
+                user_favs["clusters"].append(cluster_id)
+        else:
+            user_favs["clusters"] = [c for c in user_favs["clusters"] if c != cluster_id]
+
+    else:
+        return jsonify({"error": "Invalid type. Use vm, node, or cluster"}), 400
+
+    save_favorites(favorites)
+
+    return jsonify({"success": True, "favorites": user_favs})
+
+
+# ============================================
+# VM Tags / Labels
+# should have added this sooner tbh
+# Tags are stored per-cluster, per-VM in a simple JSON file
+# ============================================
+
+TAGS_FILE = os.path.join(CONFIG_DIR, "vm_tags.json")  # Legacy
+
+
+def load_vm_tags():
+    """Load VM tags from SQLite database
+
+    SQLite migration
+    """
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT * FROM vm_tags")
+
+        tags = {}
+        for row in cursor.fetchall():
+            cluster_id = row["cluster_id"]
+            vmid = str(row["vmid"])
+
+            if cluster_id not in tags:
+                tags[cluster_id] = {}
+            if vmid not in tags[cluster_id]:
+                tags[cluster_id][vmid] = []
+
+            tags[cluster_id][vmid].append({
+                "name": row["tag_name"],
+                "color": row["tag_color"] or TAG_COLORS[hash(row["tag_name"]) % len(TAG_COLORS)],
+            })
+
+        return tags
+    except Exception as e:
+        logging.error(f"Error loading VM tags from database: {e}")
+        # Legacy fallback
+        try:
+            if os.path.exists(TAGS_FILE):
+                with open(TAGS_FILE) as f:
+                    return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_vm_tags(tags):
+    """Save VM tags to SQLite database
+
+    SQLite migration
+    """
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+
+        # Clear existing tags
+        cursor.execute("DELETE FROM vm_tags")
+
+        # Insert all tags
+        for cluster_id, vms in tags.items():
+            for vmid, vm_tags in vms.items():
+                for tag in vm_tags:
+                    tag_name = tag.get("name", tag) if isinstance(tag, dict) else tag
+                    tag_color = tag.get("color", "") if isinstance(tag, dict) else ""
+
+                    cursor.execute(
+                        """
+                        INSERT INTO vm_tags (cluster_id, vmid, tag_name, tag_color)
+                        VALUES (?, ?, ?, ?)
+                    """,
+                        (cluster_id, int(vmid), tag_name, tag_color),
+                    )
+
+        db.conn.commit()
+    except Exception as e:
+        logging.error(f"Error saving VM tags: {e}")
+
+
+# Global tag colors - keeps things consistent
+TAG_COLORS = [
+    "#ef4444",
+    "#f97316",
+    "#eab308",
+    "#22c55e",
+    "#14b8a6",
+    "#3b82f6",
+    "#8b5cf6",
+    "#ec4899",
+    "#6b7280",
+    "#78716c",
+]
+
+
+@bp.route("/api/clusters/<cluster_id>/tags", methods=["GET"])
+@require_auth()
+def get_cluster_tags(cluster_id):
+    """Get all tags used in this cluster
+
+    Returns unique tags with their colors and usage count
+    """
+    # (sec-review) - was unscoped; leaked tags cross-tenant (CWE-285)
+    ok, _ = check_cluster_access(cluster_id)
+    if not ok:
+        return jsonify({"error": "Access denied to this cluster"}), 403
+    tags_db = load_vm_tags()
+    cluster_tags = tags_db.get(cluster_id, {})
+
+    # (#585 cybrwerk): this only ever knew tags assigned through our own UI
+    # (the load_vm_tags store). PVE-native tags set in the VM config never showed up here.
+    # Build a per-VM union of stored + live PVE tags so each VM counts once per tag.
+    per_vm = {}  # vmid -> set(tag names)
+    colors = {}  # tag name -> explicit colour (stored tags may carry one)
+    for vm_key, vm_tags in cluster_tags.items():
+        bucket = per_vm.setdefault(str(vm_key), set())
+        for tag in vm_tags or []:
+            name = ((tag.get("name") if isinstance(tag, dict) else tag) or "").strip()
+            if not name:
+                continue
+            bucket.add(name)
+            if isinstance(tag, dict) and tag.get("color"):
+                colors[name] = tag["color"]
+
+    # merge the live PVE tags (semicolon-separated on each guest)
+    try:
+        mgr = cluster_managers.get(cluster_id)
+        if mgr:
+            for r in mgr.get_vm_resources() or []:
+                raw = r.get("tags")
+                if not raw:
+                    continue
+                parts = raw if isinstance(raw, list) else str(raw).split(";")
+                bucket = per_vm.setdefault(str(r.get("vmid")), set())
+                for p in parts:
+                    p = (p or "").strip()
+                    if p:
+                        bucket.add(p)
+    except Exception as e:
+        logging.debug(f"[tags] could not merge live PVE tags for {cluster_id}: {e}")
+
+    tag_counts = {}
+    for bucket in per_vm.values():
+        for name in bucket:
+            entry = tag_counts.setdefault(
+                name,
+                {
+                    "name": name,
+                    "color": colors.get(name, TAG_COLORS[hash(name) % len(TAG_COLORS)]),
+                    "count": 0,
+                },
+            )
+            entry["count"] += 1
+
+    return jsonify(list(tag_counts.values()))
+
+
+@bp.route("/api/clusters/<cluster_id>/vms/<vmid>/tags", methods=["GET"])
+@require_auth()
+def get_vm_tags(cluster_id, vmid):
+    """Get tags for a specific VM"""
+    ok, _ = check_cluster_access(cluster_id)  # sec-review: was unscoped (CWE-285)
+    if not ok:
+        return jsonify({"error": "Access denied to this cluster"}), 403
+    tags_db = load_vm_tags()
+    cluster_tags = tags_db.get(cluster_id, {})
+    vm_tags = cluster_tags.get(str(vmid), [])
+
+    return jsonify(vm_tags)
+
+
+@bp.route("/api/clusters/<cluster_id>/vms/<vmid>/tags", methods=["POST"])
+@require_auth(perms=["vm.config"])
+def update_vm_tags(cluster_id, vmid):
+    """Add or update tags for a VM
+
+    Body:
+    - tags: Array of tag objects [{name: 'prod', color: '#ef4444'}, ...]
+
+    Or simple add:
+    - tag: Single tag name to add
+    - color: Optional color for the tag
+    """
+    # (sec-review) - vm.config is global; gate per-cluster so a tenant
+    # user can't write tags onto another tenant's VMs (the DELETE sibling already does)
+    ok, _ = check_cluster_access(cluster_id)
+    if not ok:
+        return jsonify({"error": "Access denied to this cluster"}), 403
+    data = request.json or {}
+    tags_db = load_vm_tags()
+
+    if cluster_id not in tags_db:
+        tags_db[cluster_id] = {}
+
+    vm_key = str(vmid)
+
+    # Full replacement
+    if "tags" in data:
+        tags_db[cluster_id][vm_key] = data["tags"]
+    # Single tag add
+    elif "tag" in data:
+        tag_name = data["tag"].strip()
+        if not tag_name:
+            return jsonify({"error": "Tag name required"}), 400
+
+        current_tags = tags_db[cluster_id].get(vm_key, [])
+
+        # Check if tag already exists
+        existing = next((t for t in current_tags if (t.get("name") if isinstance(t, dict) else t) == tag_name), None)
+        if not existing:
+            new_tag = {"name": tag_name, "color": data.get("color", TAG_COLORS[hash(tag_name) % len(TAG_COLORS)])}
+            current_tags.append(new_tag)
+            tags_db[cluster_id][vm_key] = current_tags
+
+    save_vm_tags(tags_db)
+
+    user = request.session.get("user", "system")
+    cluster_name = cluster_managers[cluster_id].config.name if cluster_id in cluster_managers else cluster_id
+    log_audit(user, "vm.tags_updated", f"Updated tags for VM {vmid}", cluster=cluster_name)
+
+    return jsonify({"success": True, "tags": tags_db[cluster_id].get(vm_key, [])})
+
+
+@bp.route("/api/clusters/<cluster_id>/vms/<vmid>/tags/<tag_name>", methods=["DELETE"])
+@require_auth(perms=["vm.config"])
+def remove_vm_tag(cluster_id, vmid, tag_name):
+    """Remove a tag from a VM"""
+    # May 2026: tenant ACL - vm.config alone wasn't enough; without this,
+    # any vm.config holder could yank tags off a VM in a cluster they don't own.
+    ok, _ = check_cluster_access(cluster_id)
+    if not ok:
+        return jsonify({"error": "Access denied to this cluster"}), 403
+    tags_db = load_vm_tags()
+
+    if cluster_id not in tags_db:
+        return jsonify({"error": "No tags for this cluster"}), 404
+
+    vm_key = str(vmid)
+    if vm_key not in tags_db[cluster_id]:
+        return jsonify({"error": "No tags for this VM"}), 404
+
+    # Remove the tag
+    current_tags = tags_db[cluster_id][vm_key]
+    tags_db[cluster_id][vm_key] = [t for t in current_tags if (t.get("name") if isinstance(t, dict) else t) != tag_name]
+
+    # Cleanup empty entries
+    if not tags_db[cluster_id][vm_key]:
+        del tags_db[cluster_id][vm_key]
+
+    save_vm_tags(tags_db)
+
+    return jsonify({"success": True})
+
+
+@bp.route("/api/tags/search", methods=["GET"])
+@require_auth()
+def search_vms_by_tag():
+    """Search VMs across all clusters by tag
+
+    Query params:
+    - tag: Tag name to search for
+    - cluster_id: Optional - limit to specific cluster
+    """
+    tag_name = request.args.get("tag", "").strip()
+    filter_cluster = request.args.get("cluster_id")
+
+    if not tag_name:
+        return jsonify({"error": "Tag parameter required"}), 400
+
+    tags_db = load_vm_tags()
+    results = []
+
+    user = request.session.get("user", "")
+    users_db = load_users()
+    users_db.get(user, {})
+    # #285: tenant/group-based access via the RBAC helper (was reading a missing
+    # user['clusters'] → empty → tags leaked across every cluster).
+    user_data = users_db.get(user, {})
+    user_data["username"] = user
+    accessible_clusters = get_user_clusters(user_data)  # None = admin / all
+
+    for cluster_id, cluster_tags in tags_db.items():
+        # Check access
+        if accessible_clusters is not None and cluster_id not in accessible_clusters:
+            continue
+        if filter_cluster and cluster_id != filter_cluster:
+            continue
+
+        mgr = cluster_managers.get(cluster_id)
+        cluster_name = mgr.config.name if mgr else cluster_id
+
+        for vm_key, vm_tags in cluster_tags.items():
+            # Check if this VM has the tag
+            has_tag = any((t.get("name") if isinstance(t, dict) else t) == tag_name for t in vm_tags)
+
+            if has_tag:
+                # Try to get VM details
+                vm_info = {"vmid": vm_key, "cluster_id": cluster_id, "cluster_name": cluster_name}
+
+                if mgr and mgr.is_connected:
+                    try:
+                        resources = mgr.get_vm_resources()
+                        vm_data = next((r for r in resources if str(r.get("vmid")) == vm_key), None)
+                        if vm_data:
+                            vm_info.update({
+                                "name": vm_data.get("name"),
+                                "node": vm_data.get("node"),
+                                "status": vm_data.get("status"),
+                                "type": vm_data.get("type"),
+                            })
+                    except Exception:
+                        pass
+
+                vm_info["tags"] = vm_tags
+                results.append(vm_info)
+
+    return jsonify(results)
+
+
+# ============================================

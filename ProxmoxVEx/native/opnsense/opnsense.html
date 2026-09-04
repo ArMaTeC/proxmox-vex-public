@@ -1,0 +1,115 @@
+<!doctype html>
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        ProxmoxVEx/native/opnsense/opnsense.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Opnsense HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title>OPNsense Manager — ProxmoxVEx</title>
+
+  <link rel="stylesheet" href="/static/css/plugin-ui.css" />
+  <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+  <div class="shell">
+    <header class="header" role="banner">
+      <h1>
+        <span class="accent">OPNsense</span>
+        <span style="color: var(--muted); font-weight: 500; font-size: 12px; margin-left: 4px;"
+          data-i18n="manager">Manager</span>
+      </h1>
+      <div class="conn" id="conn" aria-live="polite">
+        <!-- Single-host: plain text -->
+        <span id="conn-single">
+          <b id="conn-host">—</b>
+          <span id="conn-version" data-i18n="loading">Loading…</span>
+        </span>
+        <!-- Multi-host: host-selector dropdown (hidden until ≥2 hosts detected) -->
+        <span id="conn-multi" hidden>
+          <div class="host-selector" id="host-selector">
+            <button class="host-selector-btn" id="hs-btn" type="button" aria-haspopup="true" aria-expanded="false"
+              aria-label="Host selector">
+              <span id="hs-active-name">Node A</span>
+              <span class="hs-role unknown" id="hs-active-role">—</span>
+              <svg class="host-selector-caret" viewBox="0 0 10 6">
+                <path d="M0 0l5 6 5-6z" />
+              </svg>
+            </button>
+            <!-- Dropdown menu, hidden until button clicked -->
+            <div class="host-selector-menu" id="hs-menu" hidden role="menu">
+              <button class="host-selector-item" id="hs-item-a" role="menuitem">
+                <span id="hs-item-name-a">Node A</span>
+                <span class="hs-item-role unknown" id="hs-item-role-a">—</span>
+              </button>
+              <button class="host-selector-item" id="hs-item-b" role="menuitem">
+                <span id="hs-item-name-b">Node B</span>
+                <span class="hs-item-role unknown" id="hs-item-role-b">—</span>
+              </button>
+            </div>
+          </div>
+          <span class="hs-diverge-pill" id="hs-diverge"></span>
+        </span>
+      </div>
+      <button class="btn" type="button" id="btn-refresh" aria-label="Refresh view">
+        <span class="refresh-glyph" aria-hidden="true">⟳</span>
+        <span data-i18n="refresh">Refresh</span>
+      </button>
+    </header>
+
+    <nav aria-label="Plugin sections">
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" id="tab-overview" data-tab="overview" aria-selected="true" aria-controls="grid"
+          data-i18n="overview">Overview</button>
+        <button class="tab" role="tab" id="tab-network" data-tab="network" aria-selected="false" aria-controls="grid"
+          data-i18n="network">Network</button>
+        <button class="tab" role="tab" id="tab-vpn" data-tab="vpn" aria-selected="false" aria-controls="grid"
+          data-i18n="vpn">VPN</button>
+        <button class="tab" role="tab" id="tab-logs" data-tab="logs" aria-selected="false" aria-controls="grid"
+          data-i18n="logs">Logs</button>
+        <button class="tab" role="tab" id="tab-nat" data-tab="nat" aria-selected="false" aria-controls="grid"
+          data-i18n="nat">NAT</button>
+        <button class="tab" role="tab" id="tab-dns" data-tab="dns" aria-selected="false" aria-controls="grid"
+          data-i18n="dns">DNS</button>
+        <button class="tab" role="tab" id="tab-dhcp" data-tab="dhcp" aria-selected="false" aria-controls="grid"
+          data-i18n="dhcp">DHCP</button>
+        <button class="tab" role="tab" id="tab-wg" data-tab="wg" aria-selected="false" aria-controls="grid"
+          data-i18n="wg_peers">WG peers</button>
+      </div>
+    </nav>
+
+    <main>
+      <div id="grid" class="grid" role="tabpanel" aria-busy="true" aria-labelledby="tab-overview">
+        <section class="card span-12" aria-label="Loading">
+          <div class="title" data-i18n="section_system">[ system ]</div>
+          <div class="skeleton xl" role="presentation" style="margin-top:8px;"></div>
+          <div class="skeleton lg" role="presentation" style="margin-top:8px;"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="drilldown" class="drilldown" aria-labelledby="dl-title">
+    <div class="dl-head">
+      <h2 id="dl-title" data-i18n="interface">Interface</h2>
+      <button class="btn" type="button" id="dl-close" aria-label="Close detail" data-i18n="close">Close</button>
+    </div>
+    <div class="dl-body" id="dl-body"></div>
+  </dialog>
+
+
+  <script src="ui.js"></script>
+</body>
+
+</html>

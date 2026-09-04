@@ -1,0 +1,99 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/disaster-recovery-runner/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Disaster Recovery Runner</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Disaster Recovery Runner</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="scenarios">Scenarios</button>
+            <button class="tab" role="tab" data-tab="editor">Editor</button>
+            <button class="tab" role="tab" data-tab="runs">Runs</button>
+        </div>
+
+        <div id="panel-scenarios" class="tab-panel">
+            <div class="card">
+                <h2>Scenarios</h2>
+                <div class="form">
+                    <label>Filter by name <input type="text" id="scFilter" /></label>
+                    <button id="scLoad">Refresh</button>
+                </div>
+                <p id="scError" class="error-text"></p>
+                <div id="scenariosList">
+                    <p class="empty">No scenarios.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-editor" class="tab-panel" hidden>
+            <div class="card">
+                <h2 id="edTitle">Create Scenario</h2>
+                <input type="hidden" id="edId" />
+                <div class="form">
+                    <label>Name <input type="text" id="edName" /></label>
+                </div>
+                <h3>Steps</h3>
+                <div id="edSteps" class="steps"></div>
+                <div class="form">
+                    <label>Catalog <select id="edCat">
+                            <option value="failover">failover</option>
+                            <option value="verify">verify</option>
+                            <option value="failback">failback</option>
+                            <option value="network-isolate">network-isolate</option>
+                            <option value="custom">custom</option>
+                        </select></label>
+                    <button id="edAddStep">Add Step</button>
+                </div>
+                <div class="form">
+                    <button id="edSave">Create</button>
+                    <button id="edCancel" class="secondary" hidden>Cancel</button>
+                    <button id="edJson" class="secondary">View JSON</button>
+                </div>
+                <p id="edError" class="error-text"></p>
+                <textarea id="edJsonBox" rows="6" hidden></textarea>
+            </div>
+        </div>
+
+        <div id="panel-runs" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Run Result</h2>
+                <div class="form">
+                    <label>Run ID <input type="text" id="rRunId" /></label>
+                    <button id="rLookup">Lookup</button>
+                </div>
+                <p id="rError" class="error-text"></p>
+                <div id="runResult">
+                    <p class="empty">No run loaded.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

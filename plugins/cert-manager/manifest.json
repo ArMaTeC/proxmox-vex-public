@@ -1,0 +1,12 @@
+{
+    "id": "cert-manager",
+    "name": "Certificate Manager",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Request, renew, deploy and track certificate expiry.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Network & Security",
+    "min_license_tier": "advanced"
+}

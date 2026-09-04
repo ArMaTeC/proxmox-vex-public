@@ -1,0 +1,16 @@
+{
+  "cancel": "Cancelar",
+  "configured": "Configurado",
+  "loading": "Carregando...",
+  "overview": "Visão geral",
+  "save": "Salvar",
+  "status": "Status",
+  "title": "VyOS",
+  "unconfigured": "Não configurado",
+  "interfaces": "Interfaces",
+  "routes": "Rotas",
+  "loaded_status": "Loaded %s (%s)",
+  "failed_to_load": "Failed to load %s: %s",
+  "error_loading": "Error loading %s: %s",
+  "unknown_error": "unknown error"
+}

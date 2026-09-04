@@ -1,0 +1,177 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/capacity-forecast/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Capacity Forecaster</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Capacity Forecaster</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="forecast">Forecast</button>
+            <button class="tab" role="tab" data-tab="scenarios">Scenarios</button>
+            <button class="tab" role="tab" data-tab="trends">Trends</button>
+            <button class="tab" role="tab" data-tab="schedules">Schedules</button>
+            <button class="tab" role="tab" data-tab="history">History</button>
+        </div>
+
+        <div id="panel-forecast" class="tab-panel">
+            <div class="card">
+                <h2>Load Forecast</h2>
+                <div class="form">
+                    <label>Cluster <select id="fCluster">
+                            <option value="">Global</option>
+                        </select></label>
+                    <label>Resource <select id="fResource">
+                            <option value="cpu">CPU</option>
+                            <option value="ram">RAM</option>
+                            <option value="storage">Storage</option>
+                            <option value="power">Power</option>
+                        </select></label>
+                    <label>Window (days) <input type="number" id="fWindow" value="7" min="1" max="90" /></label>
+                    <label>Threshold % <input type="number" id="fThreshold" value="90" min="0" max="100"
+                            step="0.1" /></label>
+                    <button id="fLoad">Load</button>
+                    <button id="fExportCsv" class="secondary">CSV</button>
+                </div>
+                <div id="fResult" class="card" hidden>
+                    <h2>Result</h2>
+                    <div class="grid" id="fMetrics"></div>
+                    <div class="chart" id="fChart"></div>
+                    <div id="fTable"></div>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-scenarios" class="tab-panel" hidden>
+            <div class="card">
+                <h2 id="sFormTitle">Create Scenario</h2>
+                <form class="form" id="scenarioForm">
+                    <input type="hidden" id="sId" />
+                    <label>Name <input type="text" id="sName" required placeholder="Q4 Growth" /></label>
+                    <label>Description <input type="text" id="sDesc" placeholder="20% storage growth" /></label>
+                    <label>CPU factor <input type="number" id="fCpu" step="0.1" min="0" max="100" value="1" /></label>
+                    <label>RAM factor <input type="number" id="fRam" step="0.1" min="0" max="100" value="1" /></label>
+                    <label>Storage factor <input type="number" id="fStorage" step="0.1" min="0" max="100"
+                            value="1" /></label>
+                    <label>Power factor <input type="number" id="fPower" step="0.1" min="0" max="100"
+                            value="1" /></label>
+                    <button type="submit">Save</button>
+                    <button type="button" id="sReset" class="secondary">Reset</button>
+                </form>
+                <p id="sError" class="error-text"></p>
+            </div>
+            <div class="card">
+                <h2>Scenarios</h2>
+                <div class="form">
+                    <input type="text" id="sSearch" placeholder="Filter by name" />
+                    <label>Compare A <select id="sA">
+                            <option value="">Select</option>
+                        </select></label>
+                    <label>Compare B <select id="sB">
+                            <option value="">Select</option>
+                        </select></label>
+                    <button id="btnCompare" class="secondary">Compare</button>
+                    <button id="sExport" class="secondary">Export</button>
+                    <button id="sImportBtn" class="secondary">Import</button>
+                    <input type="file" id="sImport" accept=".json" hidden />
+                </div>
+                <div id="scenariosList">
+                    <p class="empty">No scenarios.</p>
+                </div>
+                <div id="compareResult"></div>
+            </div>
+        </div>
+
+        <div id="panel-trends" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Historical Trends</h2>
+                <div id="trendsList">
+                    <p class="empty">Loading...</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-schedules" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Refresh Schedule</h2>
+                <div class="form">
+                    <label>Resource <select id="shResource">
+                            <option value="cpu">CPU</option>
+                            <option value="ram">RAM</option>
+                            <option value="storage">Storage</option>
+                            <option value="power">Power</option>
+                        </select></label>
+                    <label>Cron <input type="text" id="shCron" placeholder="0 2 * * *" /></label>
+                    <label><input type="checkbox" id="shEnabled" checked /> Enabled</label>
+                    <button id="shSave">Save</button>
+                </div>
+                <p id="shError" class="error-text"></p>
+            </div>
+            <div class="card">
+                <h2>Schedules</h2>
+                <div id="schedulesList">
+                    <p class="empty">No schedules.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-history" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Historical Usage</h2>
+                <div class="form">
+                    <label>Cluster <select id="hCluster">
+                            <option value="">Global</option>
+                        </select></label>
+                    <label>Node <input type="text" id="hNode" placeholder="node name (optional)" /></label>
+                    <label>Resource <select id="hResource">
+                            <option value="cpu">CPU</option>
+                            <option value="ram">RAM</option>
+                            <option value="storage">Storage</option>
+                            <option value="power">Power</option>
+                        </select></label>
+                    <label>Days <input type="number" id="hDays" value="7" min="1" max="90" /></label>
+                    <label>Step <select id="hStep">
+                            <option value="0">5 min (raw)</option>
+                            <option value="3600">1 hour</option>
+                            <option value="86400">1 day</option>
+                        </select></label>
+                    <button id="hLoad">Load</button>
+                    <button id="hExportCsv" class="secondary">CSV</button>
+                </div>
+                <div id="hResult" class="card" hidden>
+                    <h2>Result</h2>
+                    <div class="grid" id="hMetrics"></div>
+                    <div class="chart" id="hChart"></div>
+                    <div id="hTable"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

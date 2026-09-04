@@ -1,0 +1,84 @@
+/* --- ProxmoxVEx auto-header start ---
+ * -------------------------------------------------------------------
+ * File:        ProxmoxVEx/native/vyos/vyos.css
+ * Project:     ProxmoxVEx
+ * Version:     1.2.303
+ * Build:       2026.09.04
+ * Description: Vyos CSS source
+ * Docs:        https://proxmoxvex.local/docs
+ * Generated:   2026-09-04
+ * -------------------------------------------------------------------
+ * --- ProxmoxVEx auto-header end --- */
+* {
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  margin: 0;
+  padding: 20px;
+  background: #1a1d21;
+  color: #d6d8db;
+}
+
+h1 {
+  font-weight: 400;
+  margin: 0 0 16px 0;
+  font-size: 22px;
+  color: #e4e4e7;
+}
+
+.tabs {
+  display: flex;
+  border-bottom: 1px solid #3d424b;
+  margin-bottom: 16px;
+}
+
+.tab {
+  padding: 10px 20px;
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  color: #9ca3af;
+  font-size: 14px;
+  border-bottom: 2px solid transparent;
+  outline: none;
+}
+
+.tab:hover {
+  color: #e4e4e7;
+}
+
+.tab.active {
+  color: #e4e4e7;
+  border-bottom-color: #2e8bc9;
+}
+
+.panel {
+  display: none;
+}
+
+.panel.active {
+  display: block;
+}
+
+.status {
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: #9ca3af;
+}
+
+.status.error {
+  color: #ef4444;
+}
+
+pre {
+  background: #121417;
+  border: 1px solid #3d424b;
+  border-radius: 4px;
+  padding: 12px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.5;
+  min-height: 120px;
+}

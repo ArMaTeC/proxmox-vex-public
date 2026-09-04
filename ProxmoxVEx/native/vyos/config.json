@@ -1,0 +1,12 @@
+{
+  "vyos_hosts": [
+    {
+      "name": "vyos-01",
+      "url": "root",
+      "api_key": "opkopkpokpokpok",
+      "verify_tls": true
+    }
+  ],
+  "poll_interval": 30,
+  "read_only": false
+}

@@ -1,0 +1,15 @@
+{
+  "cancel": "Отмена",
+  "configured": "Настроено",
+  "loading": "Загрузка...",
+  "overview": "Обзор",
+  "save": "Сохранить",
+  "status": "Статус",
+  "title": "pfSense Manager",
+  "unconfigured": "Не настроено",
+  "interfaces": "Интерфейсы",
+  "rules": "правила",
+  "error": "Error: %s",
+  "loaded": "Loaded %s",
+  "request_failed": "Request failed: %s"
+}

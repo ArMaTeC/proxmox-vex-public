@@ -1,0 +1,27 @@
+{
+    "ntfy_enabled": true,
+    "apprise_enabled": false,
+    "ntfy_topic": "ProxmoxVEx-test",
+    "apprise_urls": [],
+    "ntfy_url": "https://ntfy.sh",
+    "ntfy_token": "",
+    "ntfy_priority_map": {
+        "critical": "max",
+        "warning": "high",
+        "info": "default"
+    },
+    "_help": {
+        "ntfy_enabled": "Enable ntfy.sh notifications.",
+        "apprise_enabled": "Enable Apprise notifications.",
+        "ntfy_topic": "ntfy topic to post messages to.",
+        "apprise_urls": "List of Apprise-compatible notification URLs.",
+        "ntfy_url": "Base URL of the ntfy server.",
+        "ntfy_token": "Bearer token for the ntfy server.",
+        "ntfy_priority_map": {
+            "critical": "Value for critical.",
+            "warning": "Value for warning.",
+            "info": "Value for info.",
+            "_description": "Mapping of alert severity to ntfy priority."
+        }
+    }
+}

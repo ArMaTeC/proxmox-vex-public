@@ -1,0 +1,15 @@
+{
+  "cancel": "取消",
+  "configured": "已配置",
+  "loading": "加载中...",
+  "overview": "概览",
+  "save": "保存",
+  "status": "状态",
+  "title": "Active Directory",
+  "unconfigured": "未配置",
+  "users": "用户",
+  "groups": "组",
+  "error": "Error: %s",
+  "loaded": "Loaded %s",
+  "request_failed": "Request failed: %s"
+}

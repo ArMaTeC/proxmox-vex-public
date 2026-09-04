@@ -1,0 +1,2854 @@
+<!DOCTYPE html>
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        ProxmoxVEx/native/netapp_storage/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NetApp Storage</title>
+  <link rel="stylesheet"
+    href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    media="print" onload="this.media='all'">
+
+
+  <link rel="stylesheet" href="/static/css/plugin-ui.css" />
+  <link rel="stylesheet" href="ui.css">
+  <link rel="stylesheet" href="custom.css">
+</head>
+
+<body>
+
+
+
+
+
+  <div class="layout">
+
+    <!-- Sub-tabs -->
+    <div class="subtabs">
+      <div class="subtab active" data-tab="snapshots"><svg class="tab-icon" width="14" height="14" fill="none"
+          stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg><span data-i18n="tab_snapshots">Snapshots</span></div>
+      <div class="subtab" data-tab="schedules"><svg class="tab-icon" width="14" height="14" fill="none"
+          stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg><span data-i18n="tab_schedules">Schedules</span></div>
+      <div class="subtab" data-tab="restore"><svg class="tab-icon" width="14" height="14" fill="none"
+          stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+        </svg><span data-i18n="tab_restore">Restore &amp; Clone</span></div>
+      <div class="subtab" data-tab="storage"><svg class="tab-icon" width="14" height="14" fill="none"
+          stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+        </svg><span data-i18n="tab_storage">Storage</span></div>
+      <div class="subtab" data-tab="jobs"><svg class="tab-icon" width="14" height="14" fill="none" stroke="currentColor"
+          viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+        </svg><span data-i18n="tab_jobs">Jobs &amp; Logs</span></div>
+      <div class="subtab" data-tab="dr"><svg class="tab-icon" width="14" height="14" fill="none" stroke="currentColor"
+          viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+        </svg><span data-i18n="sp_disaster_recovery">Disaster Recovery</span></div>
+      <div class="subtab" data-tab="settings"><svg class="tab-icon" width="14" height="14" fill="none"
+          stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg><span data-i18n="tab_settings">Settings</span></div>
+    </div>
+
+    <!-- Scrollable content -->
+    <div class="content">
+
+      <!-- ════════════════════════ SNAPSHOTS ════════════════════════ -->
+      <div id="tab-snapshots" class="tab-panel">
+        <div class="section-actions" style="gap:8px;align-items:center">
+          <button class="btn btn-primary" onclick="showCreateSnapshotForm()" data-i18n="btn_create_snapshot">+ Create
+            Snapshot</button>
+          <button class="btn btn-ghost" onclick="loadSnapshots()" data-i18n="btn_refresh">Refresh</button>
+          <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
+            <input id="snap_filter_text" type="search" data-i18n-placeholder="filter_search" placeholder="Search …"
+              style="width:160px;padding:5px 8px;font-size:13px" oninput="filterSnapshots()">
+            <select id="snap_filter_source" onchange="filterSnapshots()" style="padding:5px 8px;font-size:13px">
+              <option value="" data-i18n="opt_all_sources">All Sources</option>
+              <option value="plugin" data-i18n="opt_plugin">Plugin</option>
+              <option value="ontap_native" data-i18n="opt_ontap_native">ONTAP native</option>
+            </select>
+            <select id="snap_filter_datastore" onchange="filterSnapshots()"
+              style="padding:5px 8px;font-size:13px;max-width:160px">
+              <option value="" data-i18n="opt_all_datastores">All Datastores</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="card snap-timeline-card" style="padding:0;margin-bottom:12px">
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px 6px">
+            <span style="font-weight:600;font-size:13px;color:var(--text)" data-i18n="sp_timeline">Timeline</span>
+            <div style="display:flex;gap:4px" id="tl_zoom_btns">
+              <button class="btn btn-ghost btn-sm" onclick="tlSetZoom('day')" data-zoom="day"
+                data-i18n="bu_day">Day</button>
+              <button class="btn btn-ghost btn-sm" onclick="tlSetZoom('week')" data-zoom="week"
+                data-i18n="bu_week">Week</button>
+              <button class="btn btn-primary btn-sm" onclick="tlSetZoom('month')" data-zoom="month"
+                data-i18n="bu_month">Month</button>
+              <button class="btn btn-ghost btn-sm" onclick="tlSetZoom('year')" data-zoom="year"
+                data-i18n="bu_year">Year</button>
+            </div>
+          </div>
+          <div id="snap_timeline" style="padding:0 8px 10px;min-height:70px;box-sizing:border-box"></div>
+        </div>
+
+        <div class="card" style="padding:0;overflow:hidden">
+          <div id="snap_bulk_bar"
+            style="display:none;padding:8px 8px 6px;border-bottom:1px solid var(--border);align-items:center;gap:10px;flex-wrap:wrap">
+            <span id="snap_bulk_count" style="color:var(--muted);font-size:13px"></span>
+            <button class="btn btn-danger btn-sm" onclick="deleteSelectedSnapshots()"
+              data-i18n="bu_delete_selection">Delete selection</button>
+            <button class="btn btn-ghost btn-sm" onclick="snapClearSelection()" data-i18n="bu_clear_selection">Clear
+              selection</button>
+          </div>
+          <div id="snapTableScroller" style="overflow:auto;max-height:min(580px,calc(100vh - 380px))">
+            <table style="min-width:860px">
+              <thead style="position:sticky;top:0;z-index:2;background:var(--card)">
+                <tr>
+                  <th style="width:32px;padding:6px 8px"><input type="checkbox" id="snap_select_all"
+                      onchange="snapToggleAll(this)" data-i18n-title="Select/deselect all" title="Select/deselect all">
+                  </th>
+                  <th class="sortable" onclick="snapSort('snap_name')"><span data-i18n="th_name">Name</span> <span
+                      class="si" id="ss_snap_name">⇅</span></th>
+                  <th class="sortable" onclick="snapSort('pve_storage_id')"><span
+                      data-i18n="th_datastore">Datastore</span> <span class="si" id="ss_pve_storage_id">⇅</span></th>
+                  <th data-i18n="th_vms">VMs</th>
+                  <th class="sortable" onclick="snapSort('consistency')"><span
+                      data-i18n="th_consistency">Consistency</span> <span class="si" id="ss_consistency">⇅</span></th>
+                  <th class="sortable" onclick="snapSort('label')"><span data-i18n="th_label">Label</span> <span
+                      class="si" id="ss_label">⇅</span></th>
+                  <th class="sortable" onclick="snapSort('status')"><span data-i18n="th_status">Status</span> <span
+                      class="si" id="ss_status">⇅</span></th>
+                  <th class="sortable" onclick="snapSort('source')"><span data-i18n="th_source">Source</span> <span
+                      class="si" id="ss_source">⇅</span></th>
+                  <th class="sortable" onclick="snapSort('created_at')"><span data-i18n="th_created">Created</span>
+                    <span class="si" id="ss_created_at">↓</span>
+                  </th>
+                  <th data-i18n="th_actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="snapshotsBody">
+                <tr>
+                  <td colspan="10" class="empty"><span class="spinner"></span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="snap_pagination"
+            style="display:flex;align-items:center;padding:6px 12px;font-size:13px;border-top:1px solid var(--border)">
+            <span id="snap_page_info" style="color:var(--muted)"></span>
+            <button id="snap_prev" style="display:none"></button>
+            <button id="snap_next" style="display:none"></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ═══════════════════════ SCHEDULES ═══════════════════════ -->
+      <div id="tab-schedules" class="tab-panel" style="display:none">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+          <button class="btn btn-primary" onclick="showAddScheduleForm()" data-i18n="btn_add_schedule">+ Add
+            Schedule</button>
+          <input id="schedSearch" type="text" data-i18n-placeholder="Filter by name, datastore or label…"
+            placeholder="Filter by name, datastore or label…" oninput="schedFilterChanged()"
+            style="flex:1;min-width:140px;max-width:240px;margin-left:4px">
+        </div>
+
+        <div class="card table-scroll">
+          <table style="min-width:860px">
+            <thead>
+              <tr>
+                <th class="sortable" onclick="schedColSort('name')"><span data-i18n="th_name">Name</span> <span
+                    class="si" id="schs_name">↑</span></th>
+                <th class="sortable" onclick="schedColSort('volume')"><span data-i18n="th_volume">Volume</span> <span
+                    class="si" id="schs_volume">⇅</span></th>
+                <th data-i18n="th_vms">VMs</th>
+                <th data-i18n="th_schedule">Schedule</th>
+                <th data-i18n="th_label">Label</th>
+                <th class="sortable" onclick="schedColSort('retention')"><span data-i18n="th_retention">Retention</span>
+                  <span class="si" id="schs_retention">⇅</span>
+                </th>
+                <th class="sortable" onclick="schedColSort('status')"><span data-i18n="th_status">Status</span> <span
+                    class="si" id="schs_status">⇅</span></th>
+                <th class="sortable" onclick="schedColSort('lastRun')"><span data-i18n="th_last_run">Last run</span>
+                  <span class="si" id="schs_lastRun">⇅</span>
+                </th>
+                <th data-i18n="tab_snapmirror">SnapMirror®</th>
+                <th data-i18n="th_actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="schedulesBody">
+              <tr>
+                <td colspan="10" class="empty"><span class="spinner"></span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ══════════════════════ SNAPMIRROR® ══════════════════════ -->
+      <!-- ═══════════════════════ VM-RESTORE ══════════════════════ -->
+      <!-- ════════════════ RESTORE & CLONE ════════════════ -->
+      <div id="tab-restore" class="tab-panel" style="display:none">
+
+        <!-- VM List header -->
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+          <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+            style="flex-shrink:0;color:var(--accent)">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+          </svg>
+          <span style="font-weight:700;font-size:15px" data-i18n="sp_restore_amp_clone">Restore &amp; Clone</span>
+          <div style="display:flex;gap:4px;margin-left:4px">
+            <button id="rcSrcPrimary" class="btn btn-primary btn-sm" onclick="rcSetSource('primary')"
+              data-i18n="bu_primary">Primary</button>
+            <button id="rcSrcSecondary" class="btn btn-ghost btn-sm" onclick="rcSetSource('secondary')"
+              data-i18n="bu_snapmirror_secondary">SnapMirror Secondary</button>
+          </div>
+          <input id="rcSearch" type="text" data-i18n-placeholder="Filter by VM name, ID or datastore…"
+            placeholder="Filter by VM name, ID or datastore…" oninput="rcFilterChanged()"
+            style="flex:1;min-width:140px;max-width:220px;margin-left:4px">
+          <button class="btn btn-ghost btn-sm" onclick="_rcSource==='secondary'?rcDrRelChanged():loadRcVmList()">
+            <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+              style="vertical-align:middle;margin-right:3px">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>Refresh
+          </button>
+        </div>
+        <!-- DR relationship selector (hidden for primary) -->
+        <div id="rcDrRow" style="display:none;margin-bottom:10px;gap:8px;align-items:center">
+          <svg width="14" height="14" fill="none" stroke="#58A6FF" viewBox="0 0 24 24" style="flex-shrink:0">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9" />
+          </svg>
+          <select id="rcDrRelSel" onchange="rcDrRelChanged()" style="flex:1;max-width:420px;font-size:13px">
+            <option value="" data-i18n="op_select_snapmirror_relationship">— Select SnapMirror relationship —</option>
+          </select>
+        </div>
+
+        <div class="card table-scroll">
+          <table style="min-width:700px">
+            <thead>
+              <tr>
+                <th class="sortable" onclick="rcColSort('vmid')">VMID <span class="si" id="rcs_vmid">⇅</span></th>
+                <th class="sortable" onclick="rcColSort('name')">Name <span class="si" id="rcs_name">⇅</span></th>
+                <th class="sortable" onclick="rcColSort('dsName')">Datastore <span class="si" id="rcs_dsName">⇅</span>
+                </th>
+                <th class="sortable" onclick="rcColSort('proto')">Protocol <span class="si" id="rcs_proto">⇅</span></th>
+                <th class="sortable" onclick="rcColSort('count')">Snapshots <span class="si" id="rcs_count">⇅</span>
+                </th>
+                <th class="sortable" onclick="rcColSort('lastSnap')">Last Snapshot <span class="si"
+                    id="rcs_lastSnap">↓</span></th>
+                <th data-i18n="th_actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="rcVmTbody">
+              <tr>
+                <td colspan="7" class="empty"><span class="spinner"></span></td>
+              </tr>
+            </tbody>
+          </table>
+          <p style="font-size:11px;color:var(--muted);padding:6px 14px 8px;margin:0"
+            data-i18n="p_all_vms_that_have_ever_been_snapshotted_includin">All VMs that have ever been snapshotted —
+            including VMs no longer in the cluster — appear here.</p>
+        </div>
+
+      </div>
+
+      <!-- tab-clone: nav pill removed, panel kept as empty placeholder for compat -->
+      <div id="tab-clone" class="tab-panel" style="display:none"></div>
+
+      <!-- ══════════════════════ PROVISION ══════════════════════ -->
+      <div id="tab-storage" class="tab-panel" style="display:none">
+
+        <div class="section-actions">
+          <button class="btn btn-primary" onclick="showProvWizard()" data-i18n="bu_provision_new">+ Provision
+            New</button>
+          <button class="btn btn-secondary" onclick="showBindWizard()" data-i18n="bu_mount_existing">⇢ Mount
+            existing</button>
+          <button class="btn btn-ghost" onclick="showVmImportModal()">
+            <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+              style="vertical-align:middle;margin-right:3px">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+            </svg>Import VMs
+          </button>
+          <button class="btn btn-ghost" onclick="runDetectAndScan()">
+            <span id="discoverSpinner" style="display:none" class="spinner"></span>
+            <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+              style="vertical-align:middle;margin-right:3px">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+            </svg>Detect &amp; Scan
+          </button>
+        </div>
+
+        <!-- ── All Datastores table ──────────────────────────────── -->
+        <div class="card table-scroll">
+          <div class="card-title"><svg class="tab-icon" width="16" height="16" fill="none" stroke="currentColor"
+              viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />
+            </svg>All Datastores</div>
+          <div id="storageEmpty" class="empty" style="display:none"
+            data-i18n="di_no_datastores_found_click_detect_amp_scan_to_dis">No datastores found. Click "Detect &amp;
+            Scan" to discover existing datastores and SnapMirror relationships, or "+ Provision New" to create one.
+          </div>
+          <table style="min-width:1040px">
+            <thead>
+              <tr>
+                <th data-i18n="th_datastore_svm_system">Datastore / SVM / System</th>
+                <th data-i18n="th_protocol">Protocol</th>
+                <th data-i18n="th_volume">Volume</th>
+                <th data-i18n="th_vg_mount">VG / Mount</th>
+                <th data-i18n="th_hosts">Hosts</th>
+                <th data-i18n="th_size">Size</th>
+                <th data-i18n="tab_snapmirror">SnapMirror®</th>
+                <th data-i18n="th_status">Status</th>
+                <th data-i18n="th_actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="storageTbody"></tbody>
+          </table>
+        </div>
+
+      </div>
+
+      <!-- ═══════════════════════ JOBS & LOGS ══════════════════════ -->
+      <!-- ═══════════════════════ JOBS & LOGS ══════════════════════ -->
+      <div id="tab-jobs" class="tab-panel" style="display:none">
+        <div class="card table-scroll">
+          <div class="card-title" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <svg class="tab-icon" width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+            </svg><span data-i18n="ct_jobs_history">Jobs &amp; History</span>
+            <button class="btn btn-ghost btn-sm" onclick="loadAllJobs()" data-i18n="btn_refresh">Refresh</button>
+            <button class="btn btn-danger btn-sm" style="margin-left:auto" onclick="cleanupJobs()"
+              data-i18n="btn_cleanup_jobs">Clean up completed</button>
+          </div>
+          <table style="min-width:860px">
+            <thead>
+              <tr>
+                <th data-i18n="th_type">Type</th>
+                <th>VMID</th>
+                <th data-i18n="th_node">Node</th>
+                <th data-i18n="th_status">Status</th>
+                <th data-i18n="th_created_by">Created by</th>
+                <th data-i18n="th_started">Started</th>
+                <th data-i18n="th_log">Log</th>
+                <th data-i18n="th_actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="jobsBody">
+              <tr>
+                <td colspan="8" class="empty"><span class="spinner"></span></td>
+              </tr>
+            </tbody>
+          </table>
+          <div id="jobs_pagination"
+            style="display:flex;align-items:center;justify-content:flex-end;gap:12px;padding:8px 4px;font-size:13px">
+            <span id="jobs_page_info" style="color:var(--muted)"></span>
+            <button id="jobs_prev" class="btn btn-ghost btn-sm" onclick="jobChangePage(-1)" data-i18n="pg_prev">←
+              Back</button>
+            <button id="jobs_next" class="btn btn-ghost btn-sm" onclick="jobChangePage(+1)" data-i18n="pg_next">Next
+              →</button>
+          </div>
+        </div>
+
+        <!-- Audit Log — disabled for now
+      <div class="card table-scroll" style="margin-top:20px">
+        ...
+      </div>
+      -->
+      </div>
+
+      <!-- ════════════════════════ DISASTER RECOVERY ════════════════════════ -->
+      <div id="tab-dr" class="tab-panel" style="display:none">
+
+        <!-- Role Banner -->
+        <div id="drRoleBanner"
+          style="display:flex;align-items:center;justify-content:space-between;padding:.75rem 1rem;border-radius:8px;margin-bottom:1.25rem;border:2px solid var(--border)">
+          <div style="display:flex;align-items:center;gap:.75rem">
+            <span id="drRoleIcon" style="font-size:1.8rem;line-height:1">🟢</span>
+            <div>
+              <div style="font-weight:700;font-size:1rem" id="drRoleLabel">PRIMARY</div>
+              <div style="font-size:.78rem;color:var(--muted)" id="drRoleSubtitle" data-i18n="di_loading">Loading…</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:.5rem;align-items:center">
+            <button class="btn btn-ghost btn-sm" onclick="drShowRoleModal()" data-i18n="bu_role">⚙ Role</button>
+          </div>
+        </div>
+
+        <!-- Peer Status Section -->
+        <div class="sub-header">
+          <span class="sub-header-title"><svg class="tab-icon" width="14" height="14" fill="none" stroke="currentColor"
+              viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+            </svg>DR Peer</span>
+          <button class="btn btn-primary btn-sm" onclick="drShowPeerConfigModal()" data-i18n="bu_configure_peer">⚙
+            Configure Peer</button>
+        </div>
+        <div id="drPeerStatusSection" style="margin-bottom:1.5rem">
+          <div class="muted-hint" data-i18n="di_loading">Loading…</div>
+        </div>
+
+        <div class="sub-header" style="margin-top:1.5rem">
+          <span class="sub-header-title"><svg class="tab-icon" width="14" height="14" fill="none" stroke="currentColor"
+              viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+            </svg>DR Plans</span>
+          <button class="btn btn-primary btn-sm" onclick="drShowAddPlanModal()" data-i18n="bu_create_dr_plan">+ Create
+            DR Plan</button>
+        </div>
+        <div id="drPlansList" class="card-list">
+          <div class="muted-hint" data-i18n="di_loading">Loading…</div>
+        </div>
+
+        <div id="drPlanDetail" style="display:none;margin-top:1.5rem">
+          <div class="sub-header">
+            <span class="sub-header-title" id="drPlanDetailTitle" data-i18n="sp_plan_detail">Plan Detail</span>
+            <div style="display:flex;gap:.5rem">
+              <button class="btn btn-primary btn-sm" onclick="drShowFailoverModal()" data-i18n="bu_start_failover">▶
+                Start Failover</button>
+              <button class="btn btn-ghost btn-sm" onclick="drClosePlanDetail()" data-i18n="bu_close">✕ Close</button>
+            </div>
+          </div>
+          <div id="drPlanStatusBar" class="alert alert-info" style="margin-bottom:1rem;font-size:.85rem"></div>
+          <div class="nav-tabs" style="margin-bottom:1rem">
+            <div class="subtab active" data-dr-tab="entries" onclick="drShowSubTab('entries',this)"><svg
+                class="tab-icon" width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
+              </svg>Protected Datastores</div>
+            <div class="subtab" data-dr-tab="groups" onclick="drShowSubTab('groups',this)"><svg class="tab-icon"
+                width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+              </svg>VM Start Groups</div>
+          </div>
+          <div id="drSubTab-entries">
+            <div style="display:flex;gap:.5rem;margin-bottom:.75rem">
+              <button class="btn btn-sm btn-ghost" onclick="drShowAddEntryModal()" data-i18n="bu_add_datastore">+ Add
+                Datastore</button>
+              <button class="btn btn-sm btn-ghost" onclick="drAutoDetect()"><svg width="13" height="13" fill="none"
+                  stroke="currentColor" viewBox="0 0 24 24" style="vertical-align:middle;margin-right:3px">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>Auto-detect</button>
+            </div>
+            <div id="drEntriesList"></div>
+          </div>
+          <div id="drSubTab-groups" style="display:none">
+            <div style="display:flex;gap:.5rem;margin-bottom:.75rem;align-items:center">
+              <button class="btn btn-sm btn-ghost" onclick="drShowAddGroupModal()" data-i18n="bu_add_group">+ Add
+                Group</button>
+              <span class="muted-hint" style="font-size:.8rem"
+                data-i18n="sp_groups_run_top_bottom_core_always_first_auto_man">Groups run top → bottom. Core always
+                first (auto). Manual groups wait for confirmation.</span>
+            </div>
+            <div id="drGroupsList"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════════════════════════ SETTINGS ════════════════════════ -->
+      <div id="tab-settings" class="tab-panel" style="display:none">
+
+        <!-- ═══════════════════════ DEPLOY WIZARD ═══════════════════════ -->
+        <div class="sub-header">
+          <span class="sub-header-title"><svg class="tab-icon" width="14" height="14" fill="none" stroke="currentColor"
+              viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+            </svg>Deploy Wizard</span>
+          <button class="btn btn-primary btn-sm" onclick="setupWizardOpen()" data-i18n="bu_initial_setup">+ Initial
+            Setup</button>
+        </div>
+
+        <div class="sub-header">
+          <span class="sub-header-title"><svg class="tab-icon" width="14" height="14" fill="none" stroke="currentColor"
+              viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01" />
+            </svg><span data-i18n="sect_netapp">NetApp Systems</span></span>
+          <button class="btn btn-primary btn-sm" onclick="showAddEndpointForm()" data-i18n="btn_add_netapp">+ Add NetApp
+            System</button>
+        </div>
+
+        <div class="card">
+          <table>
+            <thead>
+              <tr>
+                <th data-i18n="th_name">Name</th>
+                <th data-i18n="th_host">Host</th>
+                <th data-i18n="th_user">User</th>
+                <th data-i18n="th_ssl_verified">SSL verified</th>
+                <th data-i18n="th_actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="endpointsBody">
+              <tr>
+                <td colspan="5" class="empty"><span class="spinner"></span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="sub-header">
+          <span class="sub-header-title"><svg class="tab-icon" width="14" height="14" fill="none" stroke="currentColor"
+              viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+            </svg><span data-i18n="sect_pve">Proxmox VE Hosts</span></span>
+          <button class="btn btn-primary btn-sm" onclick="showAddPveHostForm()" data-i18n="btn_add_pve">+ Add PVE
+            Host</button>
+        </div>
+
+        <div class="card">
+          <table>
+            <thead>
+              <tr>
+                <th data-i18n="th_name">Name</th>
+                <th data-i18n="th_host">Host</th>
+                <th data-i18n="lbl_port">Port</th>
+                <th data-i18n="th_user">User</th>
+                <th data-i18n="th_nfs_ip">NFS IP</th>
+                <th data-i18n="th_ssl_verified">SSL verified</th>
+                <th data-i18n="th_actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="pveHostsBody">
+              <tr>
+                <td colspan="7" class="empty"><span class="spinner"></span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- ═══════════════ EMAIL / SMTP ═══════════════ -->
+        <div class="sub-header" style="margin-top:16px">
+          <span class="sub-header-title"><svg class="tab-icon" width="14" height="14" fill="none" stroke="currentColor"
+              viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+            </svg><span data-i18n="sect_smtp">Email Notifications (SMTP)</span></span>
+        </div>
+        <div class="card">
+          <div class="form-grid">
+            <div class="form-group">
+              <label data-i18n="lbl_smtp_host">SMTP Server</label>
+              <input id="smtp_host" placeholder="mail.example.com">
+            </div>
+            <div class="form-group">
+              <label data-i18n="lbl_smtp_port">Port</label>
+              <input id="smtp_port" type="number" value="587" min="1" max="65535" style="width:120px">
+            </div>
+            <div class="form-group">
+              <label data-i18n="lbl_smtp_encryption">Encryption</label>
+              <select id="smtp_encryption" onchange="smtpAutoPort()">
+                <option value="starttls" data-i18n="opt_smtp_starttls">STARTTLS (port 587)</option>
+                <option value="ssl" data-i18n="opt_smtp_ssl">SSL/TLS (port 465)</option>
+                <option value="none" data-i18n="opt_smtp_none">None (port 25)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label data-i18n="lbl_smtp_user">Username</label>
+              <input id="smtp_user" placeholder="user@example.com">
+            </div>
+            <div class="form-group">
+              <label data-i18n="lbl_smtp_pass">Password</label>
+              <input id="smtp_pass" type="password" placeholder="••••••••">
+            </div>
+            <div class="form-group">
+              <label data-i18n="lbl_smtp_from">Sender (From)</label>
+              <input id="smtp_from" placeholder="netapp-plugin@example.com">
+            </div>
+          </div>
+          <p class="hint" style="margin-top:4px" data-i18n="hint_smtp_desc">Used for schedule job notifications.
+            Configure recipients and notification filter per schedule.</p>
+          <div class="form-actions">
+            <button class="btn btn-ghost" onclick="testSmtp()" data-i18n="btn_test_smtp">Test Connection</button>
+            <button class="btn btn-primary" onclick="saveSmtp()" data-i18n="btn_save">Save</button>
+          </div>
+        </div>
+
+        <!-- ═══════════════ DATA BACKUP / RESTORE ═══════════════ -->
+        <div class="sub-header" style="margin-top:16px">
+          <span class="sub-header-title"><svg class="tab-icon" width="14" height="14" fill="none" stroke="currentColor"
+              viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
+            </svg>Data Backup / Restore</span>
+        </div>
+        <div class="card">
+          <p class="hint" style="margin-bottom:12px">
+            Export plugin configuration (endpoints, PVE hosts, volume mappings, schedules, provisioned datastores, SMTP
+            config) as a JSON file.
+            Use the exported file to restore the plugin on a new or rebuilt server. Passwords are exported in encrypted
+            form — they will only work if the encryption key is the same on the target server.
+            Snapshot history and SnapMirror relationship cache are not included — both are repopulated automatically.
+          </p>
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+            <a id="exportDataLink" href="#" onclick="triggerExport(event)" class="btn btn-primary"
+              data-i18n="a_export_plugin_data">Export Plugin Data</a>
+            <label class="btn btn-ghost" style="cursor:pointer;margin:0">
+              Import from File
+              <input type="file" id="importFileInput" accept=".json" style="display:none"
+                onchange="importPluginData(this)">
+            </label>
+            <span id="importStatus" style="font-size:13px;color:var(--muted)"></span>
+          </div>
+        </div>
+
+
+
+      </div>
+
+    </div><!-- /.content -->
+  </div><!-- /.layout -->
+
+  <div id="toast" class="toast" style="display:none" role="status" aria-live="polite" aria-atomic="true"></div>
+
+
+  <!-- ═══════════════════════ DEPLOY WIZARD MODAL ═══════════════════════ -->
+  <div id="setupWizardModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="setupWizardBackdropClick(event)">
+    <div
+      style="max-width:700px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+
+      <!-- Modal header -->
+      <div
+        style="display:flex;align-items:center;gap:10px;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+          style="flex-shrink:0;color:var(--accent)">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg>
+        <span style="font-size:14px;font-weight:600" data-i18n="sp_deploy_wizard">Deploy Wizard</span>
+        <span style="font-size:12px;color:var(--muted)" data-i18n="sp_initial_setup">— Initial Setup</span>
+        <button class="btn btn-ghost btn-sm" style="margin-left:auto;font-size:15px;padding:2px 8px;line-height:1"
+          onclick="setupWizardClose()">✕</button>
+      </div>
+
+      <!-- Modal body -->
+      <div style="padding:20px">
+
+        <!-- Progress strip -->
+        <div
+          style="display:flex;gap:0;margin-bottom:20px;border-radius:6px;overflow:hidden;border:1px solid var(--border)">
+          <div class="setup-step-pill" id="spill1" onclick="setupShowStep(1)" data-i18n="di_system">① System</div>
+          <div class="setup-step-pill" id="spill2" onclick="setupShowStep(2)" data-i18n="di_pve_hosts">② PVE Hosts</div>
+          <div class="setup-step-pill" id="spill3" onclick="setupShowStep(3)" data-i18n="di_netapp">③ NetApp</div>
+          <div class="setup-step-pill" id="spill4" onclick="setupShowStep(4)" data-i18n="di_ready">④ Ready</div>
+        </div>
+
+        <!-- ── Step 1: ProxmoxVEx System Check ── -->
+        <div class="card setup-step-card" id="setupStep1">
+          <div class="card-title" data-i18n="di_proxmoxvex_system_check">① ProxmoxVEx System Check</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:12px"
+            data-i18n="p_checks_that_all_required_tools_are_available_on_">
+            Checks that all required tools are available on the ProxmoxVEx host.
+          </p>
+          <div id="setupDepsResult" style="margin-bottom:12px"></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="setupRunSystemCheck()">
+              Run Checks <span id="setupSysSpinner" class="spinner" style="display:none;margin-left:4px"></span>
+            </button>
+            <div id="setupSshKeyBox"
+              style="display:none;margin-left:8px;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:12px;max-width:100%">
+              <div
+                style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:4px"
+                data-i18n="di_ssh_public_key_copy_to_pve_hosts_if_needed">SSH Public Key (copy to PVE hosts if needed)
+              </div>
+              <code id="setupSshPubKey" style="word-break:break-all;font-size:11px;color:var(--text)"></code>
+              <button class="btn btn-ghost btn-sm" style="margin-left:8px;font-size:11px" onclick="setupCopySshKey()"
+                data-i18n="bu_copy">📋 Copy</button>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;margin-top:12px">
+            <button class="btn btn-secondary btn-sm" onclick="setupShowStep(2)" data-i18n="pg_next">Next →</button>
+          </div>
+        </div>
+
+        <!-- ── Step 2: PVE Hosts & Packages ── -->
+        <div class="card setup-step-card" id="setupStep2" style="display:none">
+          <div class="card-title" data-i18n="di_proxmox_ve_hosts_amp_packages">② Proxmox VE Hosts &amp; Packages</div>
+
+          <!-- Main view: host table -->
+          <div id="wizHostMainView">
+            <p style="font-size:13px;color:var(--muted);margin-bottom:12px"
+              data-i18n="p_hosts_are_imported_from_proxmoxvex_automatically">
+              Hosts are imported from ProxmoxVEx automatically. SSH and packages are checked on every host — use the Fix
+              button to resolve any issues.
+            </p>
+            <div id="wizHostTable" style="margin-bottom:12px">
+              <span style="color:var(--muted);font-size:13px" data-i18n="di_loading">Loading…</span>
+            </div>
+            <div id="wizPkgInstallMsg" style="font-size:12px;margin-bottom:8px"></div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-ghost btn-sm" onclick="wizStep2Load()">
+                ↻ Re-check All <span id="wizStep2Spinner" class="spinner" style="display:none;margin-left:4px"></span>
+              </button>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-top:14px">
+              <button class="btn btn-ghost btn-sm" onclick="setupShowStep(1)" data-i18n="pg_prev">← Back</button>
+              <button class="btn btn-secondary btn-sm" onclick="setupShowStep(3)" data-i18n="pg_next">Next →</button>
+            </div>
+          </div>
+
+          <!-- Fix view: SSH troubleshoot panel (shown instead of main view) -->
+          <div id="wizFixPanel" style="display:none">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
+              <button class="btn btn-ghost btn-sm" onclick="wizHideHostFix()" data-i18n="pg_prev">← Back</button>
+              <span style="font-size:13px;font-weight:600" data-i18n="sp_fix_ssh_connection">Fix SSH Connection</span>
+            </div>
+
+            <!-- Host info + error -->
+            <div id="wizFixHostInfo"
+              style="margin-bottom:14px;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:13px">
+            </div>
+
+            <!-- Test SSH -->
+            <div style="margin-bottom:16px">
+              <button class="btn btn-primary" onclick="wizRetestHostSsh()">
+                Test SSH
+                <span id="wizFixSshSpinner" class="spinner" style="display:none;margin-left:4px"></span>
+              </button>
+              <div id="wizFixSshResult" style="font-size:12px;margin-top:6px"></div>
+            </div>
+
+            <!-- SSH public key -->
+            <div style="margin-bottom:16px">
+              <div
+                style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px"
+                data-i18n="di_ssh_public_key">SSH Public Key</div>
+              <div
+                style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px;display:flex;align-items:flex-start;gap:8px">
+                <code id="wizFixSshKey" style="font-size:10px;word-break:break-all;flex:1;color:var(--text)">—</code>
+                <button class="btn btn-ghost btn-sm" style="font-size:11px;flex-shrink:0;padding:2px 6px"
+                  onclick="wizFixCopySshKey()" data-i18n="bu_copy">📋 Copy</button>
+              </div>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px">Paste into
+                <code>/root/.ssh/authorized_keys</code>, or use the form below to push automatically.
+              </div>
+            </div>
+
+            <!-- Push key via password -->
+            <div>
+              <div
+                style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px"
+                data-i18n="di_push_key_via_password">Push Key via Password</div>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <input class="form-control" id="wizFixHostPass" type="password" placeholder="root password"
+                  style="max-width:180px">
+                <button class="btn btn-secondary" onclick="wizPushHostKey()">
+                  Push Key
+                  <span id="wizFixPushSpinner" class="spinner" style="display:none;margin-left:4px"></span>
+                </button>
+              </div>
+              <div id="wizFixPushResult" style="font-size:12px;margin-top:6px"></div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- ── Step 3: NetApp ONTAP (add + create user in one go) ── -->
+        <div class="card setup-step-card" id="setupStep3" style="display:none">
+          <div class="card-title" data-i18n="di_netapp_ontap_systems">③ NetApp ONTAP Systems</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:12px">
+            Enter the cluster management IP and your admin credentials. The wizard will
+            create a dedicated <code>ProxmoxVEx</code> account on ONTAP and register
+            the system — the admin password is only used here and never stored.
+            Add as many systems as you need (primary, secondary, DR cluster).
+          </p>
+
+          <!-- Already-registered endpoints -->
+          <div id="wizEpList" style="margin-bottom:10px"></div>
+
+          <!-- Combined add + user form -->
+          <div id="wizAddEpBox"
+            style="padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;margin-bottom:12px">
+            <div
+              style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:12px"
+              data-i18n="di_add_netapp_system">Add NetApp System</div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label>Name <span style="font-weight:400;color:var(--muted)" data-i18n="sp_friendly_label">(friendly
+                    label)</span></label>
+                <input class="form-control" id="wiz_ep_name" placeholder="ontap-cluster1">
+              </div>
+              <div class="form-group">
+                <label data-i18n="la_cluster_mgmt_ip_fqdn">Cluster Mgmt IP / FQDN</label>
+                <input class="form-control" id="wiz_ep_host" placeholder="10.0.0.1">
+              </div>
+            </div>
+            <div
+              style="margin:10px 0 6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)">
+              Admin credentials <span style="font-weight:400;text-transform:none;letter-spacing:0"
+                data-i18n="sp_temporary_not_stored">(temporary — not stored)</span></div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label data-i18n="la_admin_username">Admin Username</label>
+                <input class="form-control" id="wiz_ep_admin_user" value="admin">
+              </div>
+              <div class="form-group">
+                <label>Admin Password</label>
+                <input class="form-control" id="wiz_ep_admin_pass" type="password" placeholder="admin password">
+              </div>
+            </div>
+            <div
+              style="margin:10px 0 6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)"
+              data-i18n="di_plugin_account_to_create_on_ontap">Plugin account to create on ONTAP</div>
+            <div class="form-grid">
+              <div class="form-group">
+                <label data-i18n="lbl_username">Username</label>
+                <input class="form-control" id="wiz_ep_user" value="ProxmoxVEx">
+              </div>
+              <div class="form-group">
+                <label data-i18n="lbl_password">Password</label>
+                <input class="form-control" id="wiz_ep_pass" type="password" placeholder="strong password">
+              </div>
+              <div class="form-group">
+                <label data-i18n="la_role">Role</label>
+                <select class="form-control" id="wiz_ep_role">
+                  <option value="admin" data-i18n="op_admin_full_rest_api_http_only">admin (full REST API, HTTP only)
+                  </option>
+                  <option value="readonly" data-i18n="op_readonly_monitoring_only">readonly (monitoring only)</option>
+                </select>
+              </div>
+            </div>
+            <label
+              style="display:flex;align-items:center;gap:8px;font-size:13px;margin:8px 0 12px;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:400">
+              <input type="checkbox" id="wiz_ep_ssl"> Verify SSL certificate
+            </label>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-primary" onclick="wizAddOntapSystem()">
+                Create User &amp; Register System <span id="wizAddEpSpinner" class="spinner"
+                  style="display:none;margin-left:4px"></span>
+              </button>
+            </div>
+            <div id="wizAddEpResult" style="font-size:12px;margin-top:8px"></div>
+          </div>
+
+          <!-- Test already-registered endpoints -->
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <button class="btn btn-secondary" onclick="setupTestEndpoints()">
+              Test All Registered Systems <span id="setupEpSpinner" class="spinner"
+                style="display:none;margin-left:4px"></span>
+            </button>
+          </div>
+          <div id="setupEpResult" style="margin-bottom:4px"></div>
+
+          <div style="display:flex;justify-content:space-between;margin-top:12px">
+            <button class="btn btn-ghost btn-sm" onclick="setupShowStep(2)" data-i18n="pg_prev">← Back</button>
+            <button class="btn btn-secondary btn-sm" onclick="setupShowStep(4)" data-i18n="pg_next">Next →</button>
+          </div>
+        </div>
+
+        <!-- ── Step 4: Ready ── -->
+        <div class="card setup-step-card" id="setupStep4" style="display:none">
+          <div class="card-title" data-i18n="di_ready_run_initial_discovery">④ Ready — Run Initial Discovery</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:12px"
+            data-i18n="p_everything_is_configured_run_auto_discovery_to_d">
+            Everything is configured. Run Auto-Discovery to detect datastores already present on your PVE cluster.
+          </p>
+          <div id="setupReadySummary" style="margin-bottom:12px"></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="runDetectAndScan(); setupWizardClose();">
+              <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                style="vertical-align:middle;margin-right:3px">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+              </svg>
+              Detect &amp; Scan — Close
+            </button>
+            <button class="btn btn-ghost" onclick="setupWizardClose()" data-i18n="bu_close_1">Close</button>
+          </div>
+          <div style="display:flex;justify-content:flex-start;margin-top:12px">
+            <button class="btn btn-ghost btn-sm" onclick="setupShowStep(3)" data-i18n="pg_prev">← Back</button>
+          </div>
+        </div>
+
+      </div><!-- /modal body -->
+    </div><!-- /modal box -->
+  </div><!-- /setupWizardModal -->
+
+  <!-- ── Provision New Datastore Modal ─────────────────────────────── -->
+  <div id="provWizModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto;align-items:flex-start;justify-content:center"
+    onclick="provWizBackdropClick(event)">
+    <div
+      style="max-width:760px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_provision_new_datastore">📦 Provision New Datastore
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="hideProvWizard()"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px">
+
+        <!-- Step indicator -->
+        <div style="display:flex;gap:0;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:12px">
+          <div id="provWizStepTab1"
+            style="flex:1;text-align:center;font-size:12px;font-weight:600;color:var(--primary);padding:4px 0"
+            data-i18n="di_1_protocol">1 · Protocol</div>
+          <div id="provWizStepTab2" style="flex:1;text-align:center;font-size:12px;color:var(--muted);padding:4px 0"
+            data-i18n="di_2_resource">2 · Resource</div>
+          <div id="provWizStepTab3" style="flex:1;text-align:center;font-size:12px;color:var(--muted);padding:4px 0"
+            data-i18n="di_3_hosts_amp_name">3 · Hosts &amp; Name</div>
+        </div>
+
+        <!-- Step 1: Protocol + Endpoint + SVM + Datastore name -->
+        <div id="provWizStep1">
+          <div class="form-grid" style="margin-bottom:14px">
+            <div class="form-group">
+              <label data-i18n="th_protocol">Protocol</label>
+              <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:4px">
+                <label
+                  style="display:flex;align-items:center;gap:6px;font-size:12px;text-transform:none;letter-spacing:0;cursor:pointer">
+                  <input type="radio" name="provProto" value="iscsi" checked onchange="provProtoChange()"> iSCSI
+                </label>
+                <label
+                  style="display:flex;align-items:center;gap:6px;font-size:12px;text-transform:none;letter-spacing:0;cursor:pointer">
+                  <input type="radio" name="provProto" value="nvme" onchange="provProtoChange()"> NVMe-oF
+                </label>
+                <label
+                  style="display:flex;align-items:center;gap:6px;font-size:12px;text-transform:none;letter-spacing:0;cursor:pointer">
+                  <input type="radio" name="provProto" value="nfs" onchange="provProtoChange()"> NFS
+                </label>
+              </div>
+            </div>
+            <div class="form-group">
+              <label data-i18n="la_datastore_name">Datastore Name</label>
+              <input class="form-control" id="provWizName" placeholder="e.g. san-prod">
+            </div>
+            <div class="form-group">
+              <label data-i18n="la_ontap_endpoint">ONTAP Endpoint</label>
+              <select class="form-control" id="provWizEndpoint" onchange="loadProvSvms()">
+                <option value="" data-i18n="op_select">— select —</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>SVM</label>
+              <select class="form-control" id="provWizSvm">
+                <option value="" data-i18n="op_select_endpoint_first">— select endpoint first —</option>
+              </select>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <button class="btn btn-primary" onclick="provWizNext1()">
+              Next <span id="provOntapLoading" class="spinner" style="display:none;margin-left:4px"></span>
+            </button>
+            <button class="btn btn-ghost" onclick="hideProvWizard()" data-i18n="btn_cancel">Cancel</button>
+            <span id="provOntapLoadErr" style="color:var(--error);font-size:12px"></span>
+          </div>
+        </div>
+
+        <!-- Step 2: ONTAP resource — protocol-specific sections -->
+        <div id="provWizStep2" style="display:none">
+
+          <!-- Common: Volume selector -->
+          <div class="form-grid" style="margin-bottom:6px">
+            <div class="form-group">
+              <label data-i18n="th_volume">Volume</label>
+              <select class="form-control" id="provWizVolume" onchange="provWizVolumeChange()">
+                <option value="__new__" data-i18n="op_create_new_volume">— create new volume —</option>
+              </select>
+            </div>
+            <div class="form-group" id="provWizNewVolRow" style="display:none">
+              <label data-i18n="la_new_volume_name">New Volume Name</label>
+              <input class="form-control" id="provWizVolName" placeholder="e.g. ucnlabprox_san01">
+            </div>
+            <div class="form-group" id="provWizAggRow">
+              <label>Aggregate <span style="font-weight:400;color:var(--muted)"
+                  data-i18n="sp_for_new_volume_optional">(for new volume, optional)</span></label>
+              <select class="form-control" id="provWizAggregate">
+                <option value="" data-i18n="op_loading">— loading… —</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- iSCSI: LUN + iGroup -->
+          <div id="provWizIscsiSection">
+            <div class="form-grid" style="margin-bottom:6px">
+              <div class="form-group">
+                <label data-i18n="la_lun">LUN</label>
+                <select class="form-control" id="provWizLun" onchange="provWizLunChange()">
+                  <option value="__new__" data-i18n="op_create_new">— create new —</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-grid" id="provWizNewLunRow" style="margin-bottom:14px">
+              <div class="form-group">
+                <label data-i18n="la_new_lun_name">New LUN Name</label>
+                <input class="form-control" id="provWizLunName" placeholder="e.g. proxmox-lun-01">
+              </div>
+              <div class="form-group">
+                <label data-i18n="la_lun_size">LUN Size</label>
+                <div style="display:flex;gap:6px">
+                  <input class="form-control" id="provWizLunSize" type="number" min="1" value="100" style="width:90px"
+                    oninput="provWizUpdateSanVolHint('provWizLunSize','provWizLunSizeUnit','provWizLunVolHint','LUN')"
+                    onchange="provWizUpdateSanVolHint('provWizLunSize','provWizLunSizeUnit','provWizLunVolHint','LUN')">
+                  <select class="form-control" id="provWizLunSizeUnit" style="width:80px"
+                    onchange="provWizUpdateSanVolHint('provWizLunSize','provWizLunSizeUnit','provWizLunVolHint','LUN')">
+                    <option value="GiB">GiB</option>
+                    <option value="TiB">TiB</option>
+                    <option value="MiB">MiB</option>
+                  </select>
+                </div>
+                <div id="provWizLunVolHint" class="hint" style="margin-top:4px"></div>
+              </div>
+              <div class="form-group">
+                <label data-i18n="la_igroup">iGroup</label>
+                <select class="form-control" id="provWizIgroup" onchange="provWizIgroupChange()">
+                  <option value="__new__" data-i18n="op_create_new">— create new —</option>
+                </select>
+              </div>
+              <div class="form-group" id="provWizNewIgroupRow" style="display:none">
+                <label data-i18n="la_new_igroup_name">New iGroup Name</label>
+                <input class="form-control" id="provWizIgroupName" data-i18n-placeholder="auto-generated if blank"
+                  placeholder="auto-generated if blank">
+              </div>
+            </div>
+          </div>
+
+          <!-- NVMe: Namespace + Subsystem -->
+          <div id="provWizNvmeSection" style="display:none">
+            <div class="form-grid" style="margin-bottom:6px">
+              <div class="form-group">
+                <label data-i18n="la_namespace">Namespace</label>
+                <select class="form-control" id="provWizNs" onchange="provWizNsChange()">
+                  <option value="__new__" data-i18n="op_create_new">— create new —</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-grid" id="provWizNewNsRow" style="margin-bottom:14px">
+              <div class="form-group">
+                <label data-i18n="la_new_namespace_name">New Namespace Name</label>
+                <input class="form-control" id="provWizNsName" placeholder="e.g. proxmox-ns-01">
+              </div>
+              <div class="form-group">
+                <label data-i18n="la_namespace_size">Namespace Size</label>
+                <div style="display:flex;gap:6px">
+                  <input class="form-control" id="provWizNsSize" type="number" min="1" value="100" style="width:90px"
+                    oninput="provWizUpdateSanVolHint('provWizNsSize','provWizNsSizeUnit','provWizNsVolHint','namespace')"
+                    onchange="provWizUpdateSanVolHint('provWizNsSize','provWizNsSizeUnit','provWizNsVolHint','namespace')">
+                  <select class="form-control" id="provWizNsSizeUnit" style="width:80px"
+                    onchange="provWizUpdateSanVolHint('provWizNsSize','provWizNsSizeUnit','provWizNsVolHint','namespace')">
+                    <option value="GiB">GiB</option>
+                    <option value="TiB">TiB</option>
+                    <option value="MiB">MiB</option>
+                  </select>
+                </div>
+                <div id="provWizNsVolHint" class="hint" style="margin-top:4px"></div>
+              </div>
+              <div class="form-group">
+                <label data-i18n="la_nvme_subsystem">NVMe Subsystem</label>
+                <select class="form-control" id="provWizSubsystem" onchange="provWizSubsystemChange()">
+                  <option value="__new__" data-i18n="op_create_new">— create new —</option>
+                </select>
+              </div>
+              <div class="form-group" id="provWizNewSubsystemRow" style="display:none">
+                <label data-i18n="la_new_subsystem_name">New Subsystem Name</label>
+                <input class="form-control" id="provWizSubsystemName" data-i18n-placeholder="auto-generated if blank"
+                  placeholder="auto-generated if blank">
+              </div>
+            </div>
+          </div>
+
+          <!-- NFS: LIF + Junction Path + Volume Size -->
+          <div id="provWizNfsSection" style="display:none">
+            <div class="form-grid" style="margin-bottom:14px">
+              <div class="form-group">
+                <label>NFS LIF <span style="font-weight:400;color:var(--muted)"
+                    data-i18n="sp_storage_network_interface">(storage network interface)</span></label>
+                <select class="form-control" id="provWizNfsLif" onchange="provWizNfsLifChange()">
+                  <option value="" data-i18n="op_loading">— loading… —</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label data-i18n="la_junction_path">Junction Path</label>
+                <input class="form-control" id="provWizNfsJunction" placeholder="e.g. /nfs-prod">
+              </div>
+              <div class="form-group" id="provWizNfsSizeRow">
+                <label>Volume Size <span style="font-weight:400;color:var(--muted)" data-i18n="sp_for_new_volume">(for
+                    new volume)</span></label>
+                <div style="display:flex;gap:6px">
+                  <input class="form-control" id="provWizNfsSize" type="number" min="1" value="500" style="width:90px">
+                  <select class="form-control" id="provWizNfsSizeUnit" style="width:80px">
+                    <option value="GiB">GiB</option>
+                    <option value="TiB">TiB</option>
+                    <option value="MiB">MiB</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-ghost" onclick="provWizShowStep(1)" data-i18n="pg_prev">← Back</button>
+            <button class="btn btn-primary" onclick="provWizNext2()" data-i18n="pg_next">Next →</button>
+            <button class="btn btn-ghost" onclick="hideProvWizard()" data-i18n="btn_cancel">Cancel</button>
+          </div>
+        </div>
+
+        <!-- Step 3: Hosts + Names + LVM type (LVM hidden for NFS) -->
+        <div id="provWizStep3" style="display:none">
+          <div class="form-grid" style="margin-bottom:14px">
+            <div class="form-group" style="grid-column:1/-1">
+              <label data-i18n="th_pve_hosts">PVE Hosts</label>
+              <div id="provWizHostList" style="margin-top:4px"></div>
+            </div>
+            <div class="form-group">
+              <label data-i18n="la_pve_storage_id">PVE Storage ID</label>
+              <input class="form-control" id="provWizStorageId" placeholder="e.g. san-prod">
+            </div>
+            <div class="form-group prov-san-only">
+              <label data-i18n="la_lvm_vg_name">LVM VG Name</label>
+              <input class="form-control" id="provWizVgName" placeholder="e.g. vgsanprod">
+            </div>
+            <div class="form-group prov-san-only">
+              <label data-i18n="la_lvm_type">LVM Type</label>
+              <select class="form-control" id="provWizLvmType">
+                <option value="linear" data-i18n="op_linear_thick">Linear (thick)</option>
+                <option value="thin" data-i18n="op_thin_provisioned">Thin-provisioned</option>
+              </select>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-ghost" onclick="provWizShowStep(2)" data-i18n="pg_prev">← Back</button>
+            <button class="btn btn-primary" id="provSubmitBtn" onclick="submitProvWizard()"
+              data-i18n="bu_create_datastore">Create Datastore</button>
+            <button class="btn btn-ghost" onclick="hideProvWizard()" data-i18n="btn_cancel">Cancel</button>
+          </div>
+        </div>
+
+      </div><!-- /modal body -->
+    </div><!-- /modal box -->
+  </div><!-- /provWizModal -->
+
+  <!-- ── Mount existing Datastore Modal ─────────────────────────────── -->
+  <div id="bindWizModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto;align-items:flex-start;justify-content:center"
+    onclick="bindWizBackdropClick(event)">
+    <div
+      style="max-width:700px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_mount_existing_datastore">⇢ Mount existing Datastore
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="hideBindWizard()"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px">
+
+        <!-- Step indicator -->
+        <div style="display:flex;gap:0;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:12px">
+          <div id="rcvStepTab1"
+            style="flex:1;text-align:center;font-size:12px;font-weight:600;color:var(--primary);padding:4px 0"
+            data-i18n="di_1_select_volume">1 · Select Volume</div>
+          <div id="rcvStepTab2" style="flex:1;text-align:center;font-size:12px;color:var(--muted);padding:4px 0"
+            data-i18n="di_2_pve_target">2 · PVE Target</div>
+          <div id="rcvStepTab3" style="flex:1;text-align:center;font-size:12px;color:var(--muted);padding:4px 0"
+            data-i18n="di_3_confirm">3 · Confirm</div>
+        </div>
+
+        <!-- ── Step 1 ── -->
+        <div id="rcvStep1">
+          <div class="form-grid" style="margin-bottom:14px">
+            <div class="form-group">
+              <label data-i18n="la_ontap_endpoint">ONTAP Endpoint</label>
+              <select class="form-control" id="rcvEndpoint" onchange="rcvLoadSvms()">
+                <option value="" data-i18n="op_select">— select —</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>SVM</label>
+              <select class="form-control" id="rcvSvm" onchange="rcvOnSvmChange()">
+                <option value="" data-i18n="op_select_endpoint_first">— select endpoint first —</option>
+              </select>
+            </div>
+            <div class="form-group" id="rcvNfsLifRow" style="display:none">
+              <label>NFS LIF <span style="color:var(--muted);font-weight:400"
+                  data-i18n="sp_storage_network_interface">(storage network interface)</span></label>
+              <select class="form-control" id="rcvNfsLif">
+                <option value="" data-i18n="op_loading">— loading… —</option>
+              </select>
+              <span id="rcvNfsLifErr" style="color:var(--error);font-size:12px;margin-top:4px;display:block"></span>
+            </div>
+            <div class="form-group">
+              <label data-i18n="th_protocol">Protocol</label>
+              <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:4px">
+                <label
+                  style="display:flex;align-items:center;gap:6px;font-size:12px;text-transform:none;letter-spacing:0;cursor:pointer">
+                  <input type="radio" name="rcvProto" value="nfs" checked onchange="rcvOnSvmChange()"> NFS
+                </label>
+                <label
+                  style="display:flex;align-items:center;gap:6px;font-size:12px;text-transform:none;letter-spacing:0;cursor:pointer">
+                  <input type="radio" name="rcvProto" value="iscsi" onchange="rcvOnSvmChange()"> iSCSI
+                </label>
+                <label
+                  style="display:flex;align-items:center;gap:6px;font-size:12px;text-transform:none;letter-spacing:0;cursor:pointer">
+                  <input type="radio" name="rcvProto" value="nvme" onchange="rcvOnSvmChange()"> NVMe-oF
+                </label>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <button class="btn btn-primary" onclick="rcvScanVolumes()">
+              Scan Volumes <span id="rcvScanSpinner" class="spinner" style="display:none;margin-left:4px"></span>
+            </button>
+            <span id="rcvScanErr" style="color:var(--error);font-size:12px"></span>
+          </div>
+          <div id="rcvVolumeTableWrap" style="display:none;margin-top:16px">
+            <div style="font-size:12px;color:var(--muted);margin-bottom:6px" data-i18n="di_select_the_volume_to_bind">
+              Select the volume to bind:</div>
+            <div class="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th data-i18n="th_volume">Volume</th>
+                    <th data-i18n="th_type">Type</th>
+                    <th data-i18n="th_size">Size</th>
+                    <th data-i18n="tab_snapmirror">SnapMirror®</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="rcvVolumesTbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── Step 2 ── -->
+        <div id="rcvStep2" style="display:none">
+          <div style="margin-bottom:12px;padding:8px 12px;background:var(--bg);border-radius:6px;font-size:13px">
+            Volume: <strong id="rcvSelVolumeName"></strong>
+            <span id="rcvSelVolumeBadge" style="margin-left:8px"></span>
+          </div>
+          <div class="form-grid" style="margin-bottom:14px">
+            <div class="form-group">
+              <label>Storage Name <span style="color:var(--muted);font-weight:400" data-i18n="sp_pve_storage_id">(PVE
+                  storage ID)</span></label>
+              <input class="form-control" id="rcvStorageId" placeholder="e.g. netapp-prod">
+            </div>
+            <div class="form-group" id="rcvVgRow">
+              <label>VG Name <span style="color:var(--muted);font-weight:400"
+                  data-i18n="sp_optional_auto_detected_if_empty">(optional — auto-detected if empty)</span></label>
+              <input class="form-control" id="rcvVgName" data-i18n-placeholder="auto-detect from device"
+                placeholder="auto-detect from device">
+            </div>
+            <div class="form-group" id="rcvLvmTypeRow">
+              <label data-i18n="la_lvm_type">LVM Type</label>
+              <select class="form-control" id="rcvLvmType" onchange="rcvLvmTypeChange()">
+                <option value="linear" data-i18n="op_linear_lvm">Linear (LVM)</option>
+                <option value="thin" data-i18n="op_thin_lvm_thin">Thin (LVM-Thin)</option>
+              </select>
+            </div>
+            <div class="form-group" id="rcvPoolRow" style="display:none">
+              <label data-i18n="la_thin_pool_name">Thin Pool Name</label>
+              <input class="form-control" id="rcvPoolName" value="data">
+            </div>
+            <div class="form-group" id="rcvJunctionRow" style="display:none">
+              <label>Junction Path Override <span style="color:var(--muted);font-weight:400"
+                  data-i18n="lbl_new_name_hint">(optional)</span></label>
+              <input class="form-control" id="rcvJunctionPath" data-i18n-placeholder="leave empty to use original"
+                placeholder="leave empty to use original">
+            </div>
+          </div>
+          <div class="form-group" style="margin-bottom:14px">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+              <label style="margin:0" data-i18n="th_pve_hosts">PVE Hosts</label>
+              <span style="font-size:12px">
+                <a href="#" onclick="rcvSelectAllHosts(true);return false;"
+                  style="color:var(--primary);text-decoration:none" data-i18n="btn_all">All</a>
+                &nbsp;/&nbsp;
+                <a href="#" onclick="rcvSelectAllHosts(false);return false;"
+                  style="color:var(--muted);text-decoration:none" data-i18n="btn_none">None</a>
+              </span>
+            </div>
+            <div id="rcvHostCheckboxes" style="display:flex;flex-wrap:wrap;gap:10px;margin-top:4px"></div>
+          </div>
+          <div id="rcvSmBreakRow"
+            style="display:none;margin-bottom:14px;padding:10px 12px;background:var(--bg);border-left:3px solid var(--warning);border-radius:4px">
+            <label
+              style="display:flex;align-items:center;gap:8px;font-size:13px;text-transform:none;letter-spacing:0;cursor:pointer;font-weight:400">
+              <input type="checkbox" id="rcvSmBreak" checked>
+              Break SnapMirror® relationship before mounting
+              <span style="color:var(--muted);font-size:11px" data-i18n="sp_required_to_make_volume_writable">(required
+                to make volume writable)</span>
+            </label>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-ghost" onclick="rcvShowStep(1)" data-i18n="pg_prev">← Back</button>
+            <button class="btn btn-primary" onclick="rcvNext2()" data-i18n="pg_next">Next →</button>
+          </div>
+        </div>
+
+        <!-- ── Step 3 ── -->
+        <div id="rcvStep3" style="display:none">
+          <div style="margin-bottom:16px">
+            <div style="font-size:13px;font-weight:600;margin-bottom:8px" data-i18n="sched_step6">Summary</div>
+            <div id="rcvSummary"
+              style="font-size:13px;line-height:1.8;background:var(--bg);padding:10px 14px;border-radius:6px"></div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-ghost" onclick="rcvShowStep(2)" data-i18n="pg_prev">← Back</button>
+            <button class="btn btn-primary" onclick="rcvBind()">
+              Bind Volume <span id="rcvBindSpinner" class="spinner" style="display:none;margin-left:4px"></span>
+            </button>
+          </div>
+          <div id="rcvBindErr" style="color:var(--error);font-size:12px;margin-top:6px"></div>
+        </div>
+
+      </div><!-- /modal body -->
+    </div><!-- /modal box -->
+  </div><!-- /bindWizModal -->
+
+  <!-- ── Import VMs from Datastore Modal ───────────────────────────── -->
+  <div id="vmImportModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="vmImportBackdropClick(event)">
+    <div
+      style="max-width:860px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_import_vms_from_datastore">📥 Import VMs from
+          Datastore</div>
+        <button class="btn btn-ghost btn-sm" onclick="hideVmImportModal()"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px">
+
+        <!-- Step 1: Datastore + Snapshot -->
+        <div class="card" style="margin-bottom:12px">
+          <div class="card-title" data-i18n="di_1_select_datastore_amp_snapshot">1 · Select Datastore &amp; Snapshot
+          </div>
+          <div class="form-grid" style="margin-bottom:14px">
+            <div class="form-group">
+              <label data-i18n="th_datastore">Datastore</label>
+              <select class="form-control" id="impDs" onchange="impOnDsChange()">
+                <option value="" data-i18n="op_select">— select —</option>
+              </select>
+            </div>
+            <div class="form-group" id="impSnapRow" style="display:none">
+              <label>
+                Snapshot Manifest
+                <span style="display:block;font-size:11px;font-weight:400;color:var(--muted);margin-top:2px"
+                  data-i18n="sp_only_vm_configuration_files_conf_are_read_from_t">
+                  Only VM configuration files (.conf) are read from this snapshot — disk data stays on the NetApp
+                  datastore unchanged.
+                </span>
+              </label>
+              <select class="form-control" id="impSnap">
+                <option value="" data-i18n="op_loading">— loading… —</option>
+              </select>
+            </div>
+            <div class="form-group" id="impSnapSanRow" style="display:none">
+              <label>
+                Snapshot Manifest
+                <span style="display:block;font-size:11px;font-weight:400;color:var(--muted);margin-top:2px"
+                  data-i18n="sp_only_vm_configuration_files_conf_are_read_from_t_1">
+                  Only VM configuration files (.conf) are read from the manifest — disk data stays on the NetApp
+                  datastore unchanged.
+                </span>
+              </label>
+              <div style="padding:8px 0;font-size:13px;color:var(--muted)"
+                data-i18n="di_san_using_latest_manifest_from_live_vg">
+                SAN: using latest manifest from live VG
+              </div>
+            </div>
+            <div class="form-group" id="impHostRow" style="display:none">
+              <label>
+                Target PVE Host
+                <span style="display:block;font-size:11px;font-weight:400;color:var(--muted);margin-top:2px"
+                  data-i18n="sp_host_that_receives_the_vm_config_files_in_a_clus">
+                  Host that receives the VM config files. In a cluster, pmxcfs syncs them automatically.
+                </span>
+              </label>
+              <select class="form-control" id="impHostSel">
+                <option value="" data-i18n="op_auto_first_available">— Auto (first available) —</option>
+              </select>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <button class="btn btn-primary" onclick="impLoadVms()">
+              Load VMs <span id="impLoadSpinner" class="spinner" style="display:none;margin-left:4px"></span>
+            </button>
+            <span id="impLoadErr" style="color:var(--error);font-size:12px"></span>
+          </div>
+        </div>
+
+        <!-- Step 2: VM selection + VMID config -->
+        <div class="card" id="impVmsCard" style="display:none;margin-bottom:12px">
+          <div class="card-title" data-i18n="di_2_select_vms_amp_vmid_assignment">2 · Select VMs &amp; VMID Assignment
+          </div>
+
+          <!-- VMID mode -->
+          <div style="margin-bottom:14px;padding:10px 14px;background:var(--bg);border-radius:6px">
+            <div
+              style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px"
+              data-i18n="di_vmid_assignment">VMID Assignment</div>
+            <div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center">
+              <label
+                style="display:flex;align-items:center;gap:6px;font-size:13px;text-transform:none;letter-spacing:0;cursor:pointer;font-weight:400">
+                <input type="radio" name="impVmidMode" value="keep" checked onchange="impUpdateVmidPreview()"> Keep
+                original IDs
+              </label>
+              <label
+                style="display:flex;align-items:center;gap:6px;font-size:13px;text-transform:none;letter-spacing:0;cursor:pointer;font-weight:400">
+                <input type="radio" name="impVmidMode" value="offset" onchange="impUpdateVmidPreview()">
+                Fixed offset &nbsp;<input type="number" id="impVmidOffset" value="0" min="0"
+                  style="width:70px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;background:var(--input-bg);color:var(--text)"
+                  oninput="impUpdateVmidPreview()">
+              </label>
+              <label
+                style="display:flex;align-items:center;gap:6px;font-size:13px;text-transform:none;letter-spacing:0;cursor:pointer;font-weight:400">
+                <input type="radio" name="impVmidMode" value="auto" onchange="impUpdateVmidPreview()">
+                Auto-assign <span style="color:var(--muted);font-size:11px" data-i18n="sp_next_free_ids">(next free
+                  IDs)</span>
+                <button class="btn btn-ghost btn-sm" onclick="impFetchUsedVmids()"
+                  style="margin-left:4px;font-size:11px">
+                  Refresh free IDs <span id="impUsedSpinner" class="spinner"
+                    style="display:none;margin-left:2px"></span>
+                </button>
+              </label>
+            </div>
+            <div id="impUsedVmidsInfo" style="font-size:11px;color:var(--muted);margin-top:6px"></div>
+          </div>
+
+          <!-- VM table -->
+          <div class="table-scroll" style="margin-bottom:14px">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:32px">
+                    <input type="checkbox" id="impSelectAll" onchange="impToggleAll(this.checked)"
+                      data-i18n-title="Select all" title="Select all">
+                  </th>
+                  <th data-i18n="th_original_vmid">Original VMID</th>
+                  <th data-i18n="th_name">Name</th>
+                  <th data-i18n="th_type">Type</th>
+                  <th data-i18n="th_new_vmid">New VMID</th>
+                </tr>
+              </thead>
+              <tbody id="impVmsTbody"></tbody>
+            </table>
+          </div>
+
+          <!-- Datastore Name Rewrite -->
+          <div id="impStorageRewSection"
+            style="margin-bottom:14px;padding:10px 14px;background:var(--bg);border-radius:6px;display:none">
+            <div
+              style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px"
+              data-i18n="di_datastore_name_rewrite">Datastore Name Rewrite</div>
+            <div id="impStorageRewInfo" style="font-size:12px;margin-bottom:8px;line-height:1.5"></div>
+            <div id="impStorageRewFields" style="display:flex;align-items:center;gap:8px;font-size:13px">
+              <label
+                style="color:var(--muted);white-space:nowrap;font-size:12px;text-transform:none;letter-spacing:0;font-weight:400"
+                data-i18n="la_from">From:</label>
+              <input class="form-control" id="impStorageOld" style="max-width:180px"
+                data-i18n-placeholder="(auto-detected)" placeholder="(auto-detected)">
+              <span style="color:var(--muted);font-size:13px">→</span>
+              <label
+                style="color:var(--muted);white-space:nowrap;font-size:12px;text-transform:none;letter-spacing:0;font-weight:400"
+                data-i18n="la_to">To:</label>
+              <input class="form-control" id="impStorageNew" style="max-width:180px;opacity:.7;cursor:default" readonly
+                tabindex="-1" data-i18n-placeholder="(current datastore)" placeholder="(current datastore)">
+            </div>
+            <div style="font-size:11px;color:var(--muted);margin-top:4px">Edit <em data-i18n="em_from">From</em> only if
+              the manifest uses a different name than auto-detected.</div>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:8px">
+            <button class="btn btn-primary" id="impImportBtn" onclick="impDoImport()">
+              Import VMs <span id="impImportSpinner" class="spinner" style="display:none;margin-left:4px"></span>
+            </button>
+            <span id="impImportErr" style="color:var(--error);font-size:12px"></span>
+            <span id="impImportOk" style="color:var(--success);font-size:12px"></span>
+          </div>
+        </div>
+
+      </div><!-- /modal body -->
+    </div><!-- /modal box -->
+  </div><!-- /vmImportModal -->
+
+  <!-- ── Create Snapshot Modal ─────────────────────────────────────── -->
+  <div id="createSnapshotForm"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="createSnapshotBackdropClick(event)">
+    <div
+      style="max-width:960px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="ct_create_snapshot">Create Snapshot</div>
+        <button class="btn btn-ghost btn-sm" onclick="hideForm('createSnapshotForm')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:flex;flex-direction:column;gap:14px">
+        <div class="form-group">
+          <label data-i18n="th_datastore">Datastore</label>
+          <select id="snap_mapping" onchange="updateSnapMapping()"></select>
+        </div>
+        <!-- Blast-radius: shown after datastore is selected -->
+        <div id="snap_blast_radius"
+          style="display:none;padding:10px 14px;border:1px solid rgba(217,83,79,.3);border-radius:6px;background:rgba(217,83,79,.05)">
+          <div
+            style="font-size:11px;font-weight:700;letter-spacing:.06em;color:#d9534f;margin-bottom:7px;text-transform:uppercase"
+            data-i18n="di_affected_vms">Affected VMs</div>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:6px">This snapshot covers the entire volume —
+            <strong id="snap_blast_count">0</strong> VM(s) will be included.
+          </div>
+          <div id="snap_blast_list" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+        </div>
+        <select id="snap_vmids_select" style="display:none" multiple>
+          <option disabled data-i18n="hint_mapping_first">Select mapping …</option>
+        </select>
+        <div class="form-group">
+          <label><span data-i18n="lbl_name">Name</span> <span style="opacity:.6"
+              data-i18n-html="lbl_name_hint">(snapshot will be named NPP_<em
+                data-i18n="th_name">Name</em>)</span></label>
+          <input id="snap_name" placeholder="e.g. before-update, test-migration">
+        </div>
+        <div class="form-group">
+          <label data-i18n="lbl_consistency">Consistency</label>
+          <select id="snap_consistency">
+            <option value="crash" data-i18n="opt_crash">Crash-consistent</option>
+            <option value="app" data-i18n="opt_app_qemu">App-consistent (QEMU guest-agent)</option>
+          </select>
+        </div>
+        <!-- SnapMirror section — shown only when an SM relationship exists for the selected mapping -->
+        <div id="snap_sm_section"
+          style="display:none;flex-direction:column;gap:10px;border:1px solid var(--border);border-radius:6px;padding:14px;background:var(--bg)">
+          <div id="snap_sm_info" style="font-size:12px;color:var(--muted)"></div>
+          <div class="form-group" style="margin:0">
+            <label><span data-i18n="lbl_snapmirror_label">SnapMirror Label</span> <span style="opacity:.6"
+                data-i18n="lbl_snapmirror_hint">(optional)</span></label>
+            <select id="snap_label">
+              <option value="" data-i18n="op_no_label">— no label —</option>
+            </select>
+          </div>
+          <div class="form-group" style="margin:0">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+              <input type="checkbox" id="snap_sm_update">
+              <span data-i18n="sm_update_after_snap">Update SnapMirror® after snapshot</span>
+            </label>
+          </div>
+        </div>
+        <p class="hint" style="margin:0">
+          ⚠️ All disks of a VM must reside on the <strong data-i18n="st_same_datastore">same datastore</strong> to be
+          included in a consistent snapshot.
+          VMs with disks spread across multiple datastores are not snapshotted consistently.
+        </p>
+        <div class="form-actions" style="margin:0">
+          <button class="btn btn-primary" onclick="createSnapshot()" data-i18n="btn_start_snapshot">Start
+            Snapshot</button>
+          <button class="btn btn-ghost" onclick="hideForm('createSnapshotForm')" data-i18n="btn_cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div><!-- /createSnapshotForm -->
+
+  <!-- ── Add/Edit Schedule Modal ───────────────────────────────────── -->
+  <div id="addScheduleForm" role="dialog" aria-modal="true" aria-label="Schedule"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="addScheduleBackdropClick(event)">
+    <div
+      style="max-width:960px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+
+      <!-- Header -->
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div id="sched_form_title" style="font-size:16px;font-weight:700" data-i18n="ct_new_schedule">New Schedule</div>
+        <button class="btn btn-ghost btn-sm" onclick="hideForm('addScheduleForm')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+
+      <!-- Body -->
+      <div style="padding:20px">
+
+        <!-- Progress strip -->
+        <div
+          style="display:flex;gap:0;margin-bottom:20px;border-radius:6px;overflow:hidden;border:1px solid var(--border)">
+          <div class="setup-step-pill" id="swpill1" onclick="schedWizGoStep(1)">① <span
+              data-i18n="sched_step1">Basics</span></div>
+          <div class="setup-step-pill" id="swpill2" onclick="schedWizGoStep(2)">② <span
+              data-i18n="sched_step2">Schedule</span></div>
+          <div class="setup-step-pill" id="swpill3" onclick="schedWizGoStep(3)">③ <span data-i18n="sched_step3">VMs
+              &amp; Scripts</span></div>
+          <div class="setup-step-pill" id="swpill4" onclick="schedWizGoStep(4)">④ <span
+              data-i18n="sched_step4">SnapMirror</span></div>
+          <div class="setup-step-pill" id="swpill5" onclick="schedWizGoStep(5)">⑤ <span
+              data-i18n="sched_step5">Notifications</span></div>
+          <div class="setup-step-pill" id="swpill6" onclick="schedWizGoStep(6)">⑥ <span
+              data-i18n="sched_step6">Summary</span></div>
+        </div>
+
+        <input type="hidden" id="sched_edit_id" value="">
+
+        <!-- ── Step 1: Basics ── -->
+        <div class="card setup-step-card" id="schedStep1">
+          <div class="card-title">① <span data-i18n="sched_step1">Basics</span></div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:16px"
+            data-i18n="p_give_this_schedule_a_name_and_select_the_datasto">Give this schedule a name and select the
+            datastore (NFS volume) to protect.</p>
+          <div style="display:flex;flex-direction:column;gap:14px">
+            <div class="form-group" style="margin:0">
+              <label data-i18n="th_name">Name</label>
+              <input id="sched_name" placeholder="e.g. Nightly Backup">
+            </div>
+            <div class="form-group" style="margin:0">
+              <label data-i18n="th_datastore">Datastore</label>
+              <select id="sched_mapping" onchange="updateSchedMapping(this.value)"></select>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:flex-end;margin-top:20px">
+            <button class="btn btn-primary btn-sm" onclick="schedWizNext()" data-i18n="pg_next">Next →</button>
+          </div>
+        </div>
+
+        <!-- ── Step 2: Schedule & Retention ── -->
+        <div class="card setup-step-card" id="schedStep2" style="display:none">
+          <div class="card-title" data-i18n="di_schedule_amp_retention">② Schedule &amp; Retention</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:16px"
+            data-i18n="p_define_when_snapshots_are_taken_and_how_many_to_">Define when snapshots are taken and how many
+            to keep.</p>
+          <div style="display:flex;flex-direction:column;gap:16px">
+            <div>
+              <div
+                style="margin-bottom:10px;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em"
+                data-i18n="di_timing">Timing</div>
+              <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+                <div class="form-group" style="flex:0 0 auto;margin:0">
+                  <label data-i18n="lbl_frequency">Frequency</label>
+                  <select id="sched_freq" onchange="updateSchedCron()">
+                    <option value="hourly" data-i18n="opt_hourly">Hourly</option>
+                    <option value="daily" selected data-i18n="opt_daily">Daily</option>
+                    <option value="weekly" data-i18n="opt_weekly">Weekly</option>
+                    <option value="monthly" data-i18n="opt_monthly">Monthly</option>
+                    <option value="interval" data-i18n="op_every_n_hours">Every N Hours</option>
+                  </select>
+                </div>
+                <div id="sched_time_group" class="form-group" style="flex:0 0 auto;margin:0">
+                  <label data-i18n="lbl_at_time">At time</label>
+                  <input id="sched_time" type="time" value="02:00" style="width:110px" onchange="updateSchedCron()">
+                </div>
+                <div id="sched_dow_group" class="form-group" style="flex:0 0 auto;margin:0;display:none">
+                  <label data-i18n="lbl_weekday">Weekday</label>
+                  <select id="sched_dow" onchange="updateSchedCron()">
+                    <option value="1" data-i18n="day_mon">Monday</option>
+                    <option value="2" data-i18n="day_tue">Tuesday</option>
+                    <option value="3" data-i18n="day_wed">Wednesday</option>
+                    <option value="4" data-i18n="day_thu">Thursday</option>
+                    <option value="5" data-i18n="day_fri">Friday</option>
+                    <option value="6" data-i18n="day_sat">Saturday</option>
+                    <option value="0" data-i18n="day_sun">Sunday</option>
+                  </select>
+                </div>
+                <div id="sched_dom_group" class="form-group" style="flex:0 0 auto;margin:0;display:none">
+                  <label data-i18n="lbl_day_of_month">Day of month</label>
+                  <select id="sched_dom" onchange="updateSchedCron()"></select>
+                </div>
+                <div id="sched_interval_group" class="form-group" style="flex:0 0 auto;margin:0;display:none">
+                  <label data-i18n="lbl_interval">Interval</label>
+                  <select id="sched_interval_val" onchange="updateSchedCron()">
+                    <option value="1" data-i18n="opt_int_1h">every hour</option>
+                    <option value="2" data-i18n="opt_int_2h">every 2 hours</option>
+                    <option value="3" data-i18n="opt_int_3h">every 3 hours</option>
+                    <option value="4" data-i18n="opt_int_4h">every 4 hours</option>
+                    <option value="6" data-i18n="opt_int_6h">every 6 hours</option>
+                    <option value="8" data-i18n="opt_int_8h">every 8 hours</option>
+                    <option value="12" data-i18n="opt_int_12h">every 12 hours</option>
+                  </select>
+                </div>
+              </div>
+              <p class="hint" style="margin-top:8px;margin-bottom:0">
+                Schedule: <strong id="sched_cron_human" style="color:var(--text)" data-i18n="st_daily_at_02_00">Daily at
+                  02:00</strong>
+                <input id="sched_cron" type="hidden" value="0 2 * * *">
+              </p>
+            </div>
+            <div class="form-group" style="margin:0">
+              <label data-i18n="la_retention_keep_last_n_snapshots">Retention — keep last N snapshots</label>
+              <input id="sched_retention" type="number" value="7" min="1" max="99" style="width:120px"
+                oninput="schedRetentionWarn()">
+              <div id="sched_retention_warn"
+                style="display:none;margin-top:8px;padding:8px 12px;background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.3);border-radius:6px;font-size:12px;color:var(--error,#dc2626);display:flex;gap:8px;align-items:flex-start">
+                <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                  style="flex-shrink:0;margin-top:1px">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                    d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                </svg>
+                <span id="sched_retention_warn_msg"></span>
+              </div>
+            </div>
+            <!-- Next-run preview -->
+            <div>
+              <div
+                style="margin-bottom:8px;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em"
+                data-i18n="di_next_10_runs">Next 10 runs</div>
+              <div id="sched_next_runs"
+                style="border:1px solid var(--border);border-radius:6px;overflow:hidden;font-size:12px">
+                <span style="opacity:.5;padding:8px;display:block">—</span>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:20px">
+            <button class="btn btn-ghost btn-sm" onclick="schedWizPrev()" data-i18n="pg_prev">← Back</button>
+            <button class="btn btn-primary btn-sm" onclick="schedWizNext()" data-i18n="pg_next">Next →</button>
+          </div>
+        </div>
+
+        <!-- ── Step 3: VMs, Consistency & Scripts ── -->
+        <div class="card setup-step-card" id="schedStep3" style="display:none">
+          <div class="card-title" data-i18n="di_vms_consistency_amp_scripts">③ VMs, Consistency &amp; Scripts</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:16px"
+            data-i18n="p_choose_which_vms_to_include_the_snapshot_consist">Choose which VMs to include, the snapshot
+            consistency method, and optional pre/post hooks.</p>
+          <div style="display:flex;flex-direction:column;gap:16px">
+            <div class="form-group" style="margin:0">
+              <label data-i18n="lbl_consistency">Consistency</label>
+              <select id="sched_consistency">
+                <option value="crash" data-i18n="opt_crash">Crash-consistent</option>
+                <option value="app" data-i18n="opt_app_sched">App-consistent (QEMU with Guest Agent)</option>
+              </select>
+            </div>
+            <div>
+              <div
+                style="margin-bottom:10px;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em"
+                data-i18n="sect_vms_include">Include VMs</div>
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:10px">
+                <input type="checkbox" id="sched_sync_vmids" onchange="toggleSchedSyncVmids()">
+                <span data-i18n="sp_automatically_include_all_vms_in_this_datastore">Automatically include all VMs in
+                  this datastore</span>
+              </label>
+              <div id="sched_vmids_manual">
+                <select id="sched_vmids_select" multiple size="10"
+                  style="width:100%;min-height:200px;margin-bottom:6px">
+                  <option disabled data-i18n="op_select_datastore_first">← Select datastore first</option>
+                </select>
+                <div style="display:flex;gap:6px;margin-bottom:4px">
+                  <button class="btn btn-ghost btn-sm" onclick="schedSelectAll()" data-i18n="btn_all">All</button>
+                  <button class="btn btn-ghost btn-sm" onclick="schedSelectNone()" data-i18n="btn_none">None</button>
+                </div>
+                <p class="hint" style="margin:0" data-i18n="p_no_selection_all_vms_of_the_datastore_are_includ">No
+                  selection = all VMs of the datastore are included.</p>
+              </div>
+            </div>
+            <details>
+              <summary
+                style="cursor:pointer;font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;user-select:none">
+                Pre/Post-Scripts (Hooks)</summary>
+              <div style="margin-top:12px;display:flex;flex-direction:column;gap:10px">
+                <div class="form-group" style="margin:0">
+                  <label style="font-size:12px">Pre-Script <span style="opacity:.6;font-weight:400"
+                      data-i18n="sp_ssh_on_pve_node_before_freeze">(SSH on PVE node, before freeze)</span></label>
+                  <textarea id="sched_pre_script" rows="2"
+                    style="width:100%;font-family:monospace;font-size:12px;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:6px 8px;color:var(--text);resize:vertical"
+                    placeholder="e.g.: qm guest exec $ProxmoxVEx_VMIDS -- /opt/scripts/db-flush.sh"></textarea>
+                </div>
+                <div class="form-group" style="margin:0">
+                  <label style="font-size:12px">Post-Script <span style="opacity:.6;font-weight:400"
+                      data-i18n="sp_ssh_on_pve_node_after_thaw">(SSH on PVE node, after thaw)</span></label>
+                  <textarea id="sched_post_script" rows="2"
+                    style="width:100%;font-family:monospace;font-size:12px;background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:6px 8px;color:var(--text);resize:vertical"
+                    placeholder="e.g.: qm guest exec $ProxmoxVEx_VMIDS -- /opt/scripts/db-unlock.sh"></textarea>
+                </div>
+                <p class="hint" style="margin:0">Variables: <code>$ProxmoxVEx_VMIDS</code> (space-separated),
+                  <code>$ProxmoxVEx_SNAP</code>, <code>$ProxmoxVEx_NODE</code>
+                </p>
+              </div>
+            </details>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:20px">
+            <button class="btn btn-ghost btn-sm" onclick="schedWizPrev()" data-i18n="pg_prev">← Back</button>
+            <button class="btn btn-primary btn-sm" onclick="schedWizNext()" data-i18n="pg_next">Next →</button>
+          </div>
+        </div>
+
+        <!-- ── Step 4: SnapMirror (only reachable when SM relationship exists) ── -->
+        <div class="card setup-step-card" id="schedStep4" style="display:none">
+          <div class="card-title" data-i18n="di_snapmirror_replication">④ SnapMirror® Replication</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:8px"
+            data-i18n="p_configure_snapmirror_replication_label_and_autom">Configure SnapMirror replication label and
+            automatic transfer trigger.</p>
+          <div id="sched_sm_info" style="font-size:12px;margin-bottom:16px"></div>
+          <div style="display:flex;flex-direction:column;gap:14px">
+            <div class="form-group" style="margin:0">
+              <label>SnapMirror Label <span style="opacity:.6" data-i18n="lbl_new_name_hint">(optional)</span></label>
+              <select id="sched_label">
+                <option value="" data-i18n="op_no_label">— no label —</option>
+              </select>
+              <p class="hint" style="margin-top:4px;margin-bottom:0"
+                data-i18n="p_labels_control_retention_tiers_on_the_destinatio">Labels control retention tiers on the
+                destination (e.g. hourly, daily, weekly).</p>
+            </div>
+            <div class="form-group" style="margin:0">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                <input type="checkbox" id="sched_sm_update">
+                <span data-i18n="sp_trigger_snapmirror_transfer_immediately_after_sn">Trigger SnapMirror® transfer
+                  immediately after snapshot</span>
+              </label>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:20px">
+            <button class="btn btn-ghost btn-sm" onclick="schedWizPrev()" data-i18n="pg_prev">← Back</button>
+            <button class="btn btn-primary btn-sm" onclick="schedWizNext()" data-i18n="pg_next">Next →</button>
+          </div>
+        </div>
+
+        <!-- ── Step 5: Notifications ── -->
+        <div class="card setup-step-card" id="schedStep5" style="display:none">
+          <div class="card-title" data-i18n="di_email_notifications">⑤ Email Notifications</div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:16px"
+            data-i18n="p_optionally_send_email_reports_after_each_snapsho">Optionally send email reports after each
+            snapshot run.</p>
+          <div style="display:flex;flex-direction:column;gap:14px">
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" id="sched_notify_enabled" onchange="toggleNotifyFields()">
+              <span style="font-weight:600" data-i18n="lbl_notify_enabled">Send email notifications</span>
+            </label>
+            <div id="sched_notify_fields"
+              style="display:none;flex-direction:column;gap:12px;border:1px solid var(--border);border-radius:8px;padding:14px;background:var(--bg)">
+              <div class="form-group" style="margin:0">
+                <label data-i18n="lbl_notify_on">Notify on</label>
+                <select id="sched_notify_on">
+                  <option value="all" data-i18n="opt_notify_all">All events (success &amp; failure)</option>
+                  <option value="failed" data-i18n="opt_notify_failed">Failures only</option>
+                  <option value="success" data-i18n="opt_notify_success">Success only</option>
+                </select>
+              </div>
+              <div class="form-group" style="margin:0">
+                <label>Recipients <span style="opacity:.6;font-weight:400"
+                    data-i18n="sp_comma_separated">(comma-separated)</span></label>
+                <input id="sched_notify_recipients" type="text" placeholder="admin@example.com, ops@example.com">
+              </div>
+              <div>
+                <button class="btn btn-ghost btn-sm" onclick="testScheduleNotification()"
+                  data-i18n="btn_notify_test">Send test email</button>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:20px">
+            <button class="btn btn-ghost btn-sm" onclick="schedWizPrev()" data-i18n="pg_prev">← Back</button>
+            <button class="btn btn-primary btn-sm" onclick="schedWizNext()" data-i18n="pg_next">Next →</button>
+          </div>
+        </div>
+
+        <!-- ── Step 6: Summary ── -->
+        <div class="card setup-step-card" id="schedStep6" style="display:none">
+          <div class="card-title">⑥ <span data-i18n="sched_step6">Summary</span></div>
+          <p style="font-size:13px;color:var(--muted);margin-bottom:16px"
+            data-i18n="p_review_your_schedule_configuration_before_saving">Review your schedule configuration before
+            saving.</p>
+          <div id="schedWizSummary"></div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
+            <button class="btn btn-ghost btn-sm" onclick="schedWizPrev()" data-i18n="pg_prev">← Back</button>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-ghost" onclick="hideForm('addScheduleForm')" data-i18n="btn_cancel">Cancel</button>
+              <button class="btn btn-primary" onclick="saveSchedule()" id="schedWizSaveBtn" data-i18n="sched_save">Save
+                Schedule</button>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div><!-- /addScheduleForm -->
+
+  <!-- ── Add NetApp System Modal ───────────────────────────────────── -->
+  <div id="addEndpointForm"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="addEndpointBackdropClick(event)">
+    <div
+      style="max-width:640px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_add_netapp_system_1">➕ Add NetApp System</div>
+        <button class="btn btn-ghost btn-sm" onclick="hideForm('addEndpointForm')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px">
+        <p style="font-size:13px;color:var(--muted);margin:0 0 16px"
+          data-i18n="p_enter_admin_credentials_to_create_a_dedicated_pl">
+          Enter admin credentials to create a dedicated plugin account on ONTAP and register the system.
+          The admin password is used only for this step and is never stored.
+        </p>
+        <!-- System -->
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Name <span style="font-weight:400;color:var(--muted)" data-i18n="sp_friendly_label">(friendly
+                label)</span></label>
+            <input id="ep_name" data-i18n-placeholder="prod-cluster" placeholder="prod-cluster">
+          </div>
+          <div class="form-group">
+            <label data-i18n="la_cluster_mgmt_ip_fqdn">Cluster Mgmt IP / FQDN</label>
+            <input id="ep_host" placeholder="192.168.1.100">
+          </div>
+        </div>
+        <!-- Admin creds (not stored) -->
+        <div
+          style="margin:12px 0 6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)">
+          Admin credentials <span style="font-weight:400;text-transform:none;letter-spacing:0"
+            data-i18n="sp_temporary_not_stored">(temporary — not stored)</span>
+        </div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label data-i18n="la_admin_username">Admin Username</label>
+            <input id="ep_admin_user" value="admin">
+          </div>
+          <div class="form-group">
+            <label>Admin Password</label>
+            <input id="ep_admin_pass" type="password" placeholder="admin password">
+          </div>
+        </div>
+        <!-- Plugin account -->
+        <div
+          style="margin:12px 0 6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)"
+          data-i18n="di_plugin_account_to_create_on_ontap_1">
+          Plugin account to create on ONTAP
+        </div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label data-i18n="lbl_username">Username</label>
+            <input id="ep_user" value="ProxmoxVEx">
+          </div>
+          <div class="form-group">
+            <label data-i18n="lbl_password">Password</label>
+            <input id="ep_pass" type="password" placeholder="strong password">
+          </div>
+          <div class="form-group">
+            <label data-i18n="la_role">Role</label>
+            <select id="ep_role">
+              <option value="admin" data-i18n="op_admin_full_rest_api">admin (full REST API)</option>
+              <option value="readonly" data-i18n="op_readonly_monitoring_only">readonly (monitoring only)</option>
+            </select>
+          </div>
+        </div>
+        <!-- Options -->
+        <div style="display:flex;flex-wrap:wrap;gap:16px;margin:10px 0 18px">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+            <input type="checkbox" id="ep_ssl">
+            Verify SSL certificate
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+            <input type="checkbox" id="ep_skip_nfs">
+            SAN-only (skip NFS scan, e.g. ASA)
+          </label>
+        </div>
+        <div id="addEpResult" style="font-size:12px;margin-bottom:10px"></div>
+        <div class="form-actions">
+          <button class="btn btn-primary" onclick="addEndpoint()">
+            Create User &amp; Register System <span id="addEpSpinner" class="spinner"
+              style="display:none;margin-left:4px"></span>
+          </button>
+          <button class="btn btn-ghost" onclick="hideForm('addEndpointForm')" data-i18n="btn_cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div><!-- /addEndpointForm -->
+
+  <!-- ── Edit Endpoint Modal ───────────────────────────────────────── -->
+  <div id="editEndpointForm"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="if(event.target===this)hideForm('editEndpointForm')">
+    <div
+      style="max-width:560px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_edit_netapp_system">✏️ Edit NetApp System</div>
+        <button class="btn btn-ghost btn-sm" onclick="hideForm('editEndpointForm')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px">
+        <input type="hidden" id="edit_ep_id">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Name <span style="font-weight:400;color:var(--muted)" data-i18n="sp_friendly_label">(friendly
+                label)</span></label>
+            <input id="edit_ep_name">
+          </div>
+          <div class="form-group">
+            <label data-i18n="la_cluster_mgmt_ip_fqdn">Cluster Mgmt IP / FQDN</label>
+            <input id="edit_ep_host">
+          </div>
+        </div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label data-i18n="lbl_username">Username</label>
+            <input id="edit_ep_user">
+          </div>
+          <div class="form-group">
+            <label>Password <span style="font-weight:400;color:var(--muted)"
+                data-i18n="sp_leave_blank_to_keep_existing">(leave blank to keep existing)</span></label>
+            <input id="edit_ep_pass" type="password" data-i18n-placeholder="unchanged" placeholder="unchanged">
+          </div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:16px;margin:10px 0 18px">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+            <input type="checkbox" id="edit_ep_ssl">
+            Verify SSL certificate
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px">
+            <input type="checkbox" id="edit_ep_skip_nfs">
+            SAN-only (skip NFS scan)
+          </label>
+        </div>
+        <div id="editEpResult" style="font-size:12px;margin-bottom:10px"></div>
+        <div class="form-actions">
+          <button class="btn btn-primary" onclick="saveEditEndpoint()">
+            Save Changes <span id="editEpSpinner" class="spinner" style="display:none;margin-left:4px"></span>
+          </button>
+          <button class="btn btn-ghost" onclick="hideForm('editEndpointForm')" data-i18n="btn_cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div><!-- /editEndpointForm -->
+
+  <!-- ── Add PVE Host Modal ─────────────────────────────────────────── -->
+  <div id="addPveHostForm"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="addPveHostBackdropClick(event)">
+    <div
+      style="max-width:640px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="ct_new_pve_host">New PVE Host</div>
+        <button class="btn btn-ghost btn-sm" onclick="hideForm('addPveHostForm')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px">
+        <div class="form-grid">
+          <div class="form-group">
+            <label data-i18n="lbl_display_name">Display name</label>
+            <input id="pve_name" placeholder="pve-cluster-1">
+          </div>
+          <div class="form-group">
+            <label data-i18n="lbl_host_ip">Host / IP</label>
+            <input id="pve_host" placeholder="192.168.1.10">
+          </div>
+          <div class="form-group">
+            <label data-i18n="lbl_port">Port</label>
+            <input id="pve_port" type="number" value="8006" min="1" max="65535">
+          </div>
+          <div class="form-group">
+            <label data-i18n="lbl_username">Username</label>
+            <input id="pve_user" value="root@pam">
+          </div>
+          <div class="form-group">
+            <label data-i18n="lbl_password">Password</label>
+            <input id="pve_pass" type="password">
+          </div>
+          <div class="form-group">
+            <label data-i18n="lbl_ssl_verify">Verify SSL certificate</label>
+            <select id="pve_ssl">
+              <option value="0" data-i18n="opt_ssl_no">No (self-signed)</option>
+              <option value="1" data-i18n="opt_ssl_yes_s">Yes</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>NFS Storage IP <span style="font-weight:400;color:var(--muted)"
+                data-i18n="sp_optional_for_export_rules">(optional — for export rules)</span></label>
+            <input id="pve_nfs_ip" placeholder="10.230.77.x — leave blank to use Host/IP above">
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-primary" onclick="addPveHost()" data-i18n="btn_save">Save</button>
+          <button class="btn btn-ghost" onclick="hideForm('addPveHostForm')" data-i18n="btn_cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div><!-- /addPveHostForm -->
+
+  <!-- ══════════════════════════ DR MODALS ══════════════════════════ -->
+
+  <div id="drAddPlanModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="if(event.target===this)drHideModal('drAddPlan')">
+    <div
+      style="max-width:480px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_create_dr_plan">📋 Create DR Plan</div>
+        <button class="btn btn-ghost btn-sm" onclick="drHideModal('drAddPlan')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:grid;gap:.75rem">
+        <div class="alert alert-info" style="font-size:.82rem">A <strong data-i18n="st_core_infrastructure">Core
+            Infrastructure</strong> VM group will be created automatically.</div>
+        <div class="form-group"><label data-i18n="la_plan_name">Plan Name</label><input id="drPlanName"
+            data-i18n-placeholder="Production DR" placeholder="Production DR" autocomplete="off"></div>
+        <div class="form-group"><label>Notes <span style="font-weight:400;color:var(--muted)"
+              data-i18n="lbl_new_name_hint">(optional)</span></label><input id="drPlanNotes"
+            data-i18n-placeholder="optional" placeholder="optional"></div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;padding:12px 20px;border-top:1px solid var(--border)">
+        <button class="btn btn-ghost" onclick="drHideModal('drAddPlan')" data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" onclick="drCreatePlan()" data-i18n="bu_create_plan">✅ Create Plan</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add Datastore Entry -->
+  <div id="drAddEntryModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="if(event.target===this)drHideModal('drAddEntry')">
+    <div
+      style="max-width:480px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_add_protected_datastore">📦 Add Protected Datastore
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="drHideModal('drAddEntry')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:grid;gap:.75rem">
+        <div class="alert alert-info" style="font-size:.82rem">Tip: Use <strong
+            data-i18n="st_auto_detect">Auto-detect</strong> to find all SnapMirror relationships automatically.</div>
+        <div class="form-group"><label data-i18n="la_source_endpoint">Source Endpoint</label><select
+            id="drEntryEndpoint"></select></div>
+        <div class="form-group"><label data-i18n="la_source_svm">Source SVM</label><input id="drEntrySvm"
+            data-i18n-placeholder="svmlabnfs01" placeholder="svmlabnfs01" autocomplete="off"></div>
+        <div class="form-group"><label data-i18n="sm_source_vol">Source Volume</label><input id="drEntryVolume"
+            placeholder="vol_nfs_prod01" autocomplete="off"></div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;padding:12px 20px;border-top:1px solid var(--border)">
+        <button class="btn btn-ghost" onclick="drHideModal('drAddEntry')" data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" onclick="drCreateEntry()" data-i18n="bu_add_datastore_1">✅ Add
+          Datastore</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add VM Group -->
+  <div id="drAddGroupModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="if(event.target===this)drHideModal('drAddGroup')">
+    <div
+      style="max-width:460px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_add_vm_group">🖥️ Add VM Group</div>
+        <button class="btn btn-ghost btn-sm" onclick="drHideModal('drAddGroup')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:grid;gap:.75rem">
+        <div class="form-group"><label data-i18n="la_group_name">Group Name</label><input id="drGroupName"
+            data-i18n-placeholder="Application Tier" placeholder="Application Tier" autocomplete="off"></div>
+        <div class="form-group">
+          <label data-i18n="la_start_mode">Start Mode</label>
+          <select id="drGroupStartMode">
+            <option value="auto" data-i18n="op_auto_starts_automatically_in_sequence">Auto — starts automatically in
+              sequence</option>
+            <option value="manual" data-i18n="op_manual_waits_for_admin_confirmation">Manual — waits for admin
+              confirmation</option>
+          </select>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem">
+          <div class="form-group"><label>Startup Delay (s) <span style="font-weight:400;color:var(--muted)"
+                data-i18n="sp_after_prev_group">after prev. group</span></label><input id="drGroupDelay" type="number"
+              value="30" min="0"></div>
+          <div class="form-group"><label data-i18n="la_max_parallel_vms">Max Parallel VMs</label><input
+              id="drGroupMaxParallel" type="number" value="1" min="1" max="20"></div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;padding:12px 20px;border-top:1px solid var(--border)">
+        <button class="btn btn-ghost" onclick="drHideModal('drAddGroup')" data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" onclick="drCreateGroup()" data-i18n="bu_add_group_1">✅ Add Group</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Add VM to Group -->
+  <div id="drAddVmModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="if(event.target===this)drHideModal('drAddVm')">
+    <div
+      style="max-width:420px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_add_vm_to_group">➕ Add VM to Group</div>
+        <button class="btn btn-ghost btn-sm" onclick="drHideModal('drAddVm')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:grid;gap:.75rem">
+        <div class="form-group"><label>VMID</label><input id="drVmVmid" type="number" placeholder="100"
+            autocomplete="off"></div>
+        <div class="form-group"><label>VM Name <span style="font-weight:400;color:var(--muted)"
+              data-i18n="sp_display_only">(display only)</span></label><input id="drVmName"
+            data-i18n-placeholder="my-vm" placeholder="my-vm" autocomplete="off"></div>
+        <div class="form-group"><label>Target Node <span style="font-weight:400;color:var(--muted)"
+              data-i18n="sp_dr_pve_node_hostname">(DR PVE node hostname)</span></label><input id="drVmNode"
+            data-i18n-placeholder="ucnlabpmx03" placeholder="ucnlabpmx03" autocomplete="off"></div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;padding:12px 20px;border-top:1px solid var(--border)">
+        <button class="btn btn-ghost" onclick="drHideModal('drAddVm')" data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" onclick="drAddVmToGroup()" data-i18n="bu_add_vm">✅ Add VM</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Role Settings -->
+  <div id="drRoleModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="if(event.target===this)drHideModal('drRole')">
+    <div
+      style="max-width:460px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_plugin_role">⚙ Plugin Role</div>
+        <button class="btn btn-ghost btn-sm" onclick="drHideModal('drRole')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:grid;gap:.75rem">
+        <div class="alert alert-info" style="font-size:.82rem"
+          data-i18n="di_role_changes_are_pushed_to_the_peer_automaticall">Role changes are pushed to the peer
+          automatically if a peer is configured.</div>
+        <div class="form-group">
+          <label data-i18n="la_role">Role</label>
+          <select id="drRoleSelect">
+            <option value="PRIMARY" data-i18n="op_primary_manages_plans_pushes_sync_to_secondary">🟢 PRIMARY — manages
+              plans, pushes sync to Secondary</option>
+            <option value="SECONDARY" data-i18n="op_secondary_standby_receives_sync_from_primary">🟡 SECONDARY —
+              standby, receives sync from Primary</option>
+            <option value="STANDALONE" data-i18n="op_standalone_no_peer_independent_operation">⚪ STANDALONE — no peer,
+              independent operation</option>
+          </select>
+        </div>
+        <label style="display:flex;align-items:center;gap:.5rem;font-size:.82rem;cursor:pointer">
+          <input type="checkbox" id="drRoleForcedCheck">
+          <span data-i18n="sp_force_override_peer_role_notify_will_not_auto_ch">Force override (peer role-notify will
+            not auto-change this)</span>
+        </label>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;padding:12px 20px;border-top:1px solid var(--border)">
+        <button class="btn btn-ghost" onclick="drHideModal('drRole')" data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" onclick="drSaveRole()" data-i18n="bu_save_role">✅ Save Role</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Peer Configure Modal -->
+  <div id="drPeerConfigModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="if(event.target===this)this.style.display='none'">
+    <div
+      style="max-width:520px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_configure_dr_peer">🔗 Configure DR Peer</div>
+        <button class="btn btn-ghost btn-sm" onclick="document.getElementById('drPeerConfigModal').style.display='none'"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:grid;gap:.75rem">
+        <div class="alert alert-info" style="font-size:.82rem">
+          Enter the other ProxmoxVEx instance URL and an admin account. Both sides must use the <strong
+            data-i18n="st_same_sync_token">same Sync Token</strong>.
+          Generate it on one side, copy it to the other.
+        </div>
+        <div id="drPeerConfigError"
+          style="display:none;padding:.4rem .6rem;background:var(--error-bg,#2d1b1b);border:1px solid var(--error,#f85149);border-radius:4px;font-size:.8rem;color:var(--error,#f85149);word-break:break-word">
+        </div>
+        <div class="form-group"><label data-i18n="th_label">Label</label><input id="peerConfigName"
+            data-i18n-placeholder="DR Site" placeholder="DR Site" autocomplete="off"></div>
+        <div class="form-group"><label>Peer URL <span style="font-weight:400;color:var(--muted)">e.g.
+              https://10.230.40.113</span></label><input id="peerConfigUrl"
+            data-i18n-placeholder="https://10.230.40.113" placeholder="https://10.230.40.113" autocomplete="off"></div>
+        <div class="form-group">
+          <label>Sync Token <span style="font-weight:400;color:var(--muted)" data-i18n="sp_same_value_on_both_sides">—
+              same value on both sides</span></label>
+          <div style="display:flex;gap:.4rem">
+            <input id="peerConfigToken" data-i18n-placeholder="paste token or generate new"
+              placeholder="paste token or generate new" autocomplete="off" style="flex:1">
+            <button class="btn btn-ghost btn-sm" onclick="peerGenerateToken()" style="white-space:nowrap"
+              data-i18n="bu_generate">🔄 Generate</button>
+          </div>
+        </div>
+        <label style="display:flex;align-items:center;gap:.5rem;font-size:.82rem;cursor:pointer">
+          <input type="checkbox" id="peerConfigSsl">
+          <span data-i18n="sp_verify_ssl_certificate">Verify SSL certificate</span>
+        </label>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;padding:12px 20px;border-top:1px solid var(--border)">
+        <button class="btn btn-ghost" onclick="document.getElementById('drPeerConfigModal').style.display='none'"
+          data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" onclick="drSavePeerConfig()" data-i18n="bu_save_peer">✅ Save Peer</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Failover Modal -->
+  <div id="drFailoverModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="if(event.target===this)drHideModal('drFailover')">
+    <div
+      style="max-width:520px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="bu_start_failover">▶ Start Failover</div>
+        <button class="btn btn-ghost btn-sm" onclick="drHideModal('drFailover')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:grid;gap:1rem">
+        <div class="form-group">
+          <label data-i18n="la_failover_type">Failover Type</label>
+          <select id="drFailoverType">
+            <option value="planned" data-i18n="op_planned_final_snapmirror_sync_before_break">Planned — final SnapMirror
+              sync before break</option>
+            <option value="emergency">Emergency — break immediately (primary unreachable)</option>
+          </select>
+        </div>
+        <div>
+          <div
+            style="font-size:.8rem;font-weight:600;color:var(--muted);margin-bottom:.4rem;text-transform:uppercase;letter-spacing:.05em"
+            data-i18n="di_datastores">Datastores</div>
+          <div id="drFailoverEntryList" style="max-height:180px;overflow-y:auto;padding:2px"></div>
+        </div>
+        <div>
+          <div
+            style="font-size:.8rem;font-weight:600;color:var(--muted);margin-bottom:.4rem;text-transform:uppercase;letter-spacing:.05em"
+            data-i18n="di_pre_check_results">Pre-Check Results</div>
+          <div id="drFailoverChecks" style="display:grid;gap:.3rem"></div>
+        </div>
+        <div class="alert alert-warning" style="font-size:.82rem">⚠️ <strong
+            data-i18n="st_irreversible">Irreversible:</strong> SnapMirror will be broken. Use Failback to return.</div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;padding:12px 20px;border-top:1px solid var(--border)">
+        <button class="btn btn-ghost" onclick="drHideModal('drFailover')" data-i18n="btn_cancel">Cancel</button>
+        <button id="drFailoverStartBtn" class="btn btn-primary" onclick="drStartFailover()" disabled
+          data-i18n="bu_start_failover">▶ Start Failover</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit DR Entry -->
+  <div id="drEditEntryModal"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2000;padding:24px 16px;overflow-y:auto"
+    onclick="if(event.target===this)drHideModal('drEditEntry')">
+    <div
+      style="max-width:480px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="font-size:16px;font-weight:700" data-i18n="di_edit_dr_datastore_entry">✏ Edit DR Datastore Entry
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="drHideModal('drEditEntry')"
+          style="font-size:18px;padding:4px 10px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:grid;gap:.75rem">
+        <div id="drEditEntryStorageInfo"
+          style="padding:.5rem .75rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:.85rem">
+        </div>
+        <div class="form-group">
+          <label>DR PVE Host(s) <span style="color:var(--muted);font-weight:400"
+              data-i18n="sp_ctrl_click_for_multiple">(Ctrl+click for multiple)</span></label>
+          <select id="drEditEntryPveHosts" multiple size="4" style="width:100%"></select>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;gap:.5rem;padding:12px 20px;border-top:1px solid var(--border)">
+        <button class="btn btn-ghost" onclick="drHideModal('drEditEntry')" data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" onclick="drSaveEntryEdit()" data-i18n="bu_save">✅ Save</button>
+      </div>
+    </div>
+  </div>
+
+
+  <!-- ── Restore Confirm Modal (danger) ──────────────────────────────── -->
+  <div id="restoreConfirmModal" role="dialog" aria-modal="true" aria-label="Confirm restore"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9100;padding:24px 16px;overflow-y:auto;align-items:flex-start;justify-content:center">
+    <div
+      style="max-width:540px;width:100%;margin:0 auto;background:var(--card);border:1px solid rgba(217,83,79,.4);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.55)">
+      <div
+        style="display:flex;align-items:center;gap:10px;padding:14px 20px;border-bottom:1px solid rgba(217,83,79,.25);background:rgba(217,83,79,.07)">
+        <svg width="20" height="20" fill="none" stroke="#d9534f" viewBox="0 0 24 24" style="flex-shrink:0">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+        <span style="font-size:15px;font-weight:700;color:#d9534f" data-i18n="btn_start_restore">Start VM Restore</span>
+        <button onclick="hideRestoreConfirm()"
+          style="margin-left:auto;background:none;border:none;color:var(--text);opacity:.6;font-size:18px;cursor:pointer;padding:2px 6px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:flex;flex-direction:column;gap:16px">
+        <table style="width:100%;font-size:13px;border-collapse:collapse">
+          <tr>
+            <td style="padding:4px 10px 4px 0;color:var(--muted);white-space:nowrap;width:90px"
+              data-i18n="lbl_snapshot">Snapshot</td>
+            <td style="padding:4px 0"><code id="rcm_snap_name"
+                style="font-family:monospace;font-size:12px;background:rgba(0,0,0,.15);padding:1px 6px;border-radius:3px"></code>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:4px 10px 4px 0;color:var(--muted)" data-i18n="th_datastore">Datastore</td>
+            <td style="padding:4px 0"><span id="rcm_datastore"></span></td>
+          </tr>
+          <tr>
+            <td style="padding:4px 10px 4px 0;color:var(--muted)" data-i18n="lbl_method">Method</td>
+            <td style="padding:4px 0"><code id="rcm_method"
+                style="font-family:monospace;font-size:12px;background:rgba(0,0,0,.15);padding:1px 6px;border-radius:3px"></code>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:4px 10px 4px 0;color:var(--muted)" data-i18n="td_target_vm">Target VM</td>
+            <td style="padding:4px 0"><code id="rcm_vmid"
+                style="font-family:monospace;font-size:12px;background:rgba(0,0,0,.15);padding:1px 6px;border-radius:3px"></code>
+            </td>
+          </tr>
+        </table>
+        <div
+          style="border:1px solid rgba(217,83,79,.35);border-radius:6px;padding:10px 14px;background:rgba(217,83,79,.05)">
+          <div
+            style="font-size:11px;font-weight:700;letter-spacing:.06em;color:#d9534f;margin-bottom:8px;text-transform:uppercase"
+            data-i18n="di_affected_vms">Affected VMs</div>
+          <div id="rcm_blast_vms" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+        </div>
+        <label
+          style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:13px;padding:10px 14px;border:1px solid var(--border);border-radius:6px;background:var(--bg)">
+          <input type="checkbox" id="rcm_safety" checked style="margin-top:2px;flex-shrink:0">
+          <span>
+            <strong data-i18n="st_create_safety_snapshot_before_restore">Create safety snapshot before
+              restore</strong><br>
+            <span style="font-size:11px;opacity:.7">Creates <code>safety_pre_restore_YYYYMMDD</code> (crash-consistent)
+              before the restore runs.</span>
+          </span>
+        </label>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <label style="font-size:13px;font-weight:600;color:#d9534f"
+            data-i18n="la_type_the_snapshot_name_to_confirm">Type the snapshot name to confirm:</label>
+          <div style="font-size:12px;color:var(--muted)">Enter <code id="rcm_expected"
+              style="font-family:monospace;background:rgba(0,0,0,.15);padding:1px 6px;border-radius:3px"></code> to
+            continue</div>
+          <input id="rcm_confirm_input" oninput="rcmCheckInput()" data-i18n-placeholder="Type snapshot name …"
+            placeholder="Type snapshot name …"
+            style="border:1px solid rgba(217,83,79,.5);background:rgba(217,83,79,.04)">
+        </div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;padding-top:4px">
+          <button class="btn btn-ghost _cancel-btn" onclick="hideRestoreConfirm()"
+            data-i18n="btn_cancel">Cancel</button>
+          <button id="rcm_submit" class="btn btn-danger" disabled onclick="doRestoreConfirmed()"
+            data-i18n="btn_start_restore">Start VM Restore</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Delete Confirm Modal (danger) ───────────────────────────────── -->
+  <div id="deleteConfirmModal" role="dialog" aria-modal="true" aria-label="Confirm delete"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9100;padding:24px 16px;overflow-y:auto;align-items:flex-start;justify-content:center">
+    <div
+      style="max-width:480px;width:100%;margin:0 auto;background:var(--card);border:1px solid rgba(217,83,79,.4);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.55)">
+      <div
+        style="display:flex;align-items:center;gap:10px;padding:14px 20px;border-bottom:1px solid rgba(217,83,79,.25);background:rgba(217,83,79,.07)">
+        <svg width="20" height="20" fill="none" stroke="#d9534f" viewBox="0 0 24 24" style="flex-shrink:0">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+        <span style="font-size:15px;font-weight:700;color:#d9534f" data-i18n="sp_delete_snapshot">Delete Snapshot</span>
+        <button onclick="hideDeleteConfirm()"
+          style="margin-left:auto;background:none;border:none;color:var(--text);opacity:.6;font-size:18px;cursor:pointer;padding:2px 6px;line-height:1">✕</button>
+      </div>
+      <div style="padding:20px;display:flex;flex-direction:column;gap:16px">
+        <p style="margin:0;font-size:13px">Snapshot <code id="dcm_snap_name"
+            style="font-family:monospace;background:rgba(0,0,0,.15);padding:1px 6px;border-radius:3px"></code> will be
+          permanently deleted. This action cannot be undone.</p>
+        <div id="dcm_blast_wrap"
+          style="border:1px solid rgba(217,83,79,.35);border-radius:6px;padding:10px 14px;background:rgba(217,83,79,.05)">
+          <div
+            style="font-size:11px;font-weight:700;letter-spacing:.06em;color:#d9534f;margin-bottom:8px;text-transform:uppercase"
+            data-i18n="di_affected_vms">Affected VMs</div>
+          <div id="dcm_blast_vms" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <label style="font-size:13px;font-weight:600;color:#d9534f"
+            data-i18n="la_type_the_snapshot_name_to_confirm">Type the snapshot name to confirm:</label>
+          <div style="font-size:12px;color:var(--muted)">Enter <code id="dcm_expected"
+              style="font-family:monospace;background:rgba(0,0,0,.15);padding:1px 6px;border-radius:3px"></code> to
+            continue</div>
+          <input id="dcm_confirm_input" oninput="dcmCheckInput()" data-i18n-placeholder="Type snapshot name …"
+            placeholder="Type snapshot name …"
+            style="border:1px solid rgba(217,83,79,.5);background:rgba(217,83,79,.04)">
+        </div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;padding-top:4px">
+          <button class="btn btn-ghost _cancel-btn" onclick="hideDeleteConfirm()" data-i18n="btn_cancel">Cancel</button>
+          <button id="dcm_submit" class="btn btn-danger" disabled onclick="doDeleteConfirmed()"
+            data-i18n="sp_delete_snapshot">Delete Snapshot</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer
+    style="margin-top:2rem;padding:0.75rem 1rem;border-top:1px solid var(--border);color:var(--muted);font-size:0.7rem;line-height:1.5">
+    NetApp&#174;, ONTAP&#174;, SnapMirror&#174;, SnapVault&#174;, SnapRestore&#174;, and FlexClone&#174; are registered
+    trademarks of NetApp, Inc.
+    This plugin is an independent community project and is not affiliated with, endorsed by, or sponsored by NetApp,
+    Inc.
+  </footer>
+
+  <!-- ── Log Viewer Modal ── -->
+  <div id="logViewModal" role="dialog" aria-modal="true" aria-label="Job log"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9200;align-items:center;justify-content:center;padding:20px">
+    <div
+      style="background:var(--card);border:1px solid var(--border);border-radius:8px;width:min(820px,100%);max-height:90vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.5)">
+
+      <!-- Header -->
+      <div
+        style="padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+        <div>
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px" id="lvm_title"></div>
+          <div style="font-size:12px;color:var(--muted)" id="lvm_meta"></div>
+        </div>
+        <button onclick="hideJobLog()"
+          style="background:none;border:none;cursor:pointer;color:var(--muted);font-size:18px;line-height:1;padding:2px 6px;flex-shrink:0"
+          data-i18n="bu_x2715">&#x2715;</button>
+      </div>
+
+      <!-- Log body -->
+      <div style="flex:1;overflow-y:auto;padding:16px 20px;min-height:0">
+        <div id="lvm_log"
+          style="background:#0f172a;border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:12px 14px;font-family:var(--mono);font-size:11.5px;line-height:1.7;color:#94a3b8;white-space:pre-wrap;word-break:break-all;min-height:120px">
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <div
+        style="padding:14px 20px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:8px">
+        <div id="lvm_error" style="font-size:12px;color:var(--error)"></div>
+        <div style="display:flex;gap:8px;margin-left:auto">
+          <button class="btn btn-ghost btn-sm" onclick="downloadJobLog()" data-i18n-title="Download as .txt"
+            title="Download as .txt">
+            <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+              style="vertical-align:middle;margin-right:4px">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+            </svg>Download
+          </button>
+          <button class="btn btn-primary btn-sm" onclick="hideJobLog()" data-i18n="bu_close_1">Close</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div id="tlTooltip"
+    style="display:none;position:fixed;z-index:9100;pointer-events:none;background:#1e293b;color:#e2e8f0;border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:8px 12px;font-size:12px;box-shadow:0 4px 16px rgba(0,0,0,.4);max-width:260px;line-height:1.55">
+  </div>
+
+  <!-- ══════════════ RESTORE WIZARD MODAL ══════════════ -->
+  <div id="rwModal" role="dialog" aria-modal="true" aria-label="Restore Wizard"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9150;padding:24px 16px;overflow-y:auto;align-items:flex-start;justify-content:center">
+    <div
+      style="max-width:640px;width:100%;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.5)">
+
+      <!-- Header -->
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="display:flex;align-items:center;gap:8px">
+          <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
+          <span style="font-size:15px;font-weight:700" data-i18n="sp_restore_vm">Restore VM</span>
+          <span id="rw_vm_hdr" style="font-size:13px;color:var(--muted);margin-left:4px"></span>
+        </div>
+        <button onclick="closeRestoreWizard()"
+          style="background:none;border:none;color:var(--text);opacity:.6;font-size:18px;cursor:pointer;padding:2px 6px;line-height:1">✕</button>
+      </div>
+
+      <!-- Step pills -->
+      <div style="padding:16px 20px 0">
+        <div style="display:flex;gap:0;border-radius:6px;overflow:hidden;border:1px solid var(--border)">
+          <div id="rwPill1" class="setup-step-pill active" data-i18n="di_snapshot_amp_method">① Snapshot &amp; Method
+          </div>
+          <div id="rwPill2" class="setup-step-pill" data-i18n="di_options">② Options</div>
+          <div id="rwPill3" class="setup-step-pill" data-i18n="di_confirm">③ Confirm</div>
+        </div>
+      </div>
+
+      <!-- Step 1 -->
+      <div id="rwStep1" style="padding:20px">
+        <div class="form-group">
+          <label class="form-label" data-i18n="lbl_snapshot">Snapshot</label>
+          <select id="rw_snap" class="form-control" onchange="rwSnapChanged()" style="width:100%"></select>
+          <div id="rw_snap_info" class="hint"></div>
+        </div>
+        <div class="form-group" style="margin-top:14px">
+          <label class="form-label" data-i18n="la_restore_method">Restore Method</label>
+          <select id="rw_method" class="form-control" onchange="rwMethodChanged()" style="width:100%"></select>
+          <div id="rw_method_hint" class="hint"></div>
+        </div>
+      </div>
+
+      <!-- Step 2 -->
+      <div id="rwStep2" style="display:none;padding:20px">
+        <div id="rw_node_row" class="form-group">
+          <label class="form-label" data-i18n="la_target_host">Target Host</label>
+          <select id="rw_target_node" class="form-control" style="width:100%">
+            <option value="" data-i18n="op_auto_any_host_in_cluster">Auto (any host in cluster)</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin-top:12px">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+            <input type="checkbox" id="rw_start_after" style="width:15px;height:15px">
+            Start VM after restore
+          </label>
+        </div>
+        <div id="rw_safety_row" class="form-group" style="margin-top:8px">
+          <label
+            style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:13px;padding:10px 14px;border:1px solid var(--border);border-radius:6px;background:var(--bg)">
+            <input type="checkbox" id="rw_safety" checked style="width:15px;height:15px;margin-top:2px;flex-shrink:0">
+            <span><strong data-i18n="st_create_safety_snapshot_before_restore">Create safety snapshot before
+                restore</strong><br>
+              <span style="font-size:11px;opacity:.7">Creates <code>safety_pre_restore_YYYYMMDD</code> before the
+                restore runs.</span>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Step 3 -->
+      <div id="rwStep3" style="display:none;padding:20px">
+        <div style="border:1px solid rgba(217,83,79,.4);border-radius:8px;overflow:hidden;margin-bottom:16px">
+          <div
+            style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:rgba(217,83,79,.07);border-bottom:1px solid rgba(217,83,79,.25)">
+            <svg width="16" height="16" fill="none" stroke="#d9534f" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+            <span style="font-size:13px;font-weight:700;color:#d9534f"
+              data-i18n="sp_destructive_action_restore_will_overwrite_vm_dat">Destructive Action — Restore will
+              overwrite VM data</span>
+          </div>
+          <div style="padding:12px 14px">
+            <table style="font-size:13px;width:100%;border-collapse:collapse">
+              <tr>
+                <td style="color:var(--muted);padding:3px 10px 3px 0;white-space:nowrap" data-i18n="lbl_snapshot">
+                  Snapshot</td>
+                <td id="rw_sum_snap" style="font-family:monospace"></td>
+              </tr>
+              <tr>
+                <td style="color:var(--muted);padding:3px 10px 3px 0" data-i18n="td_vm">VM</td>
+                <td id="rw_sum_vmid"></td>
+              </tr>
+              <tr>
+                <td style="color:var(--muted);padding:3px 10px 3px 0" data-i18n="lbl_method">Method</td>
+                <td id="rw_sum_method"></td>
+              </tr>
+              <tr>
+                <td style="color:var(--muted);padding:3px 10px 3px 0" data-i18n="la_target_host">Target Host</td>
+                <td id="rw_sum_node"></td>
+              </tr>
+              <tr>
+                <td style="color:var(--muted);padding:3px 10px 3px 0" data-i18n="td_start_after">Start after</td>
+                <td id="rw_sum_start"></td>
+              </tr>
+            </table>
+            <div id="rw_blast_row" style="margin-top:10px">
+              <div
+                style="font-size:11px;font-weight:700;letter-spacing:.06em;color:#d9534f;text-transform:uppercase;margin-bottom:6px"
+                data-i18n="di_affected_vms">Affected VMs</div>
+              <div id="rw_sum_blast" style="display:flex;flex-wrap:wrap;gap:4px"></div>
+            </div>
+            <div id="rw_sum_safety_row" style="margin-top:10px">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+                <input type="checkbox" id="rw_sum_safety" style="width:15px;height:15px">
+                Create safety snapshot first
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label style="font-size:13px;font-weight:600;color:#d9534f"
+            data-i18n="la_type_the_snapshot_name_to_confirm">Type the snapshot name to confirm:</label>
+          <div style="font-size:12px;color:var(--muted);margin:4px 0 8px">Enter <code id="rw_sum_expected"
+              style="background:rgba(0,0,0,.2);padding:1px 6px;border-radius:3px"></code> to continue</div>
+          <input id="rw_confirm_input" oninput="rwCheckConfirm()" data-i18n-placeholder="Type snapshot name…"
+            placeholder="Type snapshot name…" autocomplete="off"
+            style="border:1px solid rgba(217,83,79,.5);background:rgba(217,83,79,.04);width:100%">
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <div
+        style="display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-top:1px solid var(--border);background:var(--bg)">
+        <button id="rwBackBtn" class="btn btn-secondary" onclick="rwBack()" style="display:none" data-i18n="pg_prev">←
+          Back</button>
+        <span></span>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-ghost" onclick="closeRestoreWizard()" data-i18n="btn_cancel">Cancel</button>
+          <button id="rwNextBtn" class="btn btn-primary" onclick="rwNext()" data-i18n="pg_next">Next →</button>
+          <button id="rwSubmitBtn" class="btn btn-danger" onclick="doRestore()" style="display:none" disabled
+            data-i18n="bu_start_restore">Start Restore</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══════════════ CLONE WIZARD MODAL ══════════════ -->
+  <div id="cwModal" role="dialog" aria-modal="true" aria-label="Clone Wizard"
+    style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9150;padding:24px 16px;overflow-y:auto;align-items:flex-start;justify-content:center">
+    <div
+      style="max-width:640px;width:100%;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.5)">
+
+      <!-- Header -->
+      <div
+        style="display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border);background:var(--bg)">
+        <div style="display:flex;align-items:center;gap:8px">
+          <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+          </svg>
+          <span style="font-size:15px;font-weight:700" data-i18n="ct_clone_vm">Clone VM</span>
+          <span id="cw_vm_hdr" style="font-size:13px;color:var(--muted);margin-left:4px"></span>
+        </div>
+        <button onclick="closeCloneWizard()"
+          style="background:none;border:none;color:var(--text);opacity:.6;font-size:18px;cursor:pointer;padding:2px 6px;line-height:1">✕</button>
+      </div>
+
+      <!-- Step pills -->
+      <div style="padding:16px 20px 0">
+        <div style="display:flex;gap:0;border-radius:6px;overflow:hidden;border:1px solid var(--border)">
+          <div id="cwPill1" class="setup-step-pill active" data-i18n="di_snapshot">① Snapshot</div>
+          <div id="cwPill2" class="setup-step-pill" data-i18n="di_options">② Options</div>
+          <div id="cwPill3" class="setup-step-pill" data-i18n="di_summary">③ Summary</div>
+        </div>
+      </div>
+
+      <!-- Step 1 -->
+      <div id="cwStep1" style="padding:20px">
+        <div class="form-group">
+          <label class="form-label" data-i18n="la_snapshot_to_clone_from">Snapshot to clone from</label>
+          <select id="cw_snap" class="form-control" onchange="cwSnapChanged()" style="width:100%"></select>
+          <div id="cw_snap_info" class="hint"></div>
+        </div>
+      </div>
+
+      <!-- Step 2 -->
+      <div id="cwStep2" style="display:none;padding:20px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+          <div class="form-group">
+            <label class="form-label">New VM ID <span style="color:#d9534f">*</span></label>
+            <input type="number" id="cw_new_vmid" class="form-control" placeholder="e.g. 200" min="100" max="999999999"
+              oninput="cwBuildSummary()">
+          </div>
+          <div class="form-group">
+            <label class="form-label">New Name <span style="color:var(--muted);font-size:12px"
+                data-i18n="lbl_new_name_hint">(optional)</span></label>
+            <input type="text" id="cw_new_name" class="form-control" data-i18n-placeholder="auto" placeholder="auto"
+              oninput="cwBuildSummary()">
+          </div>
+        </div>
+        <div id="cw_node_row" class="form-group" style="margin-top:10px">
+          <label class="form-label" data-i18n="la_target_host">Target Host</label>
+          <select id="cw_target_node" class="form-control" style="width:100%">
+            <option value="" data-i18n="op_auto_any_host_in_cluster">Auto (any host in cluster)</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin-top:14px;display:flex;flex-direction:column;gap:10px">
+          <label
+            style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:13px;padding:10px 14px;border:1px solid var(--border);border-radius:6px;background:var(--bg)">
+            <input type="checkbox" id="cw_network_isolated" checked
+              style="width:15px;height:15px;margin-top:2px;flex-shrink:0">
+            <span><strong data-i18n="st_disconnect_from_network_after_clone">Disconnect from network after
+                clone</strong><br>
+              <span style="font-size:11px;opacity:.7"
+                data-i18n="sp_sets_link_down_1_on_all_network_interfaces_preve">Sets link_down=1 on all network
+                interfaces — prevents IP conflicts</span>
+            </span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+            <input type="checkbox" id="cw_start_after" style="width:15px;height:15px">
+            Start VM after clone
+          </label>
+        </div>
+      </div>
+
+      <!-- Step 3 -->
+      <div id="cwStep3" style="display:none;padding:20px">
+        <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:14px 16px">
+          <table style="font-size:13px;width:100%;border-collapse:collapse">
+            <tr>
+              <td style="color:var(--muted);padding:3px 12px 3px 0;white-space:nowrap" data-i18n="lbl_source_vm">Source
+                VM</td>
+              <td id="cw_sum_src"></td>
+            </tr>
+            <tr>
+              <td style="color:var(--muted);padding:3px 12px 3px 0" data-i18n="lbl_snapshot">Snapshot</td>
+              <td id="cw_sum_snap" style="font-family:monospace"></td>
+            </tr>
+            <tr>
+              <td style="color:var(--muted);padding:3px 12px 3px 0" data-i18n="lbl_new_vmid">New VM ID</td>
+              <td id="cw_sum_vmid" style="font-family:monospace"></td>
+            </tr>
+            <tr>
+              <td style="color:var(--muted);padding:3px 12px 3px 0" data-i18n="lbl_new_name">New Name</td>
+              <td id="cw_sum_name"></td>
+            </tr>
+            <tr>
+              <td style="color:var(--muted);padding:3px 12px 3px 0" data-i18n="la_target_host">Target Host</td>
+              <td id="cw_sum_node"></td>
+            </tr>
+            <tr>
+              <td style="color:var(--muted);padding:3px 12px 3px 0" data-i18n="td_network">Network</td>
+              <td id="cw_sum_net"></td>
+            </tr>
+            <tr>
+              <td style="color:var(--muted);padding:3px 12px 3px 0" data-i18n="td_start_after">Start after</td>
+              <td id="cw_sum_start"></td>
+            </tr>
+          </table>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <div
+        style="display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-top:1px solid var(--border);background:var(--bg)">
+        <button id="cwBackBtn" class="btn btn-secondary" onclick="cwBack()" style="display:none" data-i18n="pg_prev">←
+          Back</button>
+        <span></span>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-ghost" onclick="closeCloneWizard()" data-i18n="btn_cancel">Cancel</button>
+          <button id="cwNextBtn" class="btn btn-primary" onclick="cwNext()" data-i18n="pg_next">Next →</button>
+          <button id="cwSubmitBtn" class="btn btn-primary" onclick="doClone()" style="display:none" disabled
+            data-i18n="btn_start_clone">Start Clone</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script src="ui.js"></script>
+  <script src="custom.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,139 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/docker-swarm/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Docker / Swarm Manager</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Docker / Swarm Manager</h1>
+            <div style="display:flex;gap:12px;align-items:center">
+                <span id="modeChip" class="chip ok">—</span>
+                <button id="refreshAll">Refresh</button>
+            </div>
+        </header>
+        <div id="message"></div>
+
+        <div class="tabs">
+            <div class="tab active" data-tab="dashboard" data-i18n="dashboard">Dashboard</div>
+            <div class="tab" data-tab="nodes" data-i18n="nodes">Nodes</div>
+            <div class="tab" data-tab="services" data-i18n="services">Services</div>
+            <div class="tab" data-tab="stacks" data-i18n="stacks">Stacks</div>
+            <div class="tab" data-tab="containers" data-i18n="containers">Containers</div>
+            <div class="tab" data-tab="networks" data-i18n="networks">Networks</div>
+            <div class="tab" data-tab="volumes" data-i18n="volumes">Volumes</div>
+            <div class="tab" data-tab="images" data-i18n="images">Images</div>
+            <div class="tab" data-tab="cleanup" data-i18n="cleanup">Disk Cleanup</div>
+        </div>
+
+        <div class="panel active" id="dashboardPanel">
+            <div class="grid" id="dashboardStats"></div>
+        </div>
+
+        <div class="panel" id="nodesPanel">
+            <div class="card">
+                <h2 data-i18n="nodes">Nodes</h2>
+                <div id="nodesList">
+                    <p class="empty">No nodes.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="servicesPanel">
+            <div class="card">
+                <h2 data-i18n="services">Services</h2>
+                <div id="servicesList">
+                    <p class="empty">No services.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="stacksPanel">
+            <div class="card">
+                <h2 data-i18n="stacks">Stacks</h2>
+                <form class="form" id="stackForm">
+                    <label>Name <input type="text" name="name" required /></label>
+                    <label>Compose YAML <textarea name="compose" required></textarea></label>
+                    <button type="submit" data-i18n="deploy">Deploy</button>
+                </form>
+                <div id="stacksList">
+                    <p class="empty">No stacks.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="containersPanel">
+            <div class="card">
+                <h2 data-i18n="containers">Containers</h2>
+                <div id="containersList">
+                    <p class="empty">No containers.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="networksPanel">
+            <div class="card">
+                <h2 data-i18n="networks">Networks</h2>
+                <div id="networksList">
+                    <p class="empty">No networks.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="volumesPanel">
+            <div class="card">
+                <h2 data-i18n="volumes">Volumes</h2>
+                <div id="volumesList">
+                    <p class="empty">No volumes.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="imagesPanel">
+            <div class="card">
+                <h2 data-i18n="images">Images</h2>
+                <div id="imagesList">
+                    <p class="empty">No images.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="cleanupPanel">
+            <div class="card">
+                <h2 data-i18n="cleanup">Disk Cleanup</h2>
+                <div id="pruneResult" class="empty"></div>
+                <form class="form" id="pruneForm">
+                    <label><input type="checkbox" name="enabled" /> Auto prune</label>
+                    <label>Threshold % <input type="number" name="threshold" value="80" /></label>
+                    <label>Interval (s) <input type="number" name="interval" value="3600" /></label>
+                    <label>Targets <input type="text" name="targets" value="containers,images,volumes" /></label>
+                    <button type="submit" data-i18n="save">Save</button>
+                    <button class="secondary" id="runPrune" data-i18n="runNow">Run now</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

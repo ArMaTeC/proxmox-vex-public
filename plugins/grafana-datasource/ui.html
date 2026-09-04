@@ -1,0 +1,97 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/grafana-datasource/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Grafana Data Source</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Grafana Data Source</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="datasource">Data Source</button>
+            <button class="tab" role="tab" data-tab="dashboards">Dashboards</button>
+            <button class="tab" role="tab" data-tab="query">Query Endpoints</button>
+        </div>
+
+        <div id="panel-datasource" class="tab-panel">
+            <div class="grid">
+                <div class="stat">
+                    <div class="muted">Plugin</div>
+                    <div class="num" id="sPlugin">-</div>
+                </div>
+                <div class="stat">
+                    <div class="muted">Version</div>
+                    <div class="num" id="sVersion">-</div>
+                </div>
+            </div>
+            <div class="card">
+                <h2>Current Data Source</h2>
+                <div id="dCard">
+                    <p class="empty">No data source provisioned.</p>
+                </div>
+                <button id="dCopyUrl" class="secondary" disabled>Copy URL</button>
+                <button id="dCopyJson" class="secondary" disabled>Copy JSON</button>
+                <button id="dUnprovision" class="danger" disabled>Unprovision</button>
+            </div>
+            <div class="card">
+                <h2>Provision</h2>
+                <div class="form">
+                    <label>Name <input type="text" id="pName" placeholder="ProxmoxVEx" /></label>
+                    <label>Cluster <select id="pCluster">
+                            <option value="">Select</option>
+                        </select></label>
+                    <label>Type <input type="text" id="pType" value="grafana-json-datasource" /></label>
+                    <label>URL <input type="text" id="pUrl" value="/api/plugins/grafana-datasource/api" /></label>
+                    <button id="pProvision">Provision</button>
+                    <button id="pTest" class="secondary">Test Connection</button>
+                </div>
+                <p id="pError" class="error-text"></p>
+            </div>
+        </div>
+
+        <div id="panel-dashboards" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Dashboards</h2>
+                <label>Search <input type="text" id="dSearch" placeholder="Filter by title" /></label>
+                <div id="dList">
+                    <p class="empty">No dashboards.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-query" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Supported Query Endpoints</h2>
+                <div id="qList">
+                    <p class="empty">Loading...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

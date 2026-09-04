@@ -1,0 +1,167 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/vm-bulk-deployer/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VM Bulk Deployer</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1 data-i18n="title">VM Bulk Deployer</h1>
+            <span class="status" id="status" aria-live="polite">Loading...</span>
+        </header>
+
+        <div id="message" role="status" aria-live="polite"></div>
+
+        <div class="grid" id="stats" role="region" aria-label="Dashboard stats"></div>
+
+        <div class="tabs" role="tablist" aria-label="Sections">
+            <button class="tab active" role="tab" aria-selected="true" data-tab="deploy"
+                data-i18n="deploy">Deploy</button>
+            <button class="tab" role="tab" aria-selected="false" data-tab="jobs" data-i18n="jobs">Jobs</button>
+            <button class="tab" role="tab" aria-selected="false" data-tab="templates"
+                data-i18n="templates">Templates</button>
+            <button class="tab" role="tab" aria-selected="false" data-tab="audit" data-i18n="audit">Audit</button>
+        </div>
+
+        <section id="deploy-panel" class="section" role="tabpanel">
+            <h2 data-i18n="deploy">Deploy</h2>
+            <form class="form" id="deployForm" autocomplete="off">
+                <label data-i18n="cluster">
+                    Cluster
+                    <select name="cluster_id" required></select>
+                </label>
+                <label data-i18n="source">
+                    Source VM/Template
+                    <select name="source" required disabled></select>
+                </label>
+                <label data-i18n="count">
+                    Count
+                    <input type="number" name="count" value="5" min="1" max="100" required />
+                </label>
+                <label data-i18n="namingPrefix">
+                    Naming Prefix
+                    <input type="text" name="naming_prefix" value="web-" required />
+                </label>
+                <label data-i18n="namingPattern">
+                    Naming Pattern
+                    <select name="naming_pattern">
+                        <option value="{prefix}-{index}">prefix-index</option>
+                        <option value="{prefix}{index}">prefixindex</option>
+                    </select>
+                </label>
+                <label data-i18n="targetNode">
+                    Target Node
+                    <select name="target_node" disabled></select>
+                </label>
+                <label data-i18n="targetStorage">
+                    Target Storage
+                    <select name="target_storage" disabled></select>
+                </label>
+                <label data-i18n="mode">
+                    Mode
+                    <select name="mode">
+                        <option value="sequential" data-i18n="sequential">Sequential</option>
+                        <option value="parallel" data-i18n="parallel">Parallel</option>
+                    </select>
+                </label>
+                <label data-i18n="startDelay">
+                    Start Delay (s)
+                    <input type="number" name="start_delay" value="0" min="0" />
+                </label>
+                <label data-i18n="onCompletion">
+                    On Completion
+                    <select name="on_completion">
+                        <option value="" data-i18n="none">None</option>
+                        <option value="start" data-i18n="startVM">Start VM</option>
+                        <option value="email" data-i18n="notificationEmail">Email Notification</option>
+                    </select>
+                </label>
+                <label data-i18n="tags">
+                    Tags
+                    <input type="text" name="tags" placeholder="web,prod" />
+                </label>
+            </form>
+            <div id="namePreview" class="preview-list" aria-live="polite"></div>
+            <div id="impact" class="muted" aria-live="polite"></div>
+            <div class="toolbar">
+                <button type="button" id="queueBtn" data-i18n="queue">Queue</button>
+                <button type="button" id="dryRunBtn" class="secondary" data-i18n="dryRun">Dry Run</button>
+                <button type="button" id="saveTemplateBtn" class="secondary" data-i18n="saveTemplate">Save
+                    Template</button>
+            </div>
+            <div id="deployResult" aria-live="polite"></div>
+            <div id="dryRunResult" aria-live="polite"></div>
+        </section>
+
+        <section id="jobs-panel" class="section" role="tabpanel" hidden>
+            <h2 data-i18n="jobs">Jobs</h2>
+            <div class="filters">
+                <select id="filterStatus" aria-label="Filter by status">
+                    <option value="" data-i18n="filterByStatus">Filter by status</option>
+                    <option value="queued" data-i18n="queued">Queued</option>
+                    <option value="running" data-i18n="running">Running</option>
+                    <option value="completed" data-i18n="completed">Completed</option>
+                    <option value="failed" data-i18n="failed">Failed</option>
+                    <option value="cancelled" data-i18n="cancelled">Cancelled</option>
+                </select>
+                <input type="text" id="filterSource" placeholder="Filter by source" data-i18n-attr="placeholder"
+                    data-i18n="filterBySource" />
+                <select id="sortBy" aria-label="Sort by">
+                    <option value="created" data-i18n="created">Created</option>
+                    <option value="status" data-i18n="status">Status</option>
+                    <option value="source" data-i18n="source">Source</option>
+                </select>
+                <select id="sortOrder" aria-label="Order">
+                    <option value="desc" data-i18n="descending">Descending</option>
+                    <option value="asc" data-i18n="ascending">Ascending</option>
+                </select>
+            </div>
+            <div class="toolbar">
+                <button id="clearCompletedBtn" class="secondary" data-i18n="clearCompleted">Clear Completed</button>
+                <button id="bulkDeleteBtn" class="danger" data-i18n="bulkDelete">Bulk Delete</button>
+                <button id="exportJsonBtn" class="secondary" data-i18n="exportJSON">Export JSON</button>
+                <button id="exportCsvBtn" class="secondary" data-i18n="exportCSV">Export CSV</button>
+            </div>
+            <div id="jobsList">
+                <p class="empty" data-i18n="noJobs">No jobs yet.</p>
+            </div>
+        </section>
+
+        <section id="templates-panel" class="section" role="tabpanel" hidden>
+            <h2 data-i18n="templates">Templates</h2>
+            <div id="templatesList">
+                <p class="empty" data-i18n="noTemplates">No templates yet.</p>
+            </div>
+        </section>
+
+        <section id="audit-panel" class="section" role="tabpanel" hidden>
+            <h2 data-i18n="audit">Audit Log</h2>
+            <div id="auditList">
+                <p class="empty">No audit entries.</p>
+            </div>
+        </section>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

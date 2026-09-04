@@ -1,0 +1,144 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/disk-usage-explorer/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Disk Usage Explorer</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Disk Usage Explorer</h1>
+            <div class="toolbar">
+                <input type="text" id="searchInput" placeholder="Filter…" style="width:140px" />
+                <label class="muted" for="sortSelect">Sort:</label>
+                <select id="sortSelect">
+                    <option value="size">Size (largest first)</option>
+                    <option value="size_asc">Size (smallest first)</option>
+                    <option value="size_on_disk">Size on disk</option>
+                    <option value="name">Name (A–Z)</option>
+                    <option value="name_desc">Name (Z–A)</option>
+                    <option value="modified">Modified (newest)</option>
+                </select>
+                <label class="muted" for="viewSelect">View:</label>
+                <select id="viewSelect">
+                    <option value="tree">Tree</option>
+                    <option value="treemap">Treemap</option>
+                    <option value="top">Top N largest</option>
+                    <option value="types">File types</option>
+                </select>
+                <button id="precomputeBtn" class="secondary">Precompute</button>
+                <button id="scanLogBtn" class="secondary">Scan log</button>
+                <button id="exportBtn" class="secondary">Export</button>
+                <button id="refreshRootBtn" class="secondary">Refresh</button>
+                <button id="settingsBtn" class="secondary" title="Scan roots" style="display:none">Settings</button>
+            </div>
+        </header>
+
+        <div id="settingsPanel">
+            <h2>Scan roots</h2>
+            <p class="muted">Add absolute paths that the Disk Usage Explorer is allowed to scan. Set <code>/</code> to
+                scan the entire host filesystem.</p>
+            <div class="settings-section">
+                <h3>Allowed roots</h3>
+                <div id="rootsList"></div>
+                <div class="settings-row">
+                    <input type="text" id="newRoot" placeholder="/var/lib/vz or /" />
+                    <button id="addRootBtn">Add</button>
+                </div>
+                <div class="settings-row">
+                    <button id="entireHostBtn" class="danger" style="flex:1">Use entire host filesystem</button>
+                </div>
+            </div>
+            <div class="settings-section">
+                <h3>Excluded patterns</h3>
+                <div id="exclusionsList"></div>
+                <div class="settings-row">
+                    <input type="text" id="newExclusion" placeholder="proc, sys, dev, *.log" />
+                    <button id="addExclusionBtn">Add</button>
+                </div>
+            </div>
+            <div class="settings-section">
+                <h3>Precompute</h3>
+                <div class="settings-row" style="align-items:center">
+                    <input type="checkbox" id="autoPrecompute" style="width:auto" />
+                    <label for="autoPrecompute" class="muted">Automatically precompute on first view</label>
+                </div>
+                <div class="settings-row">
+                    <label for="fullScanBudget" class="muted" style="flex:0 0 auto;padding-top:6px">Full-scan budget
+                        (ms):</label>
+                    <input type="number" id="fullScanBudget" min="1000" step="1000" placeholder="300000" />
+                </div>
+                <p class="muted" style="margin:4px 0">To scan paths the web process cannot read, run the scanner as a
+                    different user via sudo. The password is stored in the plugin config file and will be sent to sudo
+                    over stdin.</p>
+                <div class="settings-row">
+                    <label for="scanUser" class="muted" style="flex:0 0 auto;padding-top:6px">Scan user:</label>
+                    <input type="text" id="scanUser" placeholder="root" />
+                </div>
+                <div class="settings-row">
+                    <label for="scanPassword" class="muted" style="flex:0 0 auto;padding-top:6px">Scan password:</label>
+                    <input type="password" id="scanPassword" placeholder="leave blank for passwordless sudo" />
+                </div>
+            </div>
+            <div class="settings-actions">
+                <button id="cancelSettingsBtn" class="secondary">Close</button>
+                <button id="saveSettingsBtn">Save</button>
+            </div>
+        </div>
+
+        <div id="precomputePanel">
+            <h2 id="precomputeTitle">Precompute sizes</h2>
+            <p class="precompute-info" id="precomputeInfo">Click Precompute to cache the entire directory tree. After
+                that, clicking through folders will be instant.</p>
+            <div class="progress">
+                <div class="progress-fill progress-indeterminate" id="precomputeBar"></div>
+            </div>
+            <p class="precompute-info" id="precomputeStatus">Ready</p>
+        </div>
+
+        <div id="rootPath" class="path-bar"></div>
+        <div id="errorBox"></div>
+        <div id="tree"></div>
+        <div id="treemap"></div>
+        <div id="topView" class="rank-list"></div>
+        <div id="typesView" class="rank-list"></div>
+    </div>
+
+
+    <div id="fileModal" class="modal-overlay" hidden>
+        <div class="modal">
+            <div class="modal-header">
+                <span id="fileName">File preview</span>
+                <button id="fileClose" class="secondary">Close</button>
+            </div>
+            <div class="modal-actions-bar">
+                <label class="muted" style="display:flex;align-items:center;gap:6px">
+                    <input type="checkbox" id="tailToggle" checked>
+                    Tail last 1000 lines
+                </label>
+                <button id="fileDownload" class="secondary">Download</button>
+            </div>
+            <pre id="fileContent" class="file-content">Select a file to view</pre>
+        </div>
+    </div>
+    <script src="ui.js"></script>
+</body>
+
+</html>

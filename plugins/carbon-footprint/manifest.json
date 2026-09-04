@@ -1,0 +1,12 @@
+{
+    "id": "carbon-footprint",
+    "name": "Carbon Footprint",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Estimate power consumption and carbon emissions by cluster and tenant.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Cost & Billing",
+    "min_license_tier": "advanced"
+}

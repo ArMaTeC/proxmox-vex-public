@@ -1,0 +1,15 @@
+{
+  "cancel": "रद्द करें",
+  "configured": "कॉन्फ़िगर किया गया",
+  "loading": "लोड हो रहा है...",
+  "overview": "अवलोकन",
+  "save": "सहेजें",
+  "status": "स्थिति",
+  "title": "एक्टिव डायरेक्टरी",
+  "unconfigured": "कॉन्फ़िगर नहीं किया गया",
+  "users": "उपयोगकर्ता",
+  "groups": "समूह",
+  "error": "Error: %s",
+  "loaded": "Loaded %s",
+  "request_failed": "Request failed: %s"
+}

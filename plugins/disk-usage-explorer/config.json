@@ -1,0 +1,18 @@
+{
+    "allowed_roots": [
+        "/"
+    ],
+    "excluded_patterns": [
+        "proc",
+        "sys",
+        "dev",
+        "run"
+    ],
+    "cache_ttl_s": 300,
+    "max_children_per_page": 2000,
+    "scan_budget_ms": 2500,
+    "full_scan_budget_ms": 30000000,
+    "auto_precompute": true,
+    "scan_user": "",
+    "scan_password": ""
+}

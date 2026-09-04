@@ -1,0 +1,16 @@
+{
+  "ad_hosts": [
+    {
+      "name": "ad-01",
+      "server": "ldaps://ad.local",
+      "port": 636,
+      "use_ssl": true,
+      "bind_dn": "cn=svc,dc=example,dc=com",
+      "bind_password": "REPLACE_WITH_PASSWORD",
+      "base_dn": "dc=example,dc=com",
+      "verify_tls": true
+    }
+  ],
+  "poll_interval": 30,
+  "read_only": false
+}

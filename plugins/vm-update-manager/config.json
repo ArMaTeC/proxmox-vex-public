@@ -1,0 +1,5 @@
+{
+    "default_schedule_cron": "0 2 * * *",
+    "default_auto_apply": false,
+    "default_dry_run": true
+}

@@ -1,0 +1,12 @@
+{
+    "id": "pci-passthrough-catalog",
+    "name": "PCI Passthrough Catalog",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Scan and simulate PCI passthrough assignments.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Hardware",
+    "min_license_tier": "corporate"
+}

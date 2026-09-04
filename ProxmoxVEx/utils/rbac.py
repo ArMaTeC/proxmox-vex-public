@@ -1,0 +1,1444 @@
+# --- ProxmoxVEx auto-header start ---
+# --------------------------------------------------------------------
+# File:        ProxmoxVEx/utils/rbac.py
+# Project:     ProxmoxVEx
+# Version:     1.2.303
+# Build:       2026.09.04
+# Description: ProxmoxVEx RBAC - Layer 4
+# Docs:        https://proxmoxvex.local/docs
+# Generated:   2026-09-04
+# --------------------------------------------------------------------
+# --- ProxmoxVEx auto-header end ---
+"""
+ProxmoxVEx RBAC - Layer 4
+Custom roles, tenants, VM ACLs, pool membership cache.
+"""
+
+import contextlib
+import json
+import logging
+import os
+import threading
+import time
+from datetime import datetime
+
+import ProxmoxVEx.models.server_access as server_access
+from ProxmoxVEx.constants import CONFIG_DIR
+from ProxmoxVEx.core.db import get_db
+from ProxmoxVEx.globals import (
+    _vm_acls_cache_time,
+    cluster_managers,
+)
+from ProxmoxVEx.models.permissions import (
+    BUILTIN_ROLES,
+    ROLE_ADMIN,
+    ROLE_PERMISSIONS,
+    ROLE_VIEWER,
+)
+
+
+def load_custom_roles() -> dict:
+    """Load custom roles from SQLite database
+
+    moved to SQLite
+
+    Structure:
+    {
+        "global": {
+            "role_id": {"name": "...", "permissions": [...], "created_by": "..."}
+        },
+        "tenants": {
+            "tenant_id": {
+                "role_id": {"name": "...", "permissions": [...]}
+            }
+        }
+    }
+    """
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT * FROM custom_roles")
+
+        global_roles = {}
+        tenant_roles = {}
+
+        for row in cursor.fetchall():
+            # #167: name column = role ID (dict key), description = display name
+            role_data = {
+                "name": row["description"] or row["name"],
+                "permissions": json.loads(row["permissions"] or "[]"),
+                "description": "",
+            }
+
+            # Check if role has tenant_id (might not exist in old schema)
+            tenant_id = None
+            with contextlib.suppress(IndexError, KeyError):
+                tenant_id = row["tenant_id"]
+
+            # Empty string or None means global role
+            if tenant_id and tenant_id != "":
+                # Tenant-specific role
+                if tenant_id not in tenant_roles:
+                    tenant_roles[tenant_id] = {}
+                tenant_roles[tenant_id][row["name"]] = role_data
+            else:
+                # Global role
+                global_roles[row["name"]] = role_data
+
+        return {"global": global_roles, "tenants": tenant_roles}
+    except Exception as e:
+        logging.error(f"Error loading custom roles from database: {e}")
+        # Plain-JSON CUSTOM_ROLES_FILE fallback removed (encrypted database only).
+
+    return {"global": {}, "tenants": {}}
+
+
+def save_custom_roles(roles: dict):
+    """Save custom roles to SQLite database
+
+    uses SQLite now
+    """
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+
+        # Clear existing roles
+        cursor.execute("DELETE FROM custom_roles")
+
+        now = datetime.now().isoformat()
+
+        # Save global roles (use empty string for tenant_id to work with composite key)
+        for role_id, role_data in roles.get("global", {}).items():
+            cursor.execute(
+                """
+                INSERT INTO custom_roles (name, permissions, description, tenant_id, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """,
+                (
+                    role_id,
+                    json.dumps(role_data.get("permissions", [])),
+                    role_data.get("name", role_id),
+                    "",  # Empty string for global roles
+                    now,
+                ),
+            )
+
+        # Save tenant-specific roles
+        for tenant_id, tenant_roles in roles.get("tenants", {}).items():
+            for role_id, role_data in tenant_roles.items():
+                cursor.execute(
+                    """
+                    INSERT INTO custom_roles (name, permissions, description, tenant_id, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                    (
+                        role_id,
+                        json.dumps(role_data.get("permissions", [])),
+                        role_data.get("name", role_id),
+                        tenant_id,
+                        now,
+                    ),
+                )
+
+        db.conn.commit()
+    except Exception as e:
+        logging.error(f"Failed to save custom roles: {e}")
+
+
+# cache
+_custom_roles_cache = None
+
+
+def get_custom_roles():
+    global _custom_roles_cache
+    if _custom_roles_cache is None:
+        _custom_roles_cache = load_custom_roles()
+    return _custom_roles_cache
+
+
+def invalidate_roles_cache():
+    global _custom_roles_cache
+    _custom_roles_cache = None
+
+
+def get_role_permissions_for_user(user: dict, tenant_id: str = None) -> list:
+    """Get permissions for a role, considering custom roles
+
+    Priority:
+    1. Builtin role (admin/user/viewer)
+    2. Tenant-specific custom role
+    3. Global custom role
+    """
+    role = user.get("role", ROLE_VIEWER)
+
+    # builtin role?
+    if role in ROLE_PERMISSIONS:
+        return ROLE_PERMISSIONS[role].copy()
+
+    # check custom roles
+    custom = get_custom_roles()
+
+    # tenant specific first
+    if tenant_id:
+        tenant_roles = custom.get("tenants", {}).get(tenant_id, {})
+        if role in tenant_roles:
+            return tenant_roles[role].get("permissions", []).copy()
+
+    # global custom role
+    global_roles = custom.get("global", {})
+    if role in global_roles:
+        return global_roles[role].get("permissions", []).copy()
+
+    # fallback to viewer
+    return ROLE_PERMISSIONS[ROLE_VIEWER].copy()
+
+
+# =============================================================================
+# MULTI-TENANCY
+# Feature requested on Reddit (r/selfhosted) - MSPs wanted to manage multiple
+# customers from one ProxmoxVEx instance without them seeing each others VMs.
+# Took about a weekend to implement properly.
+#
+# Tenants are like organizations - users belong to tenants
+# Each tenant can only see clusters assigned to them
+# =============================================================================
+
+TENANTS_FILE = os.path.join(CONFIG_DIR, "tenants.json")  # legacy, kept for migration
+DEFAULT_TENANT_ID = "default"  # fallback tenant for existing users
+
+
+def load_tenants() -> dict:
+    """Load tenants from SQLite database
+
+    SQLite backend
+    """
+    try:
+        db = get_db()
+        tenants_list = db.get_all_tenants()
+
+        if tenants_list:
+            # Convert list to dict format
+            return {t["id"]: t for t in tenants_list}
+    except Exception as e:
+        logging.error(f"Error loading tenants from database: {e}")
+        # Plain-JSON TENANTS_FILE fallback removed (encrypted database only).
+
+    # Create default tenant
+    default = {
+        DEFAULT_TENANT_ID: {
+            "id": DEFAULT_TENANT_ID,
+            "name": "Default",
+            "clusters": [],  # empty = all clusters (for backwards compat)
+            "created": datetime.now().isoformat(),
+        }
+    }
+    save_tenants(default)
+    return default
+
+
+def save_tenants(tenants: dict):
+    """Save tenants to SQLite database
+
+    SQLite migration
+    """
+    try:
+        db = get_db()
+        # Convert dict to list format
+        tenants_list = list(tenants.values())
+        db.save_all_tenants(tenants_list)
+    except Exception as e:
+        logging.error(f"Failed to save tenants: {e}")
+
+
+# tenant cache - reloaded on changes
+tenants_db = {}
+
+
+def get_user_permissions(user: dict, tenant_id: str = None) -> list:
+    """Get effective permissions for a user
+
+    Updated Dec 2025 - now supports tenant-specific permissions
+
+    User can have different permissions per tenant via 'tenant_permissions' field:
+    {
+        "tenant_permissions": {
+            "tenant_a": {"role": "custom_role", "extra": [...], "denied": [...]},
+            "tenant_b": {"role": "viewer"}
+        }
+    }
+    """
+    # figure out which tenant we're checking for
+    if not tenant_id:
+        tenant_id = user.get("tenant_id", DEFAULT_TENANT_ID)
+
+    # check if user has tenant-specific settings
+    tenant_perms = user.get("tenant_permissions", {})
+
+    if tenant_id in tenant_perms:
+        # use tenant-specific role/permissions
+        tp = tenant_perms[tenant_id]
+        role = tp.get("role", user.get("role", ROLE_VIEWER))
+        extra = tp.get("extra", [])
+        denied = tp.get("denied", [])
+    else:
+        # use global user settings — effective_role wins when set (API-token scoping)
+        role = user.get("effective_role", user.get("role", ROLE_VIEWER))
+        extra = user.get("permissions", [])
+        denied = user.get("denied_permissions", [])
+
+    # get base permissions from role (supports custom roles now)
+    base_perms = get_role_permissions_for_user({"role": role}, tenant_id)
+
+    # add extra
+    for p in extra:
+        if p not in base_perms:
+            base_perms.append(p)
+
+    # remove denied
+    base_perms = [p for p in base_perms if p not in denied]
+
+    return base_perms
+
+
+def has_permission(user: dict, permission: str, tenant_id: str = None) -> bool:
+    """check if user has a specific permission
+
+    Now tenant-aware
+    """
+    if not user:
+        return False
+    # admin always has access (safety net) - unless checking tenant-specific
+    if user.get("effective_role", user.get("role")) == ROLE_ADMIN and not tenant_id:
+        return True
+    return permission in get_user_permissions(user, tenant_id)
+
+
+def get_user_effective_role(user: dict, tenant_id: str = None) -> str:
+    """Get the effective role for a user in a specific tenant"""
+    if not tenant_id:
+        tenant_id = user.get("tenant_id", DEFAULT_TENANT_ID)
+
+    tenant_perms = user.get("tenant_permissions", {})
+    if tenant_id in tenant_perms:
+        return tenant_perms[tenant_id].get("role", user.get("role", ROLE_VIEWER))
+    return user.get("role", ROLE_VIEWER)
+
+
+def get_user_clusters(user: dict, include_pools: bool = True) -> list | None:
+    """Get list of cluster IDs user can access based on tenant
+
+    Also checks role's tenant for tenant-specific roles
+    Added group-based access (tenant can be assigned to groups)
+    """
+    global tenants_db
+    if not tenants_db:
+        tenants_db = load_tenants()
+
+    # admin sees all
+    if user.get("role") == ROLE_ADMIN:
+        return None  # None means all clusters
+
+    tenant_id = user.get("tenant_id", DEFAULT_TENANT_ID)
+
+    # If user has default tenant but a tenant-specific role, use the role's tenant
+    role = user.get("role", ROLE_VIEWER)
+    if tenant_id == DEFAULT_TENANT_ID and role not in BUILTIN_ROLES:
+        custom_roles = load_custom_roles()
+        for tid, roles in custom_roles.get("tenants", {}).items():
+            if role in roles:
+                tenant_id = tid
+                break
+
+    tenant = tenants_db.get(tenant_id, {})
+    clusters = tenant.get("clusters", [])
+
+    # Also include clusters from groups assigned to this tenant
+    try:
+        db = get_db()
+        # Get groups assigned to this tenant
+        groups = db.query("SELECT id FROM cluster_groups WHERE tenant_id = ?", (tenant_id,))
+        if groups:
+            group_ids = [g["id"] for g in groups]
+            # Get clusters in those groups
+            placeholders = ",".join(["?"] * len(group_ids))
+            q = "SELECT id FROM clusters WHERE group_id IN (" + placeholders + ")"  # nosec: B608 - placeholders are only '?'"
+            group_clusters = db.query(q, tuple(group_ids))
+            if group_clusters:
+                clusters = list(set(clusters + [c["id"] for c in group_clusters]))
+    except Exception as e:
+        logging.error(f"Error getting group clusters for tenant {tenant_id}: {e}")
+
+    # empty list means all clusters (backwards compat) - but only for default tenant
+    # Changed this - non-default tenants with empty clusters should see nothing, not everything
+    # was confusing before when new tenants could suddenly see everything
+    if not clusters:
+        if tenant_id == DEFAULT_TENANT_ID:
+            # Default tenant may see all clusters, but the server access filter
+            # below restricts them to servers assigned to their groups.
+            all_cluster_rows = get_db().query("SELECT id FROM clusters")
+            clusters = [c["id"] for c in all_cluster_rows]
+        else:
+            return []  # other tenants with no clusters assigned see nothing
+
+    # #555: a pool-only user (tenant+group gave them this list) must also reach
+    # clusters where they hold pool perms. Only widen the non-None list — the None
+    # (admin / default-tenant-all) paths above already see everything.
+    # (sec-review): callers that decide BLANKET per-cluster authority
+    # (the role fall-through in user_can_access_vm) pass include_pools=False, so a
+    # pool grant only reaches its pool's VMs — not every VM on the cluster.
+    if include_pools:
+        try:
+            username = user.get("username", "")
+            if username:
+                pool_cids = get_db().get_user_pool_clusters(username, user.get("groups", []))
+                if pool_cids:
+                    clusters = list(set(clusters) | set(pool_cids))
+        except Exception as e:
+            logging.error(f"Error adding pool clusters for {user.get('username', '')}: {e}")
+
+    # Server access group filter (ANDed gate). If no groups are assigned to a
+    # server, the server is only visible to global administrators.
+    if user.get("effective_role", user.get("role")) != ROLE_ADMIN:
+        try:
+            username = user.get("username", "")
+            if not server_access.has_server_access_assignments("cluster"):
+                # Feature is not active for clusters yet; preserve legacy
+                # default-tenant "all" sentinel and skip the filter.
+                if tenant_id == DEFAULT_TENANT_ID:
+                    clusters = None
+            elif clusters is None:
+                all_cluster_rows = get_db().query("SELECT id FROM clusters")
+                all_cluster_ids = [c["id"] for c in all_cluster_rows]
+                sa_allowed = server_access.filter_servers_for_user(username, "cluster", all_cluster_ids)
+                clusters = list(sa_allowed)
+            else:
+                sa_allowed = server_access.filter_servers_for_user(username, "cluster", clusters)
+                clusters = list(sa_allowed)
+        except Exception as e:
+            logging.error(f"Error applying server access filter: {e}")
+            return []
+
+    return clusters
+
+
+def filter_clusters_for_user(clusters: dict, user: dict) -> dict:
+    """Filter clusters dict to only show user's allowed clusters"""
+    allowed = get_user_clusters(user)
+    if allowed is None:
+        return clusters  # user can see all
+
+    return {k: v for k, v in clusters.items() if k in allowed}
+
+
+# =============================================================================
+# SERVER ACCESS GROUPS
+# Per-server RBAC layer (Proxmox cluster, VMware/vCenter, PBS).
+# Highest applicable group permission is used, capped by global role.
+# =============================================================================
+
+
+PERMISSION_ORDER = {"view": 0, "edit": 1, "admin": 2}
+
+
+def get_user_server_permission(user: dict, server_type: str, server_id: str) -> str | None:
+    """Return the highest server access permission for a user on a server.
+
+    Returns None if the user is not in any group assigned to the server.
+    Global administrators always get 'admin'.
+    """
+    if not user:
+        return None
+    if user.get("effective_role", user.get("role")) == ROLE_ADMIN:
+        return "admin"
+    try:
+        return server_access.get_user_server_permission(user.get("username", ""), server_type, server_id)
+    except Exception as e:
+        logging.error(f"Error resolving server permission for {server_type}/{server_id}: {e}")
+        return None
+
+
+def filter_servers_for_user(user: dict, server_type: str, server_ids: list[str]) -> set[str]:
+    """Return the subset of server_ids the user may see for a server type.
+
+    Fail-closed: an error returns an empty set so the user sees nothing.
+    """
+    if not user or not server_ids:
+        return set()
+    if user.get("effective_role", user.get("role")) == ROLE_ADMIN:
+        return set(server_ids)
+    try:
+        return server_access.filter_servers_for_user(user.get("username", ""), server_type, server_ids)
+    except Exception as e:
+        logging.error(f"Error filtering {server_type} servers for user: {e}")
+        return set()
+
+
+def user_can_access_server(user: dict, server_type: str, server_id: str, required_level: str = "view") -> bool:
+    """Check if user has the required server access permission level.
+
+    Admin always passes. An error or unknown level fails closed.
+    """
+    if not user:
+        return False
+    if user.get("effective_role", user.get("role")) == ROLE_ADMIN:
+        return True
+    level = get_user_server_permission(user, server_type, server_id)
+    if not level:
+        return False
+    return PERMISSION_ORDER.get(level, -1) >= PERMISSION_ORDER.get(required_level, 0)
+
+
+def check_tenant_quota(tenant_id, add_cores=0, add_mem_gb=0, add_vms=1, force=False):
+    """#502 — sum a tenant's current resource usage across its clusters and decide
+    whether adding (add_cores, add_mem_gb, add_vms) would exceed its quota.
+    Returns {'ok', 'enforce', 'violations', 'usage', 'quota'}. FAIL-OPEN: any error
+    returns ok=True so a quota bug can never block a legitimate VM create.
+    force=True computes usage even when no quota is set (for the usage display)."""
+    try:
+        global tenants_db
+        # #502 - always refresh: the cached global goes stale after a quota edit,
+        # and get_user_clusters() below reads the same global for cluster resolution.
+        tenants_db = load_tenants()
+        t = (tenants_db or {}).get(tenant_id) or {}
+        qv = int(t.get("quota_max_vms", 0) or 0)
+        qc = int(t.get("quota_max_cores", 0) or 0)
+        qm = int(t.get("quota_max_memory_gb", 0) or 0)
+        enforce = t.get("quota_enforcement") or "block"
+        if not force and qv <= 0 and qc <= 0 and qm <= 0:
+            return {"ok": True, "enforce": enforce, "violations": [], "usage": {}, "quota": {}}
+        allowed = get_user_clusters({"role": ROLE_VIEWER, "tenant_id": tenant_id})  # None = all clusters
+        from ProxmoxVEx.globals import cluster_managers
+
+        used_vms = 0
+        used_cores = 0
+        used_mem = 0.0
+        for cid, mgr in cluster_managers.items():
+            if allowed is not None and cid not in allowed:
+                continue
+            try:
+                vms = mgr.get_vm_resources() if hasattr(mgr, "get_vm_resources") else []
+            except Exception as _e:
+                vms = []
+            for vm in vms or []:
+                used_vms += 1
+                used_cores += int(vm.get("maxcpu") or vm.get("cpus") or vm.get("cores") or 0)
+                with contextlib.suppress(ValueError, TypeError):
+                    used_mem += float(vm.get("maxmem") or 0) / (1024.0**3)
+        violations = []
+        if qv > 0 and used_vms + add_vms > qv:
+            violations.append("vms")
+        if qc > 0 and used_cores + add_cores > qc:
+            violations.append("cores")
+        if qm > 0 and used_mem + add_mem_gb > qm:
+            violations.append("memory")
+        return {
+            "ok": not violations,
+            "enforce": enforce,
+            "violations": violations,
+            "usage": {"vms": used_vms, "cores": used_cores, "memory_gb": round(used_mem, 1)},
+            "quota": {"vms": qv, "cores": qc, "memory_gb": qm},
+        }
+    except Exception as e:
+        logging.warning(f"[quota] check failed, allowing create (fail-open): {e}")
+        return {"ok": True, "enforce": "warn", "violations": [], "usage": {}, "quota": {}}
+
+
+# =============================================================================
+# VM-LEVEL ACCESS CONTROL
+# Fine-grained permissions for individual VMs/CTs
+# Users can be granted or denied access to specific VMs
+# =============================================================================
+
+VM_ACLS_FILE = os.path.join(CONFIG_DIR, "vm_acls.json")
+
+
+def load_vm_acls() -> dict:
+    """Load VM access control lists from SQLite database
+
+    SQLite migration
+
+    Structure:
+    {
+        "cluster_id": {
+            "100": {  # vmid
+                "users": ["user1", "user2"],  # users with access
+                "permissions": ["vm.view", "vm.console"],  # specific perms
+                "inherit_role": true  # use user's role permissions
+            }
+        }
+    }
+    """
+    try:
+        db = get_db()
+        return db.get_all_vm_acls()
+    except Exception as e:
+        logging.error(f"Failed to load VM ACLs from database: {e}")
+        # Legacy fallback
+        if os.path.exists(VM_ACLS_FILE):
+            try:
+                with open(VM_ACLS_FILE) as f:
+                    return json.load(f)
+            except Exception as e:
+                logging.warning(f"Failed to load legacy VM ACLs file: {e}")
+    return {}
+
+
+def save_vm_acls(acls: dict):
+    """Save VM ACLs to SQLite database
+
+    SQLite migration
+    """
+    try:
+        db = get_db()
+        db.save_all_vm_acls(acls)
+    except Exception as e:
+        logging.error(f"Failed to save VM ACLs: {e}")
+
+
+_vm_acls_cache = None
+
+# Pool membership cache
+# Structure: {cluster_id: {'data': {vmid: pool_id, ...}, 'timestamp': time, 'refreshing': bool}}
+# TTL: 300 seconds (5 min) - pools don't change often
+# Stale TTL: 30 seconds - return stale data while refreshing in background
+_pool_membership_cache = {}
+POOL_CACHE_TTL = 300  # 5 minutes - pools rarely change
+POOL_CACHE_STALE_TTL = 30  # Return stale data for 30s while refreshing
+_pool_cache_lock = threading.Lock()
+# (#555) - when a build can't enumerate members (token lacks Pool.Audit,
+# member fetch errored, or a remote cluster is mid-connect) it produced an EMPTY map
+# that got pinned fresh for the full TTL — so every pool-only portal user resolved to
+# nothing for 5 min with no signal and no retry. Cache such a result for only this
+# short window so it self-heals, and shout once so the operator can fix the token.
+POOL_CACHE_EMPTY_TTL = 25
+
+
+def _stamp_pool_cache(cluster_id, pools, membership, had_error):
+    """Return the timestamp to cache a freshly-built membership map under. A build
+    that saw pools but resolved zero members (or hit a fetch error) is suspect
+    don't pin it as fresh; date it so it expires in POOL_CACHE_EMPTY_TTL and warn."""
+    import time as _t
+
+    now = _t.time()
+    suspect = bool(pools) and (not membership or had_error)
+    if suspect:
+        logging.warning(
+            f"[POOL-CACHE] cluster {cluster_id}: {len(pools)} pool(s) but {len(membership)} "
+            f"member(s) resolved{' (member fetch errored)' if had_error else ''} — the cluster "
+            f"API token likely lacks Pool.Audit; pool-based portal/console access won't work "
+            f"until the token can enumerate pool members. Retrying soon."
+        )
+        # date it so age already exceeds (TTL - EMPTY_TTL) -> expires in ~EMPTY_TTL
+        return now - (POOL_CACHE_TTL - POOL_CACHE_EMPTY_TTL)
+    return now
+
+
+def _refresh_pool_cache_async(cluster_id: str):
+    """Background refresh of pool cache - doesn't block requests"""
+    global _pool_membership_cache
+
+    try:
+        if cluster_id not in cluster_managers:
+            return
+
+        mgr = cluster_managers[cluster_id]
+        pools = mgr.get_pools()
+
+        membership = {}
+        had_error = False
+        for pool in pools:
+            pool_id = pool.get("poolid")
+            if not pool_id:
+                continue
+
+            try:
+                pool_data = mgr.get_pool_members(pool_id)
+                members = pool_data.get("members", [])
+
+                for member in members:
+                    vmid = member.get("vmid")
+                    mtype = member.get("type")
+                    if vmid and mtype in ("qemu", "lxc"):
+                        membership[f"{vmid}:{mtype}"] = pool_id
+            except Exception as e:
+                had_error = True
+                logging.warning(f"[POOL-CACHE] Error getting members for pool {pool_id}: {e}")
+                continue
+
+        with _pool_cache_lock:
+            _pool_membership_cache[cluster_id] = {
+                "data": membership,
+                "timestamp": _stamp_pool_cache(cluster_id, pools, membership, had_error),
+                "refreshing": False,
+            }
+
+        logging.info(f"[POOL-CACHE] Refreshed cache for cluster {cluster_id}: {len(membership)} VMs in pools")
+
+    except Exception as e:
+        logging.error(f"[POOL-CACHE] Error refreshing cache for {cluster_id}: {e}")
+        with _pool_cache_lock:
+            if cluster_id in _pool_membership_cache:
+                _pool_membership_cache[cluster_id]["refreshing"] = False
+
+
+def get_pool_membership_cache(cluster_id: str) -> dict:
+    """Get cached pool memberships for a cluster
+
+    Returns {vmid:type: pool_id, ...} mapping
+    Uses stale-while-revalidate pattern for better performance
+    """
+    global _pool_membership_cache
+
+    now = time.time()
+
+    with _pool_cache_lock:
+        cache_entry = _pool_membership_cache.get(cluster_id)
+
+        # No cache at all - need synchronous refresh
+        if not cache_entry:
+            _pool_membership_cache[cluster_id] = {"data": {}, "timestamp": 0, "refreshing": True}
+
+    if cache_entry:
+        age = now - cache_entry.get("timestamp", 0)
+
+        # Cache is fresh - return immediately
+        if age < POOL_CACHE_TTL:
+            return cache_entry.get("data", {})
+
+        # Cache is stale but usable - return it and refresh in background
+        if age < POOL_CACHE_TTL + POOL_CACHE_STALE_TTL:
+            if not cache_entry.get("refreshing"):
+                with _pool_cache_lock:
+                    _pool_membership_cache[cluster_id]["refreshing"] = True
+                threading.Thread(target=_refresh_pool_cache_async, args=(cluster_id,), daemon=True).start()
+            return cache_entry.get("data", {})
+
+    # Cache too old or missing - do synchronous refresh (only on first load)
+    if cluster_id not in cluster_managers:
+        return cache_entry.get("data", {}) if cache_entry else {}
+
+    try:
+        mgr = cluster_managers[cluster_id]
+        pools = mgr.get_pools()
+
+        membership = {}
+        had_error = False
+        for pool in pools:
+            pool_id = pool.get("poolid")
+            if not pool_id:
+                continue
+
+            try:
+                pool_data = mgr.get_pool_members(pool_id)
+                members = pool_data.get("members", [])
+
+                for member in members:
+                    vmid = member.get("vmid")
+                    mtype = member.get("type")
+                    if vmid and mtype in ("qemu", "lxc"):
+                        membership[f"{vmid}:{mtype}"] = pool_id
+            except Exception as _e:
+                had_error = True
+                continue
+
+        with _pool_cache_lock:
+            _pool_membership_cache[cluster_id] = {
+                "data": membership,
+                "timestamp": _stamp_pool_cache(cluster_id, pools, membership, had_error),
+                "refreshing": False,
+            }
+
+        logging.info(f"[POOL-CACHE] Initial cache for cluster {cluster_id}: {len(membership)} VMs in pools")
+        return membership
+
+    except Exception as e:
+        logging.error(f"[POOL-CACHE] Error getting pool cache for {cluster_id}: {e}")
+        return cache_entry.get("data", {}) if cache_entry else {}
+
+
+def invalidate_pool_cache(cluster_id: str = None):
+    """Invalidate pool membership cache"""
+    global _pool_membership_cache
+    with _pool_cache_lock:
+        if cluster_id:
+            _pool_membership_cache.pop(cluster_id, None)
+        else:
+            _pool_membership_cache = {}
+
+
+def get_vm_pool_cached(cluster_id: str, vmid: int, vm_type: str = None) -> str | None:
+    """Get pool for a VM using cache
+
+    Much faster than direct API calls - uses cached membership data
+    """
+    membership = get_pool_membership_cache(cluster_id)
+
+    if vm_type:
+        # Exact match
+        return membership.get(f"{vmid}:{vm_type}")
+    else:
+        # Try both types
+        return membership.get(f"{vmid}:qemu") or membership.get(f"{vmid}:lxc")
+
+
+def user_has_any_pool_access(user: dict, cluster_id: str) -> bool:
+    """#555 — does this user hold ANY pool permission in this cluster?
+    One cheap DB read, no membership scan. For the cluster gates."""
+    if user.get("role") == ROLE_ADMIN:
+        return True
+    username = user.get("username", "")
+    if not username:
+        return False
+    try:
+        perms = get_db().get_user_pool_permissions(cluster_id, username, user.get("groups", []))
+    except Exception as e:
+        logging.error(f"[POOL] any-access check failed for {username}@{cluster_id}: {e}")
+        return False
+    return any(p for p in perms.values())
+
+
+def get_user_pool_vmids(user: dict, cluster_id: str, permission: str = None) -> set:
+    """#555 — set of int vmids the user can reach via pool perms in this cluster.
+    Reuses the pool-membership cache + a single DB read. Empty set if none.
+    Only consulted for non-admins (list callers handle admin-all separately).
+
+    permission=None (default) = VISIBILITY: any non-empty pool grant counts. This
+    matches the pool model where 'pool.view' (not 'vm.view') is the see-the-members
+    permission — so the portal list shows a pool's VMs to anyone with a grant on it.
+    Pass a specific action perm (e.g. 'vm.start') to filter to pools where the user
+    holds that perm (or pool.admin)."""
+    username = user.get("username", "")
+    if not username:
+        return set()
+    try:
+        user_pool_perms = get_db().get_user_pool_permissions(cluster_id, username, user.get("groups", []))
+    except Exception as e:
+        logging.error(f"[POOL] vmid-list failed for {username}@{cluster_id}: {e}")
+        return set()
+    if not user_pool_perms:
+        return set()
+    if permission is None:
+        # visibility: any pool the user holds at least one (non-empty) permission on
+        ok_pools = {pid for pid, perms in user_pool_perms.items() if perms}
+    else:
+        # action-specific: pool.admin grants everything, else the perm must be present
+        ok_pools = {pid for pid, perms in user_pool_perms.items() if "pool.admin" in perms or permission in perms}
+    if not ok_pools:
+        return set()
+    membership = get_pool_membership_cache(cluster_id)  # {'vmid:type': pool_id}
+    out = set()
+    for key, pid in membership.items():
+        if pid in ok_pools:
+            try:
+                out.add(int(key.split(":", 1)[0]))
+            except (ValueError, IndexError):
+                continue
+    return out
+
+
+# (scale) - short TTL for the VM-ACL cache. user_can_access_vm() calls
+# get_vm_acls() once per VM on the console/action/pbs/user-listing paths, so a non-admin
+# op over 1000 VMs did ~1000 full SQLCipher-decrypted reloads of the whole vm_acls table
+# (~1.6ms each ≈ 1.6s of pure waste per request). ACLs are security-critical, so this stays
+# CORRECT via complete write-invalidation — every writer (api/users set+delete, settings
+# import) calls invalidate_vm_acls_cache(). The TTL is only a secondary safety net that
+# bounds any hypothetically-missed invalidation to a few seconds; it is short on purpose.
+_VM_ACLS_TTL = 30.0
+
+
+def get_vm_acls():
+    """Get VM ACLs with a short TTL cache (security-critical; writes invalidate).
+
+    Was "always reload" for safety.  : re-enabled the pre-existing
+    _vm_acls_cache behind a 30s TTL now that every write path invalidates it — this
+    kills the per-VM reload storm at 1000+-VM scale without a stale-authz window
+    (a write nulls the cache immediately; the TTL only caps a missed invalidation).
+    """
+    global _vm_acls_cache, _vm_acls_cache_time
+    now = time.monotonic()
+    if _vm_acls_cache is not None and (now - _vm_acls_cache_time) < _VM_ACLS_TTL:
+        return _vm_acls_cache
+    _vm_acls_cache = load_vm_acls()
+    _vm_acls_cache_time = now
+    return _vm_acls_cache
+
+
+def invalidate_vm_acls_cache():
+    global _vm_acls_cache, _vm_acls_cache_time
+    _vm_acls_cache = None
+    _vm_acls_cache_time = 0
+
+
+def user_can_access_vm(
+    user: dict, cluster_id: str, vmid: int, permission: str = "vm.view", vm_type: str = None
+) -> bool:
+    """Check if user can access a specific VM
+
+    VM ACLs are ADDITIVE, not restrictive
+    Added Pool Permission support
+
+    Logic:
+    1. Admin always has access
+    2. If user has VM-specific ACL entry:
+       - inherit_role=True: User can do ALL VM operations (full access)
+       - inherit_role=False: User can ONLY do operations listed in permissions
+    3. Check Pool Permissions (if VM is in a pool)
+    4. If user not in ACL: fall back to user's general role permissions
+
+    Changed inherit_role=True to mean "full VM access" instead of "use role perms"
+    This is more intuitive - adding someone to a VM ACL should grant them access to that VM
+    """
+    # Effective_role (token-scoped) wins over the stored role so an admin-owned
+    # restricted token doesn't get the admin VM bypass below
+    if user.get("effective_role", user.get("role")) == ROLE_ADMIN:
+        return True
+
+    # Server access group gate: map the requested VM permission to the required
+    # server access level (view/edit/admin) and apply it as an ANDed gate.
+    _vm_perm_to_level = {
+        "vm.view": "view",
+        "vm.console": "view",
+        "vm.start": "edit",
+        "vm.stop": "edit",
+        "vm.restart": "edit",
+        "vm.snapshot": "edit",
+        "vm.migrate": "edit",
+        "vm.clone": "edit",
+        "vm.config": "edit",
+        "vm.backup": "edit",
+        "vm.create": "admin",
+        "vm.delete": "admin",
+    }
+    required_level = _vm_perm_to_level.get(permission, "admin")
+    if not user_can_access_server(user, "cluster", cluster_id, required_level):
+        logging.debug(f"[VM-ACL] {user.get('username', '')} denied: no server access to cluster {cluster_id}")
+        return False
+
+    username = user.get("username", "")
+    acls = get_vm_acls()
+
+    # Debug logging to help troubleshoot ACL issues
+    logging.debug(f"[VM-ACL] Checking access for user={username}, cluster={cluster_id}, vmid={vmid}, perm={permission}")
+    logging.debug(f"[VM-ACL] Available ACLs for cluster: {list(acls.get(cluster_id, {}).keys())}")
+
+    # check VM-specific acl
+    cluster_acls = acls.get(cluster_id, {})
+    vm_acl = cluster_acls.get(str(vmid), {})
+
+    if vm_acl:
+        allowed_users = vm_acl.get("users", [])
+        logging.debug(f"[VM-ACL] VM {vmid} ACL found, allowed users: {allowed_users}")
+
+        # If user is in the ACL whitelist, check their ACL permissions
+        if username in allowed_users or "*" in allowed_users:
+            if vm_acl.get("inherit_role", True):
+                # inherit_role=True: FULL VM access (start, stop, console, etc.)
+                # This means "this user has access to this VM"
+                vm_permissions = [
+                    "vm.view",
+                    "vm.start",
+                    "vm.stop",
+                    "vm.restart",
+                    "vm.console",
+                    "vm.snapshot",
+                    "vm.migrate",
+                    "vm.clone",
+                    "vm.config",
+                    "vm.backup",
+                ]
+                result = permission in vm_permissions
+                logging.debug(
+                    f"[VM-ACL] User {username} in ACL with inherit_role=True, checking {permission}: {result}"
+                )
+                return result
+            else:
+                # inherit_role=False: use ONLY the VM-specific permissions
+                vm_perms = vm_acl.get("permissions", [])
+                result = permission in vm_perms
+                logging.debug(
+                    f"[VM-ACL] User {username} in ACL with custom perms {vm_perms}, checking {permission}: {result}"
+                )
+                return result
+        else:
+            logging.debug(f"[VM-ACL] User {username} NOT in ACL whitelist {allowed_users}")
+
+        # User not in ACL whitelist - fall through to check pool permissions
+    else:
+        logging.debug(f"[VM-ACL] No ACL found for VM {vmid} in cluster {cluster_id}")
+
+    # Check Pool Permissions
+    # If VM is in a pool, check if user has permission via pool
+    # Uses cached pool membership data to avoid API calls on every permission check
+    try:
+        pool_id = get_vm_pool_cached(cluster_id, vmid, vm_type)
+
+        if pool_id:
+            logging.debug(f"[POOL-PERM] VM {vmid} is in pool '{pool_id}' (cached)")
+
+            # Get user's groups
+            user_groups = user.get("groups", [])
+
+            # Get user's pool permissions from DB (not API)
+            db = get_db()
+            user_pool_perms = db.get_user_pool_permissions(cluster_id, username, user_groups)
+
+            # Check if user has required permission for this pool
+            pool_perms = user_pool_perms.get(pool_id, [])
+
+            if pool_perms:
+                # pool.admin grants all permissions
+                if "pool.admin" in pool_perms:
+                    logging.debug(f"[POOL-PERM] User {username} has pool.admin for pool '{pool_id}'")
+                    return True
+
+                if permission in pool_perms:
+                    logging.debug(f"[POOL-PERM] User {username} has {permission} for pool '{pool_id}'")
+                    return True
+
+                logging.debug(f"[POOL-PERM] User {username} has pool perms {pool_perms} but not {permission}")
+            else:
+                logging.debug(f"[POOL-PERM] User {username} has no permissions for pool '{pool_id}'")
+    except Exception as e:
+        logging.error(f"[POOL-PERM] Error checking pool permission: {e}")
+
+    # no VM-specific ACL or pool permission matched.
+    # (sec-review): the general-role fall-through may ONLY grant blanket
+    # access to VMs on clusters the user belongs to via their TENANT. A user who merely
+    # *reached* this cluster through a VM-ACL or pool grant (cluster not in their tenant
+    # set) must NOT inherit role-wide control of every VM here — only the specific ACL/
+    # pool VMs handled above. Without this, #555's pool cluster-reach (and the older
+    # #248 VM-ACL reach) let a pool-/ACL-scoped user drive every VM on the cluster.
+    tenant_clusters = get_user_clusters(user, include_pools=False)
+    if tenant_clusters is not None and cluster_id not in tenant_clusters:
+        logging.debug(
+            f"[VM-ACL] {username} reached {cluster_id} only via ACL/pool; no grant for VM {vmid} → deny {permission}"
+        )
+        return False
+    result = has_permission(user, permission)
+    logging.debug(f"[VM-ACL] Fallback to general permission check for {permission}: {result}")
+    return result
+
+
+def get_user_vms(user: dict, cluster_id: str) -> list | None:
+    """Get list of VMIDs user can access in a cluster
+
+    Returns None if user can access all VMs (admin or no restrictions)
+    """
+    if user.get("effective_role", user.get("role")) == ROLE_ADMIN:
+        return None
+
+    username = user.get("username", "")
+    acls = get_vm_acls()
+    cluster_acls = acls.get(cluster_id, {})
+
+    # if no acls for this cluster, user can see all (based on general perms)
+    if not cluster_acls:
+        return None
+
+    # collect VMs user has access to
+    allowed_vms = []
+    for vmid, acl in cluster_acls.items():
+        users = acl.get("users", [])
+        if username in users or "*" in users:
+            allowed_vms.append(int(vmid))
+
+    return allowed_vms if allowed_vms else None
+
+
+# =============================================================================
+# VMWARE VM-LEVEL ACCESS CONTROL
+# Similar to Proxmox VM ACLs but for VMware VMs
+# Security fix: Prevent unauthorized VM operations
+# =============================================================================
+
+
+def user_can_access_vmware_vm(user: dict, vmware_id: str, vm_id: str, permission: str = "vmware.vm.view") -> bool:
+    """Check if user can access a specific VMware VM
+
+    Security fix for authorization bypass vulnerability.
+    Implements VM-level authorization for VMware VMs similar to Proxmox.
+
+    Logic:
+    1. Admin always has access
+    2. If user has VM-specific ACL entry for this VMware server:
+       - inherit_role=True: User can do ALL VM operations (full access)
+       - inherit_role=False: User can ONLY do operations listed in permissions
+    3. If user not in ACL: fall back to user's general role permissions
+
+    Args:
+        user: User dict with username and role
+        vmware_id: VMware server ID
+        vm_id: VM identifier (string)
+        permission: Required permission (e.g., 'vmware.vm.power', 'vmware.vm.view')
+
+    Returns:
+        bool: True if user has access, False otherwise
+    """
+    if user.get("role") == ROLE_ADMIN:
+        return True
+
+    # Server access group gate for VMware servers.
+    _vmware_perm_to_level = {
+        "vmware.vm.view": "view",
+        "vmware.vm.console": "view",
+        "vmware.vm.power": "edit",
+        "vmware.vm.snapshot": "edit",
+        "vmware.vm.migrate": "edit",
+        "vmware.vm.manage": "edit",
+        "vmware.vm.create": "admin",
+        "vmware.vm.delete": "admin",
+    }
+    _vmware_level = _vmware_perm_to_level.get(permission, "admin")
+    if not user_can_access_server(user, "vmware", vmware_id, _vmware_level):
+        logging.debug(f"[VMWARE-ACL] {user.get('username', '')} denied: no server access to {vmware_id}")
+        return False
+
+    username = user.get("username", "")
+    acls = get_vm_acls()
+
+    # VMware ACLs are stored under vmware_id as the cluster key
+    vmware_acls = acls.get(f"vmware:{vmware_id}", {})
+    vm_acl = vmware_acls.get(str(vm_id), {})
+
+    if vm_acl:
+        allowed_users = vm_acl.get("users", [])
+
+        # If user is in the ACL whitelist, check their ACL permissions
+        if username in allowed_users or "*" in allowed_users:
+            if vm_acl.get("inherit_role", True):
+                # inherit_role=True: FULL VM access
+                vmware_permissions = [
+                    "vmware.vm.view",
+                    "vmware.vm.power",
+                    "vmware.vm.manage",
+                    "vmware.vm.snapshot",
+                    "vmware.vm.migrate",
+                    "vmware.vm.console",
+                ]
+                return permission in vmware_permissions
+            else:
+                # inherit_role=False: use ONLY the VM-specific permissions
+                vm_perms = vm_acl.get("permissions", [])
+                return permission in vm_perms
+
+    # No VM-specific ACL — fall back to the general role permission, BUT gate it by the VMware
+    # server's tenant reach first. (CodeAnt BOLA) - this fallback previously granted
+    # ANY vmware.vm.* holder access to EVERY VMware server's VMs regardless of tenant (the Proxmox
+    # user_can_access_vm has the equivalent guard at ~853; the VMware path was missing it). Mirror
+    # check_pbs_access: admin already returned above; an unlinked server stays backward-compat open;
+    # otherwise require the caller to reach one of the server's linked clusters.
+    try:
+        from ProxmoxVEx.globals import vmware_managers
+
+        _mgr = vmware_managers.get(vmware_id)
+        _linked = (getattr(_mgr, "linked_clusters", None) or []) if _mgr else []
+        if _linked:
+            _uc = get_user_clusters(user)  # None => all clusters (admin/default-tenant)
+            if _uc is not None and not any(c in _uc for c in _linked):
+                logging.debug(
+                    f"[VMWARE-ACL] {username} cannot reach any linked cluster of {vmware_id} → deny {permission}"
+                )
+                return False
+    except Exception as _e:
+        logging.error(f"[VMWARE-ACL] tenant-gate error for {vmware_id}: {_e}")
+
+    # No VM-specific ACL - use general permissions (now tenant-gated)
+    return has_permission(user, permission)
+
+
+# =============================================================================
+# ROLE TEMPLATES
+# Preset roles for common use cases
+# =============================================================================
+
+ROLE_TEMPLATES = {
+    "tenant_admin": {
+        "name": "Tenant Administrator",
+        "description": "Full tenant access - everything except global settings",
+        "permissions": [
+            # VMs - full control
+            "vm.view",
+            "vm.start",
+            "vm.stop",
+            "vm.restart",
+            "vm.console",
+            "vm.migrate",
+            "vm.clone",
+            "vm.delete",
+            "vm.create",
+            "vm.config",
+            "vm.snapshot",
+            "vm.backup",
+            "vm.template",
+            # cluster - no add/delete/join (thats global admin stuff)
+            "cluster.view",
+            "cluster.config",
+            # nodes - Added shell/reboot
+            "node.view",
+            "node.shell",
+            "node.maintenance",
+            "node.reboot",
+            "node.network",
+            "node.config",
+            # storage
+            "storage.view",
+            "storage.upload",
+            "storage.download",
+            "storage.delete",
+            "storage.config",
+            # backup - Tenant admins need full backup control
+            "backup.view",
+            "backup.create",
+            "backup.restore",
+            "backup.delete",
+            "backup.schedule",
+            "backup.config",
+            # HA
+            "ha.view",
+            "ha.config",
+            "ha.groups",
+            "ha.resources",
+            # firewall
+            "firewall.view",
+            "firewall.edit",
+            "firewall.aliases",
+            # pools + replication
+            "pool.view",
+            "pool.manage",
+            "pool.assign",
+            "replication.view",
+            "replication.manage",
+            # site recovery - full access for tenant admins
+            "site_recovery.view",
+            "site_recovery.manage",
+            "site_recovery.failover",
+        ],
+    },
+    "tenant_operator": {
+        "name": "Tenant Operator",
+        "description": "Daily ops - VMs, backups, basic maintenance",
+        "permissions": [
+            # VMs - no delete/create/template
+            "vm.view",
+            "vm.start",
+            "vm.stop",
+            "vm.restart",
+            "vm.console",
+            "vm.migrate",
+            "vm.clone",
+            "vm.config",
+            "vm.snapshot",
+            "vm.backup",
+            "cluster.view",
+            "node.view",
+            "node.maintenance",
+            "storage.view",
+            "storage.upload",
+            "storage.download",
+            "backup.view",
+            "backup.create",
+            "backup.restore",
+            "backup.delete",  # Ops need to clean up old backups
+            "ha.view",
+            "firewall.view",
+            "pool.view",
+            "pool.assign",
+            "replication.view",
+            "site_recovery.view",
+        ],
+    },
+    "tenant_user": {
+        "name": "Tenant User",
+        "description": "Basic VM stuff - start/stop/console",
+        "permissions": [
+            "vm.view",
+            "vm.start",
+            "vm.stop",
+            "vm.restart",
+            "vm.console",
+            "vm.snapshot",
+            "cluster.view",
+            "node.view",
+            "storage.view",
+            "backup.view",
+            "backup.create",
+            "backup.restore",  # Let users backup their own stuff
+            "ha.view",
+            "firewall.view",
+            "pool.view",
+        ],
+    },
+    "tenant_viewer": {
+        "name": "Tenant Viewer",
+        "description": "Read-only + console",
+        "permissions": [
+            "vm.view",
+            "vm.console",
+            "cluster.view",
+            "node.view",
+            "storage.view",
+            "backup.view",
+            "ha.view",
+            "firewall.view",
+            "pool.view",
+            "replication.view",
+            "site_recovery.view",
+        ],
+    },
+    "vm_operator": {
+        "name": "VM Operator",
+        "description": "VMs only - no infra access",
+        "permissions": [
+            "vm.view",
+            "vm.start",
+            "vm.stop",
+            "vm.restart",
+            "vm.console",
+            "vm.snapshot",
+            "vm.backup",
+            "backup.view",
+            "backup.create",
+            "backup.restore",
+            "storage.view",
+        ],
+    },
+    "backup_operator": {
+        "name": "Backup Operator",
+        "description": "Backups only - for backup admins",
+        "permissions": [
+            "vm.view",
+            "storage.view",
+            "storage.upload",
+            "backup.view",
+            "backup.create",
+            "backup.restore",
+            "backup.delete",
+            "backup.schedule",
+            "backup.config",
+        ],
+    },
+    "storage_admin": {
+        "name": "Storage Administrator",
+        "description": "Storage + backup management",
+        "permissions": [
+            "vm.view",
+            "cluster.view",
+            "node.view",
+            "storage.view",
+            "storage.upload",
+            "storage.delete",
+            "storage.config",
+            "storage.create",
+            "storage.download",
+            "backup.view",
+            "backup.create",
+            "backup.restore",
+            "backup.delete",
+            "backup.config",
+        ],
+    },
+    "network_admin": {
+        "name": "Network Administrator",
+        "description": "Network + firewall config",
+        "permissions": [
+            "vm.view",
+            "vm.config",  # need this for VM NICs
+            "cluster.view",
+            "node.view",
+            "node.network",
+            "node.config",
+            "firewall.view",
+            "firewall.edit",
+            "firewall.aliases",
+            "ha.view",
+        ],
+    },
+    "monitoring": {
+        "name": "Monitoring",
+        "description": "Read-only for dashboards/alerting",
+        "permissions": [
+            "vm.view",
+            "cluster.view",
+            "node.view",
+            "storage.view",
+            "backup.view",
+            "ha.view",
+            "firewall.view",
+            "pool.view",
+            "replication.view",
+            "site_recovery.view",
+            "admin.audit",  # Monitoring tools need audit logs
+        ],
+    },
+    "group_manager": {
+        "name": "Group Manager",
+        "description": "Cluster groups + tenant management",
+        "permissions": [
+            "vm.view",
+            "cluster.view",
+            "node.view",
+            "storage.view",
+            "pool.view",
+            "pool.manage",
+            "pool.assign",
+            "admin.groups",
+            "admin.tenants",
+        ],
+    },
+    "helpdesk": {
+        "name": "Helpdesk",
+        "description": "Support staff - basic VM help",
+        "permissions": [
+            "vm.view",
+            "vm.start",
+            "vm.stop",
+            "vm.restart",
+            "vm.console",
+            "vm.snapshot",
+            "cluster.view",
+            "node.view",
+            "storage.view",
+            "backup.view",
+            "backup.restore",  # can restore for users
+            "ha.view",
+        ],
+    },
+    "developer": {
+        "name": "Developer",
+        "description": "Dev access - own VMs + snapshots",
+        "permissions": [
+            "vm.view",
+            "vm.start",
+            "vm.stop",
+            "vm.restart",
+            "vm.console",
+            "vm.snapshot",
+            "vm.clone",
+            "vm.config",
+            "cluster.view",
+            "node.view",
+            "storage.view",
+            "storage.upload",
+            "backup.view",
+            "backup.create",
+            "backup.restore",
+        ],
+    },
+    "auditor": {
+        "name": "Auditor",
+        "description": "Compliance - read-only + audit logs",
+        "permissions": [
+            "vm.view",
+            "cluster.view",
+            "node.view",
+            "storage.view",
+            "backup.view",
+            "ha.view",
+            "firewall.view",
+            "pool.view",
+            "replication.view",
+            "site_recovery.view",
+            "admin.audit",
+        ],
+    },
+}

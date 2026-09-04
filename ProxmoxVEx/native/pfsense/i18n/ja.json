@@ -1,0 +1,15 @@
+{
+  "cancel": "キャンセル",
+  "configured": "設定済み",
+  "loading": "読み込み中...",
+  "overview": "概要",
+  "save": "保存",
+  "status": "ステータス",
+  "title": "pfSense Manager",
+  "unconfigured": "未設定",
+  "interfaces": "インターフェース",
+  "rules": "ルール",
+  "error": "Error: %s",
+  "loaded": "Loaded %s",
+  "request_failed": "Request failed: %s"
+}

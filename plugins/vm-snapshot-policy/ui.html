@@ -1,0 +1,96 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/vm-snapshot-policy/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VM Snapshot Policy</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>VM Snapshot Policy</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="policies">Policies</button>
+            <button class="tab" role="tab" data-tab="apply">Apply</button>
+            <button class="tab" role="tab" data-tab="assignments">Assignments</button>
+            <button class="tab" role="tab" data-tab="history">History</button>
+        </div>
+
+        <div id="panel-policies" class="tab-panel">
+            <div class="card">
+                <h2>Create / Edit Policy</h2>
+                <form class="form" id="policyForm">
+                    <label>ID <input type="text" id="pId" required placeholder="daily-7d" /></label>
+                    <label>Schedule (cron) <input type="text" id="pSchedule" placeholder="0 3 * * *" /></label>
+                    <label>Retention <input type="number" id="pRetention" min="1" value="7" required /></label>
+                    <label>Description <input type="text" id="pDesc" placeholder="Daily 7-day retention" /></label>
+                    <label><input type="checkbox" id="pEnabled" checked /> Enabled</label>
+                    <button type="submit">Save</button>
+                    <button type="button" id="pReset" class="secondary">Reset</button>
+                </form>
+                <p id="pError" class="error-text"></p>
+            </div>
+            <div class="card">
+                <h2>Policies</h2>
+                <div id="policiesList">
+                    <p class="empty">No policies.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-apply" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Apply to VM</h2>
+                <form class="form" id="applyForm">
+                    <label>Cluster <select id="aCluster" required></select></label>
+                    <label>VM <select id="aVm" required></select></label>
+                    <label>Policy <select id="aPolicy" required></select></label>
+                    <button type="submit">Apply</button>
+                </form>
+                <div id="applyResult"></div>
+            </div>
+        </div>
+
+        <div id="panel-assignments" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Assignments</h2>
+                <div id="assignList">
+                    <p class="empty">No assignments.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-history" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Snapshot History</h2>
+                <div id="historyList">
+                    <p class="empty">No history.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

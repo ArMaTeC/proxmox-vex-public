@@ -1,0 +1,123 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/health-dashboard/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cluster Health Dashboard</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Cluster Health Dashboard</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="overview">Overview</button>
+            <button class="tab" role="tab" data-tab="cluster">Cluster</button>
+            <button class="tab" role="tab" data-tab="trends">Trends</button>
+        </div>
+
+        <div id="panel-overview" class="tab-panel">
+            <div class="card">
+                <h2>Overall Health</h2>
+                <div class="form">
+                    <label>Cluster (optional) <select id="oCluster">
+                            <option value="">Global</option>
+                        </select></label>
+                    <button id="oCheck">Check</button>
+                </div>
+                <p id="oError" class="error-text"></p>
+                <div class="grid" id="oResult">
+                    <div class="metric">
+                        <div class="value" id="oScore">-</div>
+                        <div class="label">Health Score</div>
+                    </div>
+                    <div class="metric">
+                        <div class="value" id="oStatus" class="badge healthy">-</div>
+                        <div class="label">Status</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-cluster" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Cluster Details</h2>
+                <div class="form">
+                    <label>Cluster <select id="cCluster">
+                            <option value="">Select</option>
+                        </select></label>
+                    <button id="cLoad">Load</button>
+                </div>
+                <p id="cError" class="error-text"></p>
+                <div id="clusterDetails">
+                    <p class="empty">Select a cluster.</p>
+                </div>
+            </div>
+            <div class="card" id="nodePanel" hidden>
+                <h2>Nodes</h2>
+                <div class="form">
+                    <label>Filter status <select id="nStatus">
+                            <option value="">All</option>
+                            <option value="healthy">Healthy</option>
+                            <option value="warning">Warning</option>
+                            <option value="critical">Critical</option>
+                        </select></label>
+                    <button id="nLoad" class="secondary">Refresh Nodes</button>
+                </div>
+                <div id="nodesList">
+                    <p class="empty">No nodes.</p>
+                </div>
+            </div>
+            <div class="card" id="storagePanel" hidden>
+                <h2>Storage</h2>
+                <button id="sLoad" class="secondary">Refresh Storage</button>
+                <div id="storageList">
+                    <p class="empty">No storage.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-trends" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Health Trends</h2>
+                <div class="form">
+                    <label>Range <select id="tRange">
+                            <option value="1h">1h</option>
+                            <option value="24h">24h</option>
+                            <option value="7d">7d</option>
+                            <option value="30d" selected>30d</option>
+                        </select></label>
+                    <button id="tLoad">Load</button>
+                </div>
+                <p id="tError" class="error-text"></p>
+                <div id="trendsChart" class="chart"></div>
+                <div id="trendsTable">
+                    <p class="empty">No trend data.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

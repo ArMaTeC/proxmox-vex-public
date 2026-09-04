@@ -1,0 +1,7 @@
+{
+    "_help": {
+        "_note": "This plugin currently exposes no user-configurable settings in config.json."
+    },
+    "default_timezone": "UTC",
+    "max_history_runs": 10000
+}

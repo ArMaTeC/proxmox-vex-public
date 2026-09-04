@@ -1,0 +1,12 @@
+{
+    "id": "vm-hibernate-scheduler",
+    "name": "VM Hibernate Scheduler",
+    "version": "1.1.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Schedule, manage, and audit hibernate and resume actions for VMs through a full UI.",
+    "min_ProxmoxVEx": "1.2.67",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Compute",
+    "min_license_tier": "advanced"
+}

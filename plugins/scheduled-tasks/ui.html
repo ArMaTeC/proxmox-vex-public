@@ -1,0 +1,162 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/scheduled-tasks/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scheduled Task Runner</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="/static/css/plugin-ui.css" />
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Scheduled Task Runner</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+
+        <div id="message"></div>
+
+        <div class="section">
+            <h2 id="formTitle">Create Task</h2>
+            <form class="form" id="taskForm">
+                <input type="hidden" name="task_id" id="taskId" value="">
+                <label>Name<input type="text" name="name" id="name" required placeholder="Backup cleanup" /></label>
+                <label>Action Type
+                    <select name="action" id="action" required>
+                        <option value="">— select —</option>
+                        <option value="snapshot">Snapshot</option>
+                        <option value="backup">Backup</option>
+                        <option value="start">Start VM</option>
+                        <option value="stop">Stop VM</option>
+                        <option value="restart">Restart VM</option>
+                        <option value="shutdown">Shutdown VM</option>
+                        <option value="plugin_route">Plugin Route</option>
+                        <option value="webhook">Webhook</option>
+                        <option value="shell_command">Shell Command</option>
+                    </select>
+                </label>
+                <label id="pluginRouteLabel" class="hidden">Plugin Route<input type="text" name="action_params.route"
+                        id="pluginRoute" placeholder="/plugin/alert-correlator/run" /></label>
+                <label id="webhookUrlLabel" class="hidden">Webhook URL<input type="text" name="action_params.url"
+                        id="webhookUrl" placeholder="https://..." /></label>
+                <label id="shellCommandLabel" class="hidden">Shell Command<textarea name="action_params.command"
+                        id="shellCommand" rows="2" placeholder="/usr/local/bin/backup.sh"></textarea></label>
+                <label>Target Cluster
+                    <select name="cluster_id" id="clusterId" required>
+                        <option value="">— select —</option>
+                    </select>
+                </label>
+                <label>Target VM (optional)
+                    <select name="target_id" id="targetId">
+                        <option value="">— select cluster first —</option>
+                    </select>
+                </label>
+                <label>Target Node (optional)<input type="text" name="target_node" id="targetNode"
+                        placeholder="node1" /></label>
+                <label class="checkbox"><input type="checkbox" name="enabled" id="enabled" checked /> Enabled</label>
+                <label>Description<textarea name="description" id="description" rows="2"
+                        placeholder="Optional operator notes"></textarea></label>
+                <label>Schedule (cron)
+                    <input type="text" name="schedule_cron" id="scheduleCron" required placeholder="0 2 * * *" />
+                    <div class="cron-builder" id="cronBuilder"
+                        style="display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin: 8px 0;">
+                    </div>
+                    <div class="presets">
+                        <button type="button" class="secondary" data-cron="0 * * * *">Hourly</button>
+                        <button type="button" class="secondary" data-cron="0 2 * * *">Daily 02:00</button>
+                        <button type="button" class="secondary" data-cron="0 2 * * 1">Weekly Monday</button>
+                        <button type="button" class="secondary" data-cron="0 2 1 * *">Monthly 1st</button>
+                    </div>
+                    <div class="cron-desc" id="cronDesc"></div>
+                </label>
+                <label>Retry Count<input type="number" name="retry_count" id="retryCount" min="0" value="0" /></label>
+                <label>Retry Delay (s)<input type="number" name="retry_delay" id="retryDelay" min="0"
+                        value="0" /></label>
+                <label>Timeout (s)<input type="number" name="timeout" id="timeout" min="1" value="300" /></label>
+                <label>Notification
+                    <select name="notification" id="notification">
+                        <option value="never">Never</option>
+                        <option value="on_failure">On failure</option>
+                        <option value="on_success">On success</option>
+                        <option value="always">Always</option>
+                    </select>
+                </label>
+                <div style="grid-column: 1 / -1; display: flex; gap: 8px; align-items: flex-end;">
+                    <button type="submit" id="saveBtn">Create</button>
+                    <button type="button" class="secondary hidden" id="cancelEdit">Cancel</button>
+                </div>
+            </form>
+        </div>
+
+        <div class="section">
+            <h2>Tasks</h2>
+            <div id="statusBar" style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px;"></div>
+            <div class="toolbar"
+                style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: center;">
+                <input type="text" id="searchInput" placeholder="Search by name..."
+                    style="flex: 1; min-width: 140px;" />
+                <select id="filterAction">
+                    <option value="">All actions</option>
+                </select>
+                <select id="filterEnabled">
+                    <option value="">All states</option>
+                    <option value="true">Enabled</option>
+                    <option value="false">Disabled</option>
+                </select>
+                <select id="sortBy">
+                    <option value="name">Name</option>
+                    <option value="action">Action</option>
+                    <option value="next_run">Next Run</option>
+                    <option value="last_run">Last Run</option>
+                </select>
+                <select id="bulkAction" style="min-width: 120px;">
+                    <option value="">Bulk action...</option>
+                    <option value="enable">Enable</option>
+                    <option value="disable">Disable</option>
+                    <option value="delete">Delete</option>
+                    <option value="export">Export</option>
+                </select>
+                <button type="button" class="secondary" id="bulkApply">Apply</button>
+                <button type="button" class="secondary" id="exportAll">Export</button>
+                <button type="button" class="secondary" id="importBtn">Import</button>
+                <input type="file" id="importFile" accept=".json" class="hidden" />
+            </div>
+            <div id="tasksList">
+                <p class="empty loading">Loading...</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Run History</h2>
+            <div class="row-actions" style="margin-bottom: 12px;">
+                <select id="historyTaskSelect" style="min-width: 200px;">
+                    <option value="">— select a task —</option>
+                </select>
+                <button type="button" id="loadHistory">Load History</button>
+            </div>
+            <div id="historyList">
+                <p class="empty">Select a task to view run history.</p>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,125 @@
+# ProxmoxVEx Requirements
+# Install with: pip install -r requirements.txt
+
+# === Core (Required) ===
+# Flask 3.x floor: pulls werkzeug 3.x which patches the RCE
+# in 2.2.3 (debugger pin bypass). Verified no removed-in-3 APIs in our code
+# (no before_first_request, no JSONEncoder direct use, no _app_ctx_stack).
+flask>=3.1.3  # Werkzeug 3.0.3 RCE fix transit; 3.1.3 patches CVE-2026-27205 (session cache info-disclosure, missing Vary:Cookie)
+# Flask-cors 6.0.0 fixes 3 CVEs incl. CVE-2024-6221 (improper case
+# handling in Origin allowlist) + CVE-2024-6839/-6844 (source verification +
+# origin validation). Pre-6 versions are scanner-flagged High.
+flask-cors>=6.0.0
+flask-sock>=0.6.0
+flask-compress>=1.14
+# Werkzeug explicit pin — defends against transitive resolution that could
+# downgrade to 2.x even with flask>=3 (rare but pip-audit reproducible).
+# Bumped 3.0.3→3.1.6: covers CVE-2024-49767 (DOS), CVE-2024-49766
+# (path traversal), CVE-2026-27199, AIKIDO-2024-10410 (weak encryption) on top
+# of the original CVE-2024-34069 debugger-pin RCE that 3.0.3 already closed.
+werkzeug>=3.1.6
+# urllib3 2.7.0+ closes CVE-2026-44431 (critical). 2.5.0 was earlier
+# Open-Redirect floor (CVE-2025-50181), 2.0.7 was the original CVE-2023-43804
+# cookie-redirect-leak floor. Each bump motivated by Aikido / Snyk findings.
+# (PR #404 Snyk auto-fix used exact `==2.7.0`; broadened back to `>=` so future
+# patches roll in cleanly.)
+requests>=2.34.0
+# 2026-06-04 (#525 ccesario): MultipartEncoder for streaming large
+# (>2 GB) ISO uploads. Plain `requests` files= path runs fp.read() and
+# buffers the whole file in memory before encoding the multipart body,
+# which OOMs the appliance on big ISOs.
+requests-toolbelt>=1.0.0
+urllib3>=2.7.0
+dnspython>=2.7.0
+
+# === Encryption & Security ===
+# Cryptography 46.0.6/.0.7 patches CVE-2026-34073 + -39892,
+# pyopenssl 26.x patches CVE-2026-27448 + -27459. argon2-cffi unchanged.
+# Bumped to 49: fido2 2.2.1 (2026-06-29) lifted its cryptography
+# ceiling from <49 to <52, so we can finally close AIKIDO-2026-94131 (raw-ChaCha20
+# counter overflow — the CVE the Aikido autofix PRs #550/#603 kept re-raising)
+# PROPERLY, without force-dropping fido2 (WebAuthn/hardware-key 2FA). Verified: no
+# removed-alias usage (PUBLIC_KEY_TYPES etc.), our crypto surface (Fernet/AESGCM/
+# TripleDES-decrepit/rsa/ec/serialization) + create_app import clean on 49; ProxmoxVEx
+# is Linux-only so the dropped macOS/32-bit-Windows wheels don't apply. <52 matches
+# fido2's ceiling. (The CVE was never reachable here anyway — zero raw ChaCha20.)
+cryptography>=49.0.0,<52
+pyopenssl>=26.0.0
+argon2-cffi>=23.0.0
+# pyasn1 transitive via pyopenssl. Explicit pin so scanners stop seeing the old
+# 0.5.x floor. 2026-07-11 - bumped 0.6.3 -> 0.6.4: clears 3 new Aikido findings
+# AIKIDO-2026-746993 (HIGH), -911927 + -27979 (both MEDIUM).
+pyasn1>=0.6.4
+
+# === SSH & Console ===
+# Paramiko 4.0 drops DSSKey (legacy DSA, broken-crypto class).
+# All our DSSKey lookups already use getattr(paramiko, 'DSSKey', None) so
+# we degrade cleanly when the symbol is gone. 3.x stays scanner-flagged Low.
+paramiko>=4.0.0
+websockets>=11.0
+websocket-client>=1.6.0
+# h11 0.16.0 closes the request-smuggling CVE (transitive via wsproto/
+# websocket stack). Pin explicit so scanners stop nagging on 0.14.x.
+h11>=0.16.0
+
+# === Performance (Recommended) ===
+# Gevent 25.4.1+ fixes 3 CVEs: trusting HTTP permission methods
+# (CVSS 9.3), race condition (CVSS 8.3), and HTTP request smuggling (CVSS 6.9).
+# WSGI handler + monkey.patch_all() unchanged from 23.x — no migration work.
+gevent>=25.4.1
+gevent-websocket>=0.10.0
+
+# === Two-Factor Auth ===
+pyotp>=2.9.0
+# qrcode[pil] pulls Pillow; bump floor so CVE-2026-40192 is dodged.
+qrcode[pil]>=7.4.0
+croniter>=2.0.0         # cron parsing and next-run computation
+cron-descriptor>=1.4.0  # human-readable cron descriptions
+# Floor 12.3.0 clears AIKIDO-2026-457677 (PCF-font-loader DoS,
+# Aikido autofix PR #606). Floor, not the bot's ==12.3.0 hard-pin, so future
+# patch bumps aren't blocked. Not reachable here anyway (we only use PIL.Image,
+# no PCF/untrusted font loading) — verified Image PNG roundtrip + vnc_grab on 12.3.
+pillow>=12.3.0
+# WebAuthn / FIDO2 hardware tokens (YubiKey, Nitrokey, Touch ID, Windows Hello).
+# Optional at runtime — feature is auto-disabled if import fails.
+# Floor at 2.2.1: that's the first release whose cryptography cap is
+# <52 (older fido2 caps <49 and would conflict with cryptography>=49 above).
+fido2>=2.2.1
+
+# === LDAP Auth ===
+ldap3>=2.9.0
+
+# === OIDC JWT Verification ===
+# >=2.12 patches CVE-2026-32597
+# >=2.13.0 patches CVE-2026-48522..48526 in PyJWKClient (used in
+# utils/oidc.py): SSRF/token-forgery via non-http jwks schemes (file://, ftp://,
+# data:), verifier-side algorithm allow-list bypass, and unbounded-JWKS-request DoS.
+PyJWT[crypto]>=2.13.0
+
+# === ESXi Migration (Optional) ===
+pyvmomi>=8.0.0
+
+# === XCP-ng Integration (Optional) ===
+XenAPI>=23.14.0
+
+# === Hardened XML parsing ===
+# Defusedxml replaces stdlib xml.etree for any input that comes
+# off the wire (XCP-ng RRD responses, iSCSI probe TGTs). Stops XXE / billion-laughs
+# / external-entity expansion. Pure-Python wrapper — no compile, tiny.
+defusedxml>=0.7.1
+
+# === Transitive pins (scanner hygiene) ===
+# These aren't direct deps but old transitive resolutions get
+# flagged by pip-audit / Snyk. Listing them here forces a fresh venv to a
+# floor that doesn't carry known CVEs. Newer versions are pulled automatically.
+setuptools>=83.0.0  # >=83 clears AIKIDO-2026-293625
+zipp>=3.19.1        # CVE-2024-5569 infinite loop in Path._next
+idna>=3.15          # CVE-2024-3651 ReDoS/DoS in idna<3.7 (transitive via requests; Snyk PR #530)
+
+# === PostgreSQL (optional; for migration / Postgres-backed deployments)
+psycopg2-binary>=2.9.9,<3
+
+# === IDS/IPS ===
+scapy>=2.5.0        # packet capture, parsing, and feature extraction
+scikit-learn>=1.5.0 # behavioral anomaly detection
+pandas>=2.1.0       # traffic feature handling

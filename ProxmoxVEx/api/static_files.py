@@ -1,0 +1,642 @@
+# --- ProxmoxVEx auto-header start ---
+# --------------------------------------------------------------------
+# File:        ProxmoxVEx/api/static_files.py
+# Project:     ProxmoxVEx
+# Version:     1.2.303
+# Build:       2026.09.04
+# Description: pool management & permissions routes - split from...
+# Docs:        https://proxmoxvex.local/docs
+# Generated:   2026-09-04
+# --------------------------------------------------------------------
+# --- ProxmoxVEx auto-header end ---
+"""pool management & permissions routes - split from monolith dec 2025,"""
+
+import logging
+import re
+
+from flask import Blueprint, jsonify, request
+
+from ProxmoxVEx.api.helpers import check_cluster_access, parse_pve_error
+from ProxmoxVEx.core.db import get_db
+from ProxmoxVEx.globals import cluster_managers
+from ProxmoxVEx.models.permissions import PERMISSIONS, ROLE_ADMIN, ROLE_VIEWER
+from ProxmoxVEx.utils.audit import log_audit
+from ProxmoxVEx.utils.auth import load_users, require_auth, save_users
+from ProxmoxVEx.utils.rbac import (
+    DEFAULT_TENANT_ID,
+    get_pool_membership_cache,
+    get_role_permissions_for_user,
+    get_user_effective_role,
+    get_user_permissions,
+    get_vm_acls,
+    invalidate_pool_cache,
+)
+
+# 2026-06-04 (CWE-117 log-injection): user-input from URL params + request
+# body lands in the four loggers below — wrap with _sl so CRLF can't forge new
+# log lines.
+from ProxmoxVEx.utils.sanitization import sanitize_log_message as _sl
+
+bp = Blueprint("static_files", __name__)
+
+
+def _access_denied():
+    return jsonify({"error": "Access denied to this cluster"}), 403
+
+
+def _api_error(default_msg, exc=None):
+    """Return a safe JSON error response and log the exception server-side."""
+    if exc is not None:
+        logging.exception(default_msg)
+    return jsonify({"error": default_msg}), 500
+
+
+# Pool Management API
+# Create, edit, delete pools and manage pool members directly from ProxmoxVEx
+# ============================================================================
+
+
+@bp.route("/api/clusters/<cluster_id>/pools", methods=["POST"])
+@require_auth(perms=["admin.users"])
+def create_pool(cluster_id):
+    """Create a new resource pool in Proxmox"""
+    ok, _ = check_cluster_access(cluster_id)
+    if not ok:
+        return _access_denied()
+
+    data = request.get_json() or {}
+    poolid = data.get("poolid", "").strip()
+    comment = data.get("comment", "").strip()
+
+    if not poolid:
+        return jsonify({"error": "Pool ID is required"}), 400
+
+    # validate pool ID
+    if not re.match(r"^[a-zA-Z0-9_-]+$", poolid):
+        return jsonify({"error": "Pool ID can only contain letters, numbers, dashes and underscores"}), 400
+
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({"error": "Cluster not found"}), 404
+
+    # Ensure connected
+    if not manager.is_connected and not manager.connect_to_proxmox():
+        return jsonify({"error": "Failed to connect to Proxmox cluster"}), 503
+
+    try:
+        # Create pool via Proxmox API
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/pools"
+
+        api_data = {"poolid": poolid}
+        if comment:
+            api_data["comment"] = comment
+
+        response = manager._api_post(url, data=api_data)
+
+        if response.status_code not in [200, 201]:
+            error_text = response.text
+            if "already exists" in error_text.lower():
+                # snyk:ignore:Cross-site Scripting (XSS)
+                return jsonify({"error": f'Pool "{poolid}" already exists'}), 409
+            # snyk:ignore:Cross-site Scripting (XSS)
+            return jsonify({"error": f"Proxmox API error: {error_text}"}), 500
+
+        # Invalidate cache
+        invalidate_pool_cache(cluster_id)
+
+        log_audit(request.session.get("user"), "pool.create", f"Created pool {poolid}", cluster=cluster_id)
+
+        return jsonify({"success": True, "poolid": poolid, "message": f'Pool "{poolid}" created successfully'})
+    except Exception as e:
+        if "already exists" in str(e).lower():
+            # snyk:ignore:Cross-site Scripting (XSS)
+            return jsonify({"error": f'Pool "{poolid}" already exists'}), 409
+        logging.error(f"[API] Failed to create pool: {e}")
+        return jsonify({"error": "Failed to create pool"}), 500
+
+
+@bp.route("/api/clusters/<cluster_id>/pools/<pool_id>", methods=["PUT"])
+@require_auth(perms=["admin.users"])
+def update_pool(cluster_id, pool_id):
+    """Update a pool's comment"""
+    ok, _ = check_cluster_access(cluster_id)
+    if not ok:
+        return _access_denied()
+
+    data = request.get_json() or {}
+    comment = data.get("comment", "")
+
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({"error": "Cluster not found"}), 404
+
+    # Ensure connected
+    if not manager.is_connected and not manager.connect_to_proxmox():
+        return jsonify({"error": "Failed to connect to Proxmox cluster"}), 503
+
+    try:
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/pools/{pool_id}"
+        response = manager._api_put(url, data={"comment": comment})
+
+        if response.status_code != 200:
+            # snyk:ignore:Cross-site Scripting (XSS)
+            return jsonify({"error": f"Proxmox API error: {parse_pve_error(response.text)}"}), 500
+
+        log_audit(request.session.get("user"), "pool.update", f"Updated pool {pool_id}", cluster=cluster_id)
+
+        return jsonify({"success": True, "message": f'Pool "{pool_id}" updated successfully'})
+    except Exception as e:
+        logging.error(f"[API] Failed to update pool: {e}")
+        return jsonify({"error": "Failed to update pool"}), 500
+
+
+@bp.route("/api/clusters/<cluster_id>/pools/<pool_id>", methods=["DELETE"])
+@require_auth(perms=["admin.users"])
+def delete_pool(cluster_id, pool_id):
+    """Delete a resource pool"""
+    ok, _ = check_cluster_access(cluster_id)
+    if not ok:
+        return _access_denied()
+
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({"error": "Cluster not found"}), 404
+
+    # Ensure connected
+    if not manager.is_connected and not manager.connect_to_proxmox():
+        return jsonify({"error": "Failed to connect to Proxmox cluster"}), 503
+
+    try:
+        host, port = manager.host, manager.api_port
+        # (#555 follow-up) - PVE refuses to delete a non-empty pool
+        # ("pool 'X' is not empty (contains VM ...)"), which surfaced as an opaque
+        # 500. Un-pool any members first (the VMs themselves are untouched), so the
+        # delete just works the way operators expect.
+        try:
+            members = (manager.get_pool_members(pool_id) or {}).get("members", []) or []
+            member_ids = [str(m.get("vmid")) for m in members if m.get("vmid") is not None]
+            if member_ids:
+                manager._api_put(
+                    f"https://{host}:{port}/api2/json/pools/{pool_id}", data={"vms": ",".join(member_ids), "delete": 1}
+                )
+        except Exception as _me:
+            logging.warning(f"[POOL] pre-delete member cleanup for {pool_id} failed: {_me}")
+        url = f"https://{host}:{port}/api2/json/pools/{pool_id}"
+        response = manager._api_delete(url)
+
+        if response.status_code != 200:
+            error_text = response.text or ""
+            if "not empty" in error_text.lower() or "contains" in error_text.lower():
+                return jsonify({
+                    "error": "Cannot delete pool - it still contains VMs or storage. Remove all members first."
+                }), 400
+            # snyk:ignore:Cross-site Scripting (XSS)
+            return jsonify({"error": f"Proxmox API error: {parse_pve_error(error_text)}"}), 500
+
+        # Invalidate cache
+        invalidate_pool_cache(cluster_id)
+
+        # Also remove any ProxmoxVEx permissions for this pool
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM pool_permissions WHERE cluster_id = ? AND pool_id = ?", (cluster_id, pool_id))
+        conn.commit()
+        conn.close()
+
+        log_audit(request.session.get("user"), "pool.delete", f"Deleted pool {pool_id}", cluster=cluster_id)
+
+        return jsonify({"success": True, "message": f'Pool "{pool_id}" deleted successfully'})
+    except Exception as e:
+        error_msg = str(e)
+        if "not empty" in error_msg.lower() or "contains" in error_msg.lower():
+            return jsonify({
+                "error": "Cannot delete pool - it still contains VMs or storage. Remove all members first."
+            }), 400
+        # snyk:ignore:Cross-site Scripting (XSS)
+        return jsonify({"error": f"Failed to delete pool: {error_msg}"}), 500
+
+
+@bp.route("/api/clusters/<cluster_id>/pools/<pool_id>/members", methods=["POST"])
+@require_auth(perms=["admin.users"])
+def add_pool_member(cluster_id, pool_id):
+    """Add a VM/CT to a pool"""
+    logging.info(f"add_pool_member called: cluster={_sl(cluster_id)}, pool={_sl(pool_id)}")
+
+    ok, _ = check_cluster_access(cluster_id)
+    if not ok:
+        return _access_denied()
+
+    data = request.get_json() or {}
+    vmid = data.get("vmid")
+    vm_type = data.get("type", "qemu")  # qemu or lxc
+
+    logging.info(f"Request data: vmid={_sl(vmid)}, type={_sl(vm_type)}")
+
+    if not vmid:
+        return jsonify({"error": "VMID is required"}), 400
+
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        logging.error(f"Cluster {_sl(cluster_id)} not found in cluster_managers")
+        return jsonify({"error": "Cluster not found"}), 404
+
+    logging.info(f"Manager found: is_connected={manager.is_connected}")
+
+    # Ensure connected
+    if not manager.is_connected:
+        logging.info("Manager not connected, attempting to connect...")
+        if not manager.connect_to_proxmox():
+            logging.error("Failed to connect to Proxmox")
+            return jsonify({"error": "Failed to connect to Proxmox cluster"}), 503
+
+    try:
+        # Add VM to pool - Proxmox uses 'vms' parameter
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/pools/{pool_id}"
+
+        logging.info(f"Adding VM {_sl(vmid)} to pool {_sl(pool_id)} on {_sl(host)}")
+
+        # Proxmox expects form data with string values.
+        # (#349) - `allow-move=1` lets us re-pool a VM that's already
+        # a member of another pool (PVE 8+ rejects without it). Without that flag
+        # the call fails AFTER the second toggle and the previous toggle's
+        # success line has already fired in cache, leading the UI to believe a
+        # silent fail when it actually worked.
+        response = manager._api_put(
+            url,
+            data={
+                "vms": str(vmid),
+                "allow-move": "1",
+            },
+        )
+
+        logging.info(f"Proxmox response: {response.status_code} - {response.text[:200] if response.text else 'empty'}")
+
+        if response.status_code != 200:
+            error_text = response.text or ""
+            try:
+                error_json = response.json()
+                error_text = (error_json.get("errors", {}) or {}).get("vms") or error_json.get("message") or error_text
+            except Exception:
+                pass
+
+            # Idempotency: PVE returns "already a pool member" when
+            # the same VM is added twice. From the user's point of view the
+            # post-condition holds (VM is in the pool), so report success and
+            # let the caller move on instead of forcing a UI error.
+            if "already a pool member" in (error_text or "").lower():
+                invalidate_pool_cache(cluster_id)
+                return jsonify({
+                    "success": True,
+                    "message": f'VM {vmid} already in pool "{pool_id}"',
+                    "idempotent": True,
+                })
+
+            # snyk:ignore:Cross-site Scripting (XSS)
+            return jsonify({"error": f"Proxmox API error: {error_text}"}), 500
+
+        invalidate_pool_cache(cluster_id)
+        log_audit(
+            request.session.get("user"), "pool.member.add", f"Added VM {vmid} to pool {pool_id}", cluster=cluster_id
+        )
+        return jsonify({"success": True, "message": f'VM {vmid} added to pool "{pool_id}"'})
+    except Exception as e:
+        # Surface the actual exception class/message so the UI doesn't have to
+        # guess. The previous flat "Failed to add VM to pool" hid PVE-side
+        # rejections behind a generic 500 (issue #349).
+        logging.error(f"[API] add VM to pool failed: {type(e).__name__}: {e}")
+        return jsonify({"error": "Failed to add VM to pool"}), 500
+
+
+@bp.route("/api/clusters/<cluster_id>/pools/<pool_id>/members/<int:vmid>", methods=["DELETE"])
+@require_auth(perms=["admin.users"])
+def remove_pool_member(cluster_id, pool_id, vmid):
+    """Remove a VM/CT from a pool"""
+    ok, _ = check_cluster_access(cluster_id)
+    if not ok:
+        return _access_denied()
+
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({"error": "Cluster not found"}), 404
+
+    # Ensure connected
+    if not manager.is_connected and not manager.connect_to_proxmox():
+        return jsonify({"error": "Failed to connect to Proxmox cluster"}), 503
+
+    try:
+        # Remove VM from pool using DELETE parameter
+        host, port = manager.host, manager.api_port
+        url = f"https://{host}:{port}/api2/json/pools/{pool_id}"
+        response = manager._api_put(url, data={"vms": str(vmid), "delete": 1})
+
+        if response.status_code != 200:
+            # snyk:ignore:Cross-site Scripting (XSS)
+            return jsonify({"error": f"Proxmox API error: {parse_pve_error(response.text)}"}), 500
+
+        # Invalidate cache
+        invalidate_pool_cache(cluster_id)
+
+        log_audit(
+            request.session.get("user"),
+            "pool.member.remove",
+            f"Removed VM {vmid} from pool {pool_id}",
+            cluster=cluster_id,
+        )
+
+        return jsonify({"success": True, "message": f'VM {vmid} removed from pool "{pool_id}"'})
+    except Exception as e:
+        logging.error(f"[API] Failed to remove VM from pool: {e}")
+        return jsonify({"error": "Failed to remove VM from pool"}), 500
+
+
+@bp.route("/api/clusters/<cluster_id>/vms-without-pool", methods=["GET"])
+@require_auth()
+def get_vms_without_pool(cluster_id):
+    """Get all VMs that are not in any pool - useful for pool assignment UI"""
+    ok, _ = check_cluster_access(cluster_id)
+    if not ok:
+        return _access_denied()
+
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({"error": "Cluster not found"}), 404
+
+    try:
+        # Get all VMs
+        all_vms = manager.get_vm_resources()
+
+        # Get pool membership
+        membership = get_pool_membership_cache(cluster_id)
+
+        # Filter VMs not in any pool
+        vms_without_pool = []
+        for vm in all_vms:
+            vmid = vm.get("vmid")
+            vm_type = vm.get("type", "qemu")
+            key = f"{vmid}:{vm_type}"
+
+            if key not in membership:
+                vms_without_pool.append({
+                    "vmid": vmid,
+                    "name": vm.get("name", f"VM {vmid}"),
+                    "type": vm_type,
+                    "status": vm.get("status", "unknown"),
+                    "node": vm.get("node", ""),
+                })
+
+        return jsonify(vms_without_pool)
+    except Exception as e:
+        return _api_error("File operation failed", e)
+
+
+def check_pool_permission(
+    cluster_id: str, vmid: int, vm_type: str, required_perm: str, user: str | None = None
+) -> bool:
+    """Check if user has permission for a VM via pool permissions
+
+    Returns True if user has the required permission through pool membership
+    """
+    if user is None:
+        user = getattr(request, "session", {}).get("user")
+
+    if not user:
+        return False
+
+    # Admins always have access
+    users = load_users()
+    user_data = users.get(user, {})
+    if user_data.get("role") == ROLE_ADMIN:
+        return True
+
+    # Get the pool this VM belongs to
+    if cluster_id not in cluster_managers:
+        return False
+
+    mgr = cluster_managers[cluster_id]
+    pool_id = mgr.get_vm_pool(vmid, vm_type)
+
+    if not pool_id:
+        return False  # VM not in any pool
+
+    # Get user's groups
+    user_groups = user_data.get("groups", [])
+
+    # Get user's pool permissions
+    db = get_db()
+    user_pool_perms = db.get_user_pool_permissions(cluster_id, user, user_groups)
+
+    # Check if user has required permission for this pool
+    pool_perms = user_pool_perms.get(pool_id, [])
+
+    # pool.admin grants all permissions
+    if "pool.admin" in pool_perms:
+        return True
+
+    return required_perm in pool_perms
+
+
+@bp.route("/api/users/<username>/vm-access", methods=["GET"])
+@require_auth(perms=["admin.users"])
+def get_user_vm_access(username):
+    """Get all VMs a user has explicit access to"""
+    users = load_users()
+    if username not in users:
+        return jsonify({"error": "User not found"}), 404
+
+    acls = get_vm_acls()
+    access = []
+
+    for cluster_id, cluster_acls in acls.items():
+        for vmid, acl in cluster_acls.items():
+            if username in acl.get("users", []) or "*" in acl.get("users", []):
+                access.append({
+                    "cluster_id": cluster_id,
+                    "vmid": int(vmid),
+                    "permissions": acl.get("permissions", []),
+                    "inherit_role": acl.get("inherit_role", True),
+                })
+
+    return jsonify(access)
+
+
+# ==================== PER-TENANT USER PERMISSIONS ====================
+
+
+@bp.route("/api/users/<username>/permissions", methods=["GET"])
+@require_auth(perms=["admin.users"])
+def get_user_perms(username):
+    """Get effective permissions for a user"""
+    users = load_users()
+
+    if username not in users:
+        return jsonify({"error": "User not found"}), 404
+
+    user = users[username]
+    tenant_id = request.args.get("tenant_id", user.get("tenant_id", DEFAULT_TENANT_ID))
+
+    effective = get_user_permissions(user, tenant_id)
+    effective_role = get_user_effective_role(user, tenant_id)
+
+    return jsonify({
+        "username": username,
+        "role": user.get("role"),
+        "effective_role": effective_role,
+        "tenant_id": tenant_id,
+        "tenant_permissions": user.get("tenant_permissions", {}),
+        "role_permissions": get_role_permissions_for_user(user, tenant_id),
+        "extra_permissions": user.get("permissions", []),
+        "denied_permissions": user.get("denied_permissions", []),
+        "effective_permissions": effective,
+    })
+
+
+@bp.route("/api/users/<username>/permissions", methods=["PUT"])
+@require_auth(perms=["admin.users"])
+def set_user_perms(username):
+    """Set user-specific permissions (global or per-tenant)"""
+    global users_db
+
+    users_db = load_users()
+
+    if username not in users_db:
+        return jsonify({"error": "User not found"}), 404
+
+    data = request.json or {}
+    tenant_id = data.get("tenant_id")  # if set, update tenant-specific perms
+
+    if tenant_id:
+        # (sec-review): only a global admin may set perms in any tenant; a
+        # tenant-scoped admin is confined to their own tenant
+        if request.session.get("role") != ROLE_ADMIN:
+            caller = users_db.get(request.session.get("user", ""), {})
+            if tenant_id != caller.get("tenant_id", DEFAULT_TENANT_ID):
+                log_audit(
+                    request.session.get("user", ""),
+                    "security.tenant_access_denied",
+                    f"Denied setting {username} perms in tenant {tenant_id}",
+                )
+                return jsonify({"error": "Access denied: cannot manage permissions for other tenants"}), 403
+
+        # per-tenant permissions
+        role = data.get("role")
+        extra = data.get("extra", [])
+        denied = data.get("denied", [])
+
+        # (CodeAnt re-scan - tenant->global privilege escalation) - a non-global-admin
+        # delegating tenant admin must NOT grant the global admin role or any admin.* permission:
+        # a tenant_permissions entry resolves to the target's EFFECTIVE GLOBAL perms because
+        # has_permission() runs with no tenant_id (auth.py) and get_user_permissions falls back to
+        # the target's own tenant. (The 'role' field was also previously stored unvalidated.)
+        if request.session.get("role") != ROLE_ADMIN and (
+            (role or "") == ROLE_ADMIN or any(str(p).startswith("admin.") for p in extra)
+        ):
+            log_audit(
+                request.session.get("user", ""),
+                "security.privilege_amplification_denied",
+                f"Denied tenant-admin granting admin-level role/perms to {username}",
+            )
+            return jsonify({"error": "Access denied: tenant admins cannot grant admin-level role or permissions"}), 403
+
+        # validate
+        for p in extra + denied:
+            if p not in PERMISSIONS:
+                # snyk:ignore:Cross-site Scripting (XSS)
+                return jsonify({"error": f"Invalid permission: {p}"}), 400
+
+        if "tenant_permissions" not in users_db[username]:
+            users_db[username]["tenant_permissions"] = {}
+
+        users_db[username]["tenant_permissions"][tenant_id] = {
+            "role": role or users_db[username].get("role", ROLE_VIEWER),
+            "extra": extra,
+            "denied": denied,
+        }
+
+        log_audit(
+            request.session["user"],
+            "user.tenant_perms_changed",
+            f"Changed tenant permissions for {username} in {tenant_id}",
+        )
+    else:
+        # global permissions (old behavior)
+        # (CodeAnt priv-esc) - GLOBAL permissions may ONLY be set by a GLOBAL admin.
+        # admin.users alone (which a tenant-scoped admin can hold) gated the tenant branch above
+        # but NOT this one, so a tenant admin could grant themselves/anyone global admin-equivalent
+        # perms. Mirror the tenant-branch check: non-global-admins are confined to tenant_permissions.
+        if request.session.get("role") != ROLE_ADMIN:
+            log_audit(
+                request.session.get("user", ""),
+                "security.global_perms_denied",
+                f"Denied setting GLOBAL permissions for {username} (caller is not a global admin)",
+            )
+            return jsonify({"error": "Access denied: only a global admin may set global permissions"}), 403
+        extra = data.get("permissions", [])
+        denied = data.get("denied_permissions", [])
+
+        for p in extra + denied:
+            if p not in PERMISSIONS:
+                # snyk:ignore:Cross-site Scripting (XSS)
+                return jsonify({"error": f"Invalid permission: {p}"}), 400
+
+        users_db[username]["permissions"] = extra
+        users_db[username]["denied_permissions"] = denied
+
+        log_audit(request.session["user"], "user.permissions_changed", f"Changed permissions for: {username}")
+
+    save_users(users_db)
+
+    return jsonify({"success": True, "effective_permissions": get_user_permissions(users_db[username], tenant_id)})
+
+
+@bp.route("/api/users/<username>/tenant-permissions/<tenant_id>", methods=["DELETE"])
+@require_auth(perms=["admin.users"])
+def remove_user_tenant_perms(username, tenant_id):
+    """Remove tenant-specific permissions for a user (revert to global)"""
+    global users_db
+    users_db = load_users()
+
+    if username not in users_db:
+        return jsonify({"error": "User not found"}), 404
+
+    # (sec-review): tenant-scoped admins can only touch their own tenant
+    if request.session.get("role") != ROLE_ADMIN:
+        caller = users_db.get(request.session.get("user", ""), {})
+        if tenant_id != caller.get("tenant_id", DEFAULT_TENANT_ID):
+            log_audit(
+                request.session.get("user", ""),
+                "security.tenant_access_denied",
+                f"Denied removing {username} perms in tenant {tenant_id}",
+            )
+            return jsonify({"error": "Access denied: cannot manage permissions for other tenants"}), 403
+
+    tp = users_db[username].get("tenant_permissions", {})
+    if tenant_id in tp:
+        del tp[tenant_id]
+        save_users(users_db)
+        log_audit(
+            request.session["user"],
+            "user.tenant_perms_removed",
+            f"Removed tenant permissions for {username} in {tenant_id}",
+        )
+
+    return jsonify({"success": True})
+
+
+@bp.route("/api/me/permissions", methods=["GET"])
+@require_auth()
+def get_my_permissions():
+    """Get current user's permissions"""
+    users = load_users()
+    user = users.get(request.session["user"], {})
+    tenant_id = request.args.get("tenant_id", user.get("tenant_id", DEFAULT_TENANT_ID))
+
+    return jsonify({
+        "role": user.get("role"),
+        "effective_role": get_user_effective_role(user, tenant_id),
+        "tenant_id": tenant_id,
+        "tenant_permissions": user.get("tenant_permissions", {}),
+        "permissions": get_user_permissions(user, tenant_id),
+    })

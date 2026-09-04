@@ -1,0 +1,103 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/notifications/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Push Notifications</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Push Notifications</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="status">Status</button>
+            <button class="tab" role="tab" data-tab="config">Configuration</button>
+            <button class="tab" role="tab" data-tab="history">History</button>
+        </div>
+
+        <div id="panel-status" class="tab-panel">
+            <div class="grid">
+                <div class="stat">
+                    <div class="muted">Ntfy</div>
+                    <div class="num" id="sNtfy">Off</div>
+                </div>
+                <div class="stat">
+                    <div class="muted">Apprise</div>
+                    <div class="num" id="sApprise">Off</div>
+                </div>
+                <div class="stat">
+                    <div class="muted">Apprise URLs</div>
+                    <div class="num" id="sUrlCount">0</div>
+                </div>
+                <div class="stat">
+                    <div class="muted">Handler</div>
+                    <div class="num" id="sHandler">No</div>
+                </div>
+            </div>
+            <div class="card">
+                <h2>Send Test</h2>
+                <p class="muted">Test one or both configured channels.</p>
+                <button id="tSend" disabled>Send Test</button>
+                <div id="tResult" class="form"></div>
+            </div>
+        </div>
+
+        <div id="panel-config" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Ntfy</h2>
+                <div class="form">
+                    <label><input type="checkbox" id="nEnabled"> Enable Ntfy</label>
+                    <label>Ntfy URL <input type="text" id="nUrl" placeholder="https://ntfy.sh" /></label>
+                    <label>Ntfy Topic <input type="text" id="nTopic" placeholder="ProxmoxVEx" /></label>
+                    <label>Ntfy Token <input type="password" id="nToken" placeholder="(optional)" /></label>
+                    <label>Priority Map (JSON) <textarea id="nPriority"
+                            placeholder='{"info":"default","warning":"high","critical":"urgent"}'></textarea></label>
+                </div>
+            </div>
+            <div class="card">
+                <h2>Apprise</h2>
+                <p class="muted">Apprise installed: <strong id="aAvail">no</strong></p>
+                <div class="form">
+                    <label><input type="checkbox" id="aEnabled" disabled> Enable Apprise</label>
+                    <label>Service URLs (one per line) <textarea id="aUrls" placeholder="discord://...&#10;tgram://..."
+                            disabled></textarea></label>
+                </div>
+                <p id="cfgError" class="error-text"></p>
+                <button id="cfgSave">Save</button>
+            </div>
+        </div>
+
+        <div id="panel-history" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Notification History</h2>
+                <div id="historyList">
+                    <p class="empty">No events.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

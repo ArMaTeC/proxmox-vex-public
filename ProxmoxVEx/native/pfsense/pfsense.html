@@ -1,0 +1,48 @@
+<!doctype html>
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        ProxmoxVEx/native/pfsense/pfsense.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Pfsense HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pfSense Manager - ProxmoxVEx</title>
+
+  <link rel="stylesheet" href="pfsense.css">
+</head>
+
+<body>
+  <h1 data-i18n="title">pfSense Manager</h1>
+  <div class="tabs">
+    <button class="tab active" data-tab="overview" data-endpoint="/api/pfsense/overview"
+      data-i18n="overview">Overview</button>
+    <button class="tab" data-tab="interfaces" data-endpoint="/api/pfsense/network"
+      data-i18n="interfaces">Interfaces</button>
+    <button class="tab" data-tab="rules" data-endpoint="/api/pfsense/rules" data-i18n="rules">Rules</button>
+  </div>
+  <div id="overview" class="panel active">
+    <div class="status" id="status-overview" data-i18n="loading">Loading...</div>
+    <pre id="content-overview"></pre>
+  </div>
+  <div id="interfaces" class="panel">
+    <div class="status" id="status-interfaces"></div>
+    <pre id="content-interfaces"></pre>
+  </div>
+  <div id="rules" class="panel">
+    <div class="status" id="status-rules"></div>
+    <pre id="content-rules"></pre>
+  </div>
+
+  <script src="pfsense.js"></script>
+</body>
+
+</html>

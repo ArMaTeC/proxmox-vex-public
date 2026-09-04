@@ -1,0 +1,13 @@
+{
+    "id": "proxmox-ha",
+    "name": "Proxmox HA Resources",
+    "version": "1.0.7",
+    "description": "Add, update, and remove VMs from Proxmox native HA resources via the cluster manager.",
+    "author": "Yair Mizrahi",
+    "trusted": false,
+    "min_version": "0.9.3",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Platform",
+    "min_license_tier": "corporate"
+}

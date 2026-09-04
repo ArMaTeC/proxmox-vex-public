@@ -1,0 +1,108 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/api-token-manager/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API Token Manager</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>API Token Manager</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="tokens">Tokens</button>
+            <button class="tab" role="tab" data-tab="create">Create</button>
+            <button class="tab" role="tab" data-tab="audit">Audit</button>
+        </div>
+
+        <div id="panel-tokens" class="tab-panel">
+            <div class="card">
+                <h2>Tokens</h2>
+                <div class="actions" style="margin-bottom:12px;">
+                    <input type="text" id="tSearch" placeholder="Search" />
+                    <select id="tScope">
+                        <option value="">All scopes</option>
+                    </select>
+                    <select id="tStatus">
+                        <option value="">All</option>
+                        <option value="active">Active</option>
+                        <option value="expired">Expired</option>
+                        <option value="revoked">Revoked</option>
+                    </select>
+                </div>
+                <div id="tokensList">
+                    <p class="empty">No tokens.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-create" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Create / Edit Token</h2>
+                <form class="form" id="tokenForm">
+                    <input type="hidden" id="tId" />
+                    <label>Name <input type="text" id="tName" required placeholder="backup-service" /></label>
+                    <label>Scopes (JSON) <input type="text" id="tScopes" placeholder='["*"]' /></label>
+                    <label>Expiration <input type="datetime-local" id="tExpires" /></label>
+                    <label style="flex:1 1 100%;">Pick scopes <span id="scopeTags"></span></label>
+                    <button type="submit">Save</button>
+                    <button type="button" id="tReset" class="secondary">Reset</button>
+                </form>
+                <p id="tError" class="error-text"></p>
+            </div>
+            <div class="card" id="newTokenPanel" hidden>
+                <h2>New Token</h2>
+                <p class="muted">Copy this now; it will not be shown again.</p>
+                <div class="token-box"><input type="text" id="newToken" readonly /><button id="copyToken">Copy</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-audit" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Audit Log</h2>
+                <div id="auditList">
+                    <p class="empty">No audit entries.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="prefixModal" class="modal" hidden>
+        <div class="modal-content">
+            <h3>Token: <span id="prefixName"></span></h3>
+            <p class="muted">The secret was shown once at creation. Only the prefix is stored now.</p>
+            <div class="token-box" style="margin:12px 0;">
+                <input type="text" id="prefixValue" readonly />
+            </div>
+            <div class="actions">
+                <button type="button" id="prefixCopy">Copy prefix</button>
+                <button type="button" id="prefixClose" class="secondary">Close</button>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

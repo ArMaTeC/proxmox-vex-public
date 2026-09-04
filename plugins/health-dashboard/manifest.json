@@ -1,0 +1,12 @@
+{
+    "id": "health-dashboard",
+    "name": "Cluster Health Dashboard",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Roll up cluster, node, storage, and VM health into a single scoreboard view.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Monitoring & Health",
+    "min_license_tier": "advanced"
+}

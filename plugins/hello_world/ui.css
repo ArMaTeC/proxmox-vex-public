@@ -1,0 +1,200 @@
+/* --- ProxmoxVEx auto-header start ---
+ * -------------------------------------------------------------------
+ * File:        plugins/hello_world/ui.css
+ * Project:     ProxmoxVEx
+ * Version:     1.2.303
+ * Build:       2026.09.04
+ * Description: Ui CSS source
+ * Docs:        https://proxmoxvex.local/docs
+ * Generated:   2026-09-04
+ * -------------------------------------------------------------------
+ * --- ProxmoxVEx auto-header end --- */
+:root {
+    --bg: #0b0d0d;
+    --card: #1a2222;
+    --border: #283d3d;
+    --accent: #7ce8e7;
+    --text: #f0f2f5;
+    --muted: #8b949e;
+    --danger: #f85149;
+    --success: #238636;
+    --warning: #d29922;
+    --info: #58a6ff;
+}
+
+[data-theme="corp-light"] {
+    --bg: #f4f4f4;
+    --card: #ffffff;
+    --border: #d4d4d4;
+    --text: #1a1a1a;
+    --muted: #666666;
+    --accent: #e57000;
+    --danger: #d32f2f;
+    --success: #2e7d32;
+    --warning: #d29922;
+    --info: #1976d2;
+}
+
+
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+}
+
+.container {
+    max-width: 800px;
+    margin: 0 auto;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+}
+
+h1 {
+    margin: 0;
+    font-size: 1.5rem;
+}
+
+.badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    background: rgba(35, 134, 54, 0.12);
+    color: var(--success);
+}
+
+.badge.error {
+    background: rgba(248, 81, 73, 0.12);
+    color: var(--danger);
+}
+
+.card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 16px;
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.card h2 {
+    margin: 0 0 12px;
+    font-size: 1.1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.actions {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    background: var(--accent);
+    color: #0b0c0d;
+    font-size: 0.85rem;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+button.secondary {
+    background: var(--border);
+    color: var(--text);
+}
+
+[data-theme="corp-light"] button {
+    color: #fff;
+}
+
+[data-theme="corp-light"] button.secondary {
+    background: #e0e0e0;
+    color: #1a1a1a;
+}
+
+input {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.9rem;
+}
+
+.muted {
+    color: var(--muted);
+}
+
+.error {
+    color: var(--danger);
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+
+td {
+    padding: 8px;
+    border-bottom: 1px solid var(--border);
+}
+
+pre {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    overflow: auto;
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+}
+
+.message {
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin-bottom: 12px;
+    font-size: 0.85rem;
+}
+
+.message.success {
+    background: rgba(35, 134, 54, 0.15);
+    color: var(--success);
+    border: 1px solid rgba(35, 134, 54, 0.3);
+}
+
+.message.error {
+    background: rgba(248, 81, 73, 0.15);
+    color: var(--danger);
+    border: 1px solid rgba(248, 81, 73, 0.3);
+}

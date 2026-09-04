@@ -1,0 +1,48 @@
+<!doctype html>
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        ProxmoxVEx/native/active_directory/active_directory.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Active Directory HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Active Directory - ProxmoxVEx</title>
+
+  <link rel="stylesheet" href="active_directory.css">
+</head>
+
+<body>
+  <h1 data-i18n="title">Active Directory</h1>
+  <div class="tabs">
+    <button class="tab active" data-tab="overview" data-endpoint="/api/active_directory/overview"
+      data-i18n="overview">Overview</button>
+    <button class="tab" data-tab="users" data-endpoint="/api/active_directory/users" data-i18n="users">Users</button>
+    <button class="tab" data-tab="groups" data-endpoint="/api/active_directory/groups"
+      data-i18n="groups">Groups</button>
+  </div>
+  <div id="overview" class="panel active">
+    <div class="status" id="status-overview" data-i18n="loading">Loading...</div>
+    <pre id="content-overview"></pre>
+  </div>
+  <div id="users" class="panel">
+    <div class="status" id="status-users"></div>
+    <pre id="content-users"></pre>
+  </div>
+  <div id="groups" class="panel">
+    <div class="status" id="status-groups"></div>
+    <pre id="content-groups"></pre>
+  </div>
+
+  <script src="active_directory.js"></script>
+</body>
+
+</html>

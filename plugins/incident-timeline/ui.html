@@ -1,0 +1,124 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/incident-timeline/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Incident Timeline</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Incident Timeline</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+        <div id="message"></div>
+
+        <div class="tabs">
+            <div class="tab active" data-tab="timeline" data-i18n="timeline">Timeline</div>
+            <div class="tab" data-tab="events" data-i18n="events">All Events</div>
+            <div class="tab" data-tab="bookmarks" data-i18n="bookmarks">Bookmarks</div>
+            <div class="tab" data-tab="analyze" data-i18n="analyze">Analyze</div>
+        </div>
+
+        <div class="panel active" id="timelinePanel">
+            <div class="card">
+                <h2>Load Timeline</h2>
+                <form class="form" id="timelineForm">
+                    <label>Cluster <select id="clusterSelect" name="cluster_id" required></select></label>
+                    <label>VMID (optional) <input type="number" name="vmid" /></label>
+                    <label>Severity <select name="severity">
+                            <option value="">All</option>
+                            <option value="low">Low</option>
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                            <option value="critical">Critical</option>
+                        </select></label>
+                    <label>From <input type="datetime-local" name="since" /></label>
+                    <label>To <input type="datetime-local" name="until" /></label>
+                    <button type="submit" data-i18n="load">Load</button>
+                    <button type="button" class="secondary" id="refreshTimeline" data-i18n="refresh">Refresh</button>
+                </form>
+                <div id="timelineResult">
+                    <p class="empty">Select a cluster to load timeline.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="eventsPanel">
+            <div class="card">
+                <h2>All Events</h2>
+                <div class="toolbar">
+                    <input type="text" id="eventSearch" placeholder="Search events..." />
+                    <select id="eventSeverity">
+                        <option value="">All</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="critical">Critical</option>
+                    </select>
+                    <select id="eventType">
+                        <option value="">All types</option>
+                        <option value="metric">Metric</option>
+                        <option value="log">Log</option>
+                    </select>
+                    <button id="applyFilter">Filter</button>
+                    <button class="secondary" id="resetFilter" data-i18n="reset">Reset</button>
+                    <button class="secondary" id="exportJson" data-i18n="exportJSON">JSON</button>
+                    <button class="secondary" id="exportCsv" data-i18n="exportCSV">CSV</button>
+                </div>
+                <div id="eventsList">
+                    <p class="empty">No events.</p>
+                </div>
+                <div class="pagination" id="eventsPagination"></div>
+            </div>
+        </div>
+
+        <div class="panel" id="bookmarksPanel">
+            <div class="card">
+                <h2>Add Bookmark</h2>
+                <form class="form" id="bookmarkForm">
+                    <label>Event ID <input type="text" name="event_id" required placeholder="event-uuid" /></label>
+                    <label>Note <textarea name="note" placeholder="Context for this event"></textarea></label>
+                    <button type="submit" data-i18n="add">Add</button>
+                </form>
+            </div>
+            <div class="card">
+                <h2>Bookmarks</h2>
+                <div id="bookmarksList">
+                    <p class="empty">No bookmarks.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" id="analyzePanel">
+            <div class="card">
+                <h2>Heatmap</h2>
+                <button id="loadHeatmap" class="secondary" data-i18n="load">Load</button>
+                <div id="heatmapResult">
+                    <p class="empty">No data</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

@@ -1,0 +1,12 @@
+{
+    "id": "vm-resource-quotas",
+    "name": "VM Resource Quotas",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Full UI management of per-tenant resource quotas with live usage, templates, alerts, default quotas, import/export, and history.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Cost & Billing",
+    "min_license_tier": "advanced"
+}

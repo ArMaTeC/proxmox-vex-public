@@ -1,0 +1,120 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/firewall-rule-manager/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Firewall Rule Manager</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Firewall Rule Manager</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="rules">Rules</button>
+            <button class="tab" role="tab" data-tab="editor">Add / Edit</button>
+            <button class="tab" role="tab" data-tab="apply">Apply</button>
+        </div>
+
+        <div id="panel-rules" class="tab-panel">
+            <div class="card">
+                <h2>Rules</h2>
+                <div class="form">
+                    <label>Search <input type="text" id="rSearch" placeholder="name, IP, alias" /></label>
+                    <label>Protocol <select id="rProtocol">
+                            <option value="">All</option>
+                            <option value="tcp">TCP</option>
+                            <option value="udp">UDP</option>
+                            <option value="icmp">ICMP</option>
+                        </select></label>
+                    <label>Action <select id="rAction">
+                            <option value="">All</option>
+                            <option value="accept">Accept</option>
+                            <option value="deny">Deny</option>
+                        </select></label>
+                    <label>Enabled <select id="rEnabled">
+                            <option value="">All</option>
+                            <option value="true">Enabled</option>
+                            <option value="false">Disabled</option>
+                        </select></label>
+                    <button id="rLoad">Refresh</button>
+                    <button id="rReset" class="secondary">Reset</button>
+                </div>
+                <p id="rError" class="error-text"></p>
+                <div id="rulesList">
+                    <p class="empty">No rules.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-editor" class="tab-panel" hidden>
+            <div class="card">
+                <h2 id="edTitle">Add Rule</h2>
+                <input type="hidden" id="edId" />
+                <div class="form">
+                    <label>Name <input type="text" id="edName" placeholder="Allow SSH" /></label>
+                    <label>Source <input type="text" id="edSource" placeholder="0.0.0.0/0" /></label>
+                    <label>Destination <input type="text" id="edDestination" placeholder="10.0.0.0/24" /></label>
+                    <label>Port <input type="text" id="edPort" placeholder="22 or 80-443" /></label>
+                    <label>Protocol <select id="edProtocol">
+                            <option value="tcp">TCP</option>
+                            <option value="udp">UDP</option>
+                            <option value="icmp">ICMP</option>
+                        </select></label>
+                    <label>Action <select id="edAction">
+                            <option value="accept">Accept</option>
+                            <option value="deny">Deny</option>
+                        </select></label>
+                    <label class="muted"><input type="checkbox" id="edEnabled" checked /> Enabled</label>
+                </div>
+                <div class="form">
+                    <label>Description <textarea id="edDesc" rows="3" placeholder="Optional comment"></textarea></label>
+                </div>
+                <p id="edError" class="error-text"></p>
+                <div class="form">
+                    <button id="edSave">Save</button>
+                    <button id="edCancel" class="secondary" hidden>Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-apply" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Apply Rules to Cluster</h2>
+                <div class="form">
+                    <label>Cluster <select id="aCluster">
+                            <option value="">Select</option>
+                        </select></label>
+                    <button id="aApply">Apply Enabled Rules</button>
+                </div>
+                <p id="aError" class="error-text"></p>
+                <div id="applyResult">
+                    <p class="empty">No apply run.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

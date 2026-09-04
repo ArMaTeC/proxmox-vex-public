@@ -1,0 +1,118 @@
+/* --- ProxmoxVEx auto-header start ---
+ * -------------------------------------------------------------------
+ * File:        web/src/responsive.css
+ * Project:     ProxmoxVEx
+ * Version:     1.2.303
+ * Build:       2026.09.04
+ * Description: Responsive CSS source
+ * Docs:        https://proxmoxvex.local/docs
+ * Generated:   2026-09-04
+ * -------------------------------------------------------------------
+ * --- ProxmoxVEx auto-header end --- */
+.mobile-only {
+  display: block;
+}
+
+.desktop-only {
+  display: none;
+}
+
+/* Touch-friendly minimum targets on small screens */
+@media (max-width: 768px) {
+
+  button,
+  a,
+  input,
+  select,
+  textarea,
+  [role="button"] {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  table,
+  thead,
+  tbody,
+  th,
+  td,
+  tr {
+    display: block;
+  }
+
+  thead tr {
+    position: absolute;
+    top: -9999px;
+    left: -9999px;
+  }
+
+  tr {
+    margin-bottom: 0.5rem;
+    border: 1px solid var(--color-surface-border, #30363d);
+  }
+
+  td {
+    border: none;
+    border-bottom: 1px solid var(--color-surface-border, #30363d);
+    position: relative;
+    padding-left: 50%;
+  }
+
+  td::before {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    width: 45%;
+    padding-right: 10px;
+    white-space: nowrap;
+    font-weight: bold;
+  }
+
+  .stack-mobile {
+    flex-direction: column !important;
+  }
+
+  .stack-mobile>* {
+    width: 100%;
+  }
+}
+
+/* Tablet and up */
+@media (min-width: 769px) and (max-width: 1024px) {
+  .hide-tablet {
+    display: none !important;
+  }
+}
+
+/* Desktop */
+@media (min-width: 1025px) {
+  .mobile-only {
+    display: none;
+  }
+
+  .desktop-only {
+    display: block;
+  }
+
+  .stack-mobile {
+    flex-direction: row;
+  }
+}
+
+/* Very small screens */
+@media (max-width: 480px) {
+  .hide-mobile {
+    display: none !important;
+  }
+
+  .full-width-mobile {
+    width: 100% !important;
+  }
+}
+
+/* Safe-area insets for notched mobile devices */
+@supports (padding: max(0px)) {
+  .safe-inset {
+    padding-left: max(var(--space-4, 1rem), env(safe-area-inset-left));
+    padding-right: max(var(--space-4, 1rem), env(safe-area-inset-right));
+  }
+}

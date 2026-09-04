@@ -1,0 +1,113 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/sdn-controller/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDN Controller</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>SDN Controller</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+
+        <div id="message"></div>
+
+        <div class="grid">
+            <div class="card">
+                <div class="title">Status</div>
+                <div class="value" id="statusValue">-</div>
+            </div>
+            <div class="card">
+                <div class="title">Zones</div>
+                <div class="value" id="zoneCount">-</div>
+            </div>
+            <div class="card">
+                <div class="title">VNets</div>
+                <div class="value" id="vnetCount">-</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Apply to Cluster</h2>
+            <form class="form" id="applyForm">
+                <label>
+                    Cluster ID
+                    <input type="text" name="cluster_id" required placeholder="cluster-uuid" />
+                </label>
+                <button type="submit">Apply</button>
+            </form>
+            <div id="applyResult"></div>
+        </div>
+
+        <div class="section">
+            <h2>Zones</h2>
+            <form class="form" id="zoneForm">
+                <label>
+                    Name
+                    <input type="text" name="name" required placeholder="production" />
+                </label>
+                <label>
+                    Type
+                    <select name="type">
+                        <option value="evpn" selected>evpn</option>
+                        <option value="vlan">vlan</option>
+                        <option value="vxlan">vxlan</option>
+                    </select>
+                </label>
+                <button type="submit">Add Zone</button>
+            </form>
+            <div id="zonesList">
+                <p class="empty">No zones.</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>VNets</h2>
+            <form class="form" id="vnetForm">
+                <label>
+                    Zone
+                    <select name="zone_id" id="zoneSelect"></select>
+                </label>
+                <label>
+                    Name
+                    <input type="text" name="name" required placeholder="vnet-prod" />
+                </label>
+                <label>
+                    Tag
+                    <input type="number" name="tag" required placeholder="100" />
+                </label>
+                <label>
+                    Subnet
+                    <input type="text" name="subnet" placeholder="10.10.0.0/24" />
+                </label>
+                <button type="submit">Add VNet</button>
+            </form>
+            <div id="vnetsList">
+                <p class="empty">No vnets.</p>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

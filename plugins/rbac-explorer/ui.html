@@ -1,0 +1,59 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/rbac-explorer/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RBAC Explorer</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>RBAC Explorer</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts"></div>
+        <div class="card">
+            <h2>Create Role</h2>
+            <div class="form">
+                <input type="text" id="roleId" placeholder="role-id" />
+                <input type="text" id="roleName" placeholder="Role name" />
+                <input type="text" id="rolePerms" placeholder="vm.view,lxc.view" />
+                <button id="createRole">Create</button>
+            </div>
+        </div>
+        <div class="card">
+            <h2>Roles</h2>
+            <table id="rolesTable">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Name</th>
+                        <th>Permissions</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

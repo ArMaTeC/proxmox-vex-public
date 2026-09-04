@@ -1,0 +1,12 @@
+{
+    "id": "api-token-manager",
+    "name": "API Token Manager",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Create, rotate, and revoke service and user API tokens with scoped permissions.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Security & Access",
+    "min_license_tier": "advanced"
+}

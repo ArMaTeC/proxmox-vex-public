@@ -1,0 +1,117 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/vpn-access-portal/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VPN Access Portal</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>VPN Access Portal</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="clients">Clients</button>
+            <button class="tab" role="tab" data-tab="add">Add / Edit</button>
+            <button class="tab" role="tab" data-tab="sessions">Sessions</button>
+            <button class="tab" role="tab" data-tab="audit">Audit</button>
+        </div>
+
+        <div id="panel-clients" class="tab-panel">
+            <div class="card">
+                <h2>Clients</h2>
+                <div class="actions" style="margin-bottom:12px;">
+                    <input type="text" id="cSearch" placeholder="Search name" />
+                    <select id="cType">
+                        <option value="">All types</option>
+                        <option value="wireguard">WireGuard</option>
+                        <option value="openvpn">OpenVPN</option>
+                    </select>
+                    <select id="cEnabled">
+                        <option value="">All</option>
+                        <option value="true">Enabled</option>
+                        <option value="false">Disabled</option>
+                    </select>
+                </div>
+                <div id="clientsList">
+                    <p class="empty">No clients.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-add" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Add / Edit Client</h2>
+                <form class="form" id="clientForm">
+                    <label>Name <input type="text" id="vName" required /></label>
+                    <label>Type <select id="vType">
+                            <option value="wireguard">WireGuard</option>
+                            <option value="openvpn">OpenVPN</option>
+                        </select></label>
+                    <label>Allowed IPs (comma CIDRs) <input type="text" id="vIps" value="10.200.0.0/24"
+                            required /></label>
+                    <label>Description <input type="text" id="vDesc" /></label>
+                    <label>Email <input type="email" id="vEmail" /></label>
+                    <label>Expires at <input type="date" id="vExpires" /></label>
+                    <label><input type="checkbox" id="vEnabled" checked /> Enabled</label>
+                    <input type="hidden" id="vId" />
+                    <button type="submit">Save</button>
+                    <button type="button" id="vReset" class="secondary">Reset</button>
+                </form>
+                <p id="vError" class="error-text"></p>
+            </div>
+        </div>
+
+        <div id="panel-sessions" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Active Sessions</h2>
+                <div id="sessionsList">
+                    <p class="empty">No sessions.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-audit" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Audit Log</h2>
+                <div id="auditList">
+                    <p class="empty">No audit events.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <dialog id="cfgDialog"
+        style="background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:12px;max-width:600px;width:90%;">
+        <h2>Configuration</h2>
+        <pre id="cfgRaw"></pre>
+        <div class="actions">
+            <button id="cfgDownload" type="button">Download</button>
+            <button id="cfgCopy" type="button" class="secondary">Copy</button>
+            <button id="cfgClose" type="button" class="secondary">Close</button>
+        </div>
+    </dialog>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

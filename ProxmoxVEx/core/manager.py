@@ -1,0 +1,17121 @@
+# --- ProxmoxVEx auto-header start ---
+# --------------------------------------------------------------------
+# File:        ProxmoxVEx/core/manager.py
+# Project:     ProxmoxVEx
+# Version:     1.2.303
+# Build:       2026.09.04
+# Description: ProxmoxVEx Cluster Manager - Layer 5
+# Docs:        https://proxmoxvex.local/docs
+# Generated:   2026-09-04
+# --------------------------------------------------------------------
+# --- ProxmoxVEx auto-header end ---
+"""
+ProxmoxVEx Cluster Manager - Layer 5
+Main cluster management: Proxmox API, load balancing, HA.
+"""
+
+import contextlib
+import json
+import logging
+import os
+import re
+import shlex
+import socket
+import ssl
+import subprocess
+import threading
+import time
+import uuid
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+import requests
+import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from urllib3.util.ssl_ import create_urllib3_context
+
+from ProxmoxVEx import globals as _g
+from ProxmoxVEx.constants import LOG_DIR, SSH_MAX_CONCURRENT
+from ProxmoxVEx.core.config import save_config
+from ProxmoxVEx.core.db import get_db
+from ProxmoxVEx.models.tasks import MaintenanceTask, ProxmoxVExConfig
+from ProxmoxVEx.utils.concurrent import GEVENT_PATCHED
+from ProxmoxVEx.utils.realtime import broadcast_sse, is_cluster_watched
+from ProxmoxVEx.utils.ssh import _ssh_track_connection, apply_ssh_host_key_policy, get_ssh_connection_stats
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+_SOCKET_OPTIONS = [
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPIDLE", 4), 30),
+    (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPINTVL", 5), 10),
+    (socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPCNT", 6), 3),
+]
+
+
+class _PVEAdapter(HTTPAdapter):
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs.setdefault("socket_options", _SOCKET_OPTIONS)
+        return super().init_poolmanager(*args, **kwargs)
+
+
+class _NoHostnameCheckAdapter(HTTPAdapter):
+    """Force-disable hostname verification so IPs work with self-signed certs"""
+
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        kwargs["ssl_context"] = ctx
+        kwargs.setdefault("socket_options", _SOCKET_OPTIONS)
+        return super().init_poolmanager(*args, **kwargs)
+
+
+# Lazy paramiko import
+def get_paramiko():
+    try:
+        import paramiko
+
+        return paramiko
+    except ImportError:
+        return None
+
+
+# Gevent pool
+GEVENT_AVAILABLE = False
+GEVENT_POOL = None
+try:
+    from gevent.pool import Pool as GeventPool
+
+    # Was 50 (100 caused fd exhaustion on the old Hetzner box at ulimit 1024).
+    # 2026-06-05: env-tunable, default back to 100 — keep-alive sessions (#528)
+    # reuse connections so the per-node fan-out no longer burns one fd per call,
+    # and the entry point now raises RLIMIT_NOFILE. Shared across all managers,
+    # so this caps total concurrent node-fetches process-wide.
+    GEVENT_POOL = GeventPool(size=int(os.environ.get("PROXMOXVEX_NODE_POOL_SIZE", "100")))
+    GEVENT_AVAILABLE = True
+except ImportError:
+    pass
+
+# H1 (scale audit 2026-06-05): negative-cache UPIDs whose initiating ProxmoxVEx user
+# can't be resolved from audit_log. The get_tasks() audit-log LIKE fallback runs
+# on the hub every ~1s broadcast tick per unmatched task; system/automation tasks
+# (cron vzdump, replication, HA) never match, so without this they re-scan forever.
+# Bounded dict {upid: monotonic_ts}, cleared wholesale when full.
+# N-3 (regression fix): entries are TTL'd, NOT permanent. The audit_log row for a
+# task is committed by the handler AFTER the PVE task is created, so the ~1s
+# broadcast scan can read a just-started task before its audit row lands → no
+# match → it used to be negcached FOREVER (permanent mis-attribution). TTL lets a
+# late-committing row be picked up on the next re-scan; a genuine system task just
+# re-scans every TTL (windowed, sub-ms).
+_TASK_USER_NEGCACHE = {}
+_TASK_USER_NEGCACHE_MAX = 5000
+_TASK_USER_NEGCACHE_TTL = 120.0
+
+
+def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
+    # 2026-05-31 - paired bugfix with utils/concurrent.py: gevent.pool.Pool's
+    # __bool__ is len(), so `if GEVENT_POOL and ...` was always-False on entry.
+    # `is not None` is the right gate.
+    if not tasks:
+        return []
+    if GEVENT_POOL is not None and GEVENT_AVAILABLE:
+        try:
+            greenlets = [GEVENT_POOL.spawn(task) for task in tasks]
+            from gevent import joinall
+
+            joinall(greenlets, timeout=timeout)
+            results = []
+            for g in greenlets:
+                try:
+                    results.append(g.value if g.successful() else None)
+                except Exception as e:
+                    logging.error(f"Concurrent task failed: {e}")
+                    results.append(None)
+            return results
+        except Exception as e:
+            logging.error(f"Concurrent execution failed: {e}")
+    results = []
+    for task in tasks:
+        try:
+            results.append(task())
+        except Exception as e:
+            logging.error(f"Task failed: {e}")
+            results.append(None)
+    return results
+
+
+def run_concurrent_dict(tasks: dict, timeout: float = 30.0) -> dict:
+    if not tasks:
+        return {}
+    keys = list(tasks.keys())
+    callables = [tasks[k] for k in keys]
+    results = run_concurrent(callables, timeout)
+    return dict(zip(keys, results))
+
+
+class UpdateTask:
+    def __init__(self, node: str, reboot: bool = True):
+        self.node = node
+        self.reboot = reboot
+        self.started_at = datetime.now()
+        self.status = "starting"  # starting, updating, rebooting, waiting_online, completed, failed
+        self.phase = "init"  # init, apt_update, apt_dist_upgrade, reboot, wait_online
+        self.output_lines: List[Dict[str, Any]] = []
+        self.error: str | None = None
+        self.packages_upgraded = 0
+        self.completed_at: datetime | None = None
+
+    def add_output(self, line: str):
+        self.output_lines.append({"timestamp": datetime.now().isoformat(), "text": line})
+        # Keep only last 100 lines
+        if len(self.output_lines) > 100:
+            self.output_lines = self.output_lines[-100:]
+
+    def to_dict(self):
+        return {
+            "node": self.node,
+            "reboot": self.reboot,
+            "started_at": self.started_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "status": self.status,
+            "phase": self.phase,
+            "output_lines": self.output_lines[-20:],  # Last 20 lines for UI
+            "error": self.error,
+            "packages_upgraded": self.packages_upgraded,
+            "duration_seconds": (datetime.now() - self.started_at).total_seconds(),
+        }
+
+
+# 2026-04-24 - When ProxmoxVEx SSH'es in as ProxmoxVEx@pam (NOPASSWD sudo), every
+# privileged command plus anything that writes to /etc or /opt needs to actually
+# run as root. Naive `sudo {cmd}` prefix breaks heredocs and pipe redirects
+# `sudo cat > /etc/foo` opens the redirect in the unprivileged shell.
+# Base64 → `sudo bash` handles arbitrary multi-line shell payloads cleanly.
+def _wrap_with_sudo(cmd):
+    """Wrap a command so it runs entirely as root via sudo, safe for heredocs."""
+    import base64 as _b64
+
+    enc = _b64.b64encode(cmd.encode("utf-8")).decode("ascii")
+    # The -n flag makes sudo fail fast if NOPASSWD isn't configured (no prompt hang).
+    return f"echo {enc} | base64 -d | sudo -n bash"
+
+
+def _ssh_stderr_excerpt(stderr, max_chars=240):
+    """Last meaningful line of SSH stderr, capped.
+
+    OpenSSH dumps the full pre-auth banner (often a 70+ char asterisk border
+    followed by AUP text) BEFORE the actual error like
+    'Permission denied (publickey,password)' / 'Connection refused' /
+    'Host key verification failed'. Logging stderr[:200] then shows nothing
+    but banner. Take the last non-empty line — that's where SSH puts the
+    error.
+    """
+    if not stderr:
+        return "no error output"
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    if not lines:
+        return "no error output"
+    return lines[-1][:max_chars]
+
+
+class ProxmoxVExManager:
+    """
+    main cluster manager
+
+    handles all the proxmox api stuff, loadbalancing, HA etc
+    each cluster runs in its own thread
+
+    this class is kinda big, should probably split it up someday
+    """
+
+    # Lock reason descriptions for UI display
+    LOCK_DESCRIPTIONS = {
+        "migrate": "Migration in progress",
+        "backup": "Backup in progress",
+        "snapshot": "Snapshot operation in progress",
+        "rollback": "Snapshot rollback in progress",
+        "clone": "Clone operation in progress",
+        "create": "VM creation in progress",
+        "disk": "Disk operation in progress",
+        "suspended": "VM suspended to disk",
+        "suspending": "VM is being suspended",
+        "copy": "Copy operation in progress",
+    }
+
+    def __init__(self, cluster_id: str, config: ProxmoxVExConfig):
+        self.id = cluster_id
+        self.config = config
+        self.running = False
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.last_run = None
+        self.last_migration_log = []
+        self._vm_migration_cooldown = {}  # {vmid: timestamp} — prevent ping-pong
+        self._node_metrics_history = {}  # {node_name: [{timestamp, cpu, mem_pct, ...}]} ring buffer for predictive LB
+        self._metrics_history_lock = threading.Lock()  # guard concurrent access from API routes
+        # #601 — hottest lm-sensors reading per node (°C), refreshed by the 5-min
+        # metrics collector and READ by the 60s alert loop (which must never SSH
+        # per-tick). _node_temp_probe_backoff skips nodes without lm-sensors/SSH.
+        self._node_temp_cache = {}  # {node_name: {'temp': float_c, 'ts': epoch}}
+        self._node_temp_lock = threading.Lock()
+        self._node_temp_probe_backoff = {}  # {node_name: reprobe_after_epoch}
+
+        # maintenance mode
+        self.nodes_in_maintenance = {}
+        self._cached_node_dict = {}
+        self._nodes_cache_time: float = 0
+        # cache ttl is 8 seconds, not 10 - api returns stale data for up to 6s after a migration
+        # and we need the 2s buffer on top so the ui never shows the vm on the old node
+        self._nodes_cache_ttl = 8
+        self.maintenance_lock = threading.Lock()
+
+        # IP address cache: (node, vmid) -> list of IPs (IPv4 first)
+        # Populated by _ip_refresh_loop every 30s, injected into get_vm_resources() output
+        self._ip_cache = {}
+        self._ip_cache_lock = threading.Lock()
+        self._ip_refresh_thread = None
+        # disk usage from guest agent: (node, vmid) -> {used, total}
+        self._disk_cache = {}
+        self._disk_cache_lock = threading.Lock()
+        # #237: track VMs where guest agent is disabled to avoid spamming PVE with failed requests
+        self._no_agent_vms = set()  # vmids with no agent (cleared on VM start/config change)
+        # OS-type cache: (node, vmid) -> ostype string (e.g. 'l26', 'win10', 'win11')
+        # Populated lazily from refresh_ip_cache and get_vm_config; injected into
+        # get_vm_resources() output so the sidebar can show OS-specific icons.
+        self._ostype_cache = {}
+        self._ostype_cache_lock = threading.Lock()
+
+        # update tracking
+        self.nodes_updating = {}
+        self.update_lock = threading.Lock()
+
+        # HA stuff - Added this
+        self.ha_enabled = getattr(config, "ha_enabled", False)
+        self.ha_check_interval = 10
+        self.ha_thread = None
+        self.ha_node_status = {}  # node -> status dict
+        self.ha_lock = threading.Lock()
+        self.ha_recovery_in_progress = {}
+
+        # load saved HA settings
+        saved_ha = getattr(config, "ha_settings", {}) or {}
+
+        self.ha_failure_threshold = saved_ha.get("failure_threshold", 3)
+
+        # split-brain stuff (complicated, dont touch)
+        self.ha_config = {
+            "quorum_enabled": saved_ha.get("quorum_enabled", True),
+            "quorum_hosts": saved_ha.get("quorum_hosts", []),
+            "quorum_gateway": saved_ha.get("quorum_gateway", ""),
+            "quorum_required_votes": saved_ha.get("quorum_required_votes", 2),
+            # self-fencing
+            "self_fence_enabled": saved_ha.get("self_fence_enabled", True),
+            "watchdog_enabled": saved_ha.get("watchdog_enabled", False),
+            # network checks
+            "verify_network_before_recovery": saved_ha.get("verify_network", True),
+            "network_check_hosts": saved_ha.get("network_check_hosts", []),
+            "network_check_required": saved_ha.get("network_check_required", 1),
+            # storage fencing
+            "storage_fence_enabled": saved_ha.get("storage_fence_enabled", False),
+            # storage heartbeat - safest for 2-node clusters
+            # Spent forever getting this to work right
+            "storage_heartbeat_enabled": saved_ha.get("storage_heartbeat_enabled", False),
+            "storage_heartbeat_path": saved_ha.get("storage_heartbeat_path", ""),
+            "storage_heartbeat_interval": saved_ha.get("storage_heartbeat_interval", 5),
+            "storage_heartbeat_timeout": saved_ha.get("storage_heartbeat_timeout", 30),
+            "poison_pill_enabled": saved_ha.get("poison_pill_enabled", True),
+            # ═══════════════════════════════════════════════════════════════
+            # DUAL-NETWORK PROTECTION
+            # For setups with separate Server and Storage networks!
+            # Auto-installs a small agent on each node that communicates
+            # via the storage network (survives server network failures)
+            # ═══════════════════════════════════════════════════════════════
+            "dual_network_mode": saved_ha.get("dual_network_mode", False),
+            "node_agent_installed": saved_ha.get("node_agent_installed", {}),  # node -> True/False
+            "self_fence_installed": saved_ha.get(
+                "self_fence_installed", False
+            ),  # Was missing, status got lost on restart
+            "self_fence_nodes": saved_ha.get("self_fence_nodes", []),  # List of nodes with agent installed
+            # Timing - defaults tuned for 3-node ceph setups (most common in the field)
+            # for 2-node with shared storage, recovery_delay should be higher (45-60)
+            # because the surviving node needs time to import the pool locks
+            "recovery_delay": saved_ha.get("recovery_delay", 30),  # seconds before recovery starts
+            "node_timeout": saved_ha.get("node_timeout", 60),  # node must be dead this long
+            "ssh_connect_timeout": saved_ha.get("ssh_connect_timeout", 10),  # ssh timeout per node
+            # ═══════════════════════════════════════════════════════════════
+            # 2-NODE CLUSTER MODE - Automatic quorum handling
+            # Uses cluster credentials (same as Proxmox API login) for SSH
+            # ═══════════════════════════════════════════════════════════════
+            "two_node_mode": saved_ha.get("two_node_mode", False),
+            "force_quorum_on_failure": saved_ha.get("force_quorum_on_failure", False),
+            # ═══════════════════════════════════════════════════════════════
+            # STRICT MODE - Maximum safety, may cause false positives
+            # ═══════════════════════════════════════════════════════════════
+            "strict_fencing": saved_ha.get("strict_fencing", False),  # Require successful fencing before recovery
+            "require_storage_heartbeat_confirm": saved_ha.get(
+                "require_storage_heartbeat_confirm", False
+            ),  # Must confirm via storage
+            # Node IPs (auto-discovered but can be overridden)
+            "node_ips": saved_ha.get("node_ips", {}),  # node_name -> ip
+        }
+
+        # Storage heartbeat tracking
+        self.ha_heartbeat_thread = None
+        self.ha_heartbeat_stop = threading.Event()
+        self.ha_last_heartbeat_write = None
+        self._cached_shared_storages: List[Dict[str, Any]] = []
+        self._cached_block_storages: List[Dict[str, Any]] = []
+
+        # Quorum tracking
+        self.ha_have_quorum = True  # Assume quorum until proven otherwise
+        self.ha_last_quorum_check: datetime | None = None
+
+        # Setup logging
+        self.logger = logging.getLogger(f"ProxmoxVEx_{config.name}")
+        self.logger.setLevel(logging.DEBUG)  # File gets everything
+        self.logger.propagate = False  # Don't propagate to root logger (prevents DEBUG spam)
+
+        # Clear existing handlers to prevent duplicates
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+
+        # File handler - DEBUG level (for troubleshooting). Capped at 3h of data,
+        # rotated content is discarded — see #345 / #348. 3h because 20+ node
+        # clusters can hit ~100 MB/h, 6h was still rough on small disks.
+        #
+        # (#357 SeeJayEmm): file handler is opt-out via env (operators
+        # shipping logs to a central collector don't want a local copy churning
+        # disk too) and level is configurable via ProxmoxVEx_FILE_LOG_LEVEL.
+        from ProxmoxVEx.constants import FILE_LOG_DISABLED as _FH_OFF
+        from ProxmoxVEx.constants import FILE_LOG_LEVEL as _FH_LVL
+
+        formatter = logging.Formatter("[%(asctime)s] [%(name)s] %(levelname)s: %(message)s")
+
+        if not _FH_OFF:
+            from ProxmoxVEx.utils.log_handler import CappedTimedFileHandler
+
+            fh = CappedTimedFileHandler(f"{LOG_DIR}/{cluster_id}.log", when="H", interval=3, backupCount=0)
+            fh.setLevel(_FH_LVL)
+            fh.setFormatter(formatter)
+            self.logger.addHandler(fh)
+
+        # Console handler — defaults to INFO so the systemd journal stays
+        # readable on busy clusters, but the operator can raise the floor via
+        # ProxmoxVEx_LOG_LEVEL.
+        # (#357 follow-up @SeeJayEmm) - earlier the per-cluster
+        # logger had `propagate=False` AND a hardcoded INFO StreamHandler, so
+        # ProxmoxVEx_LOG_LEVEL=WARNING only quieted the root logger; per-cluster
+        # INFO lines kept landing in journald. Honour the env var on the
+        # StreamHandler too: env-level wins iff it's stricter than INFO.
+        from ProxmoxVEx.constants import LOG_LEVEL as _ENV_LOG_LEVEL
+
+        ch = logging.StreamHandler()
+        _stream_level = logging.INFO
+        if _ENV_LOG_LEVEL is not None and _stream_level < _ENV_LOG_LEVEL:
+            _stream_level = _ENV_LOG_LEVEL
+        ch.setLevel(_stream_level)
+        ch.setFormatter(formatter)
+        self.logger.addHandler(ch)
+
+        # Proxmox API credentials (stored, not session)
+        self._ticket: str | None = None
+        self._csrf_token: str | None = None
+        self._api_token: str | None = None  # For API token auth (user@realm!tokenid=secret)
+        self._using_api_token = False
+        self.current_host: str | None = None  # Track which host we're connected to (resolved IP after #279)
+        self._original_host: str | None = None  # original hostname before DNS resolution
+        self._ssl_verify = False
+
+        # Connection state tracking
+        self.is_connected = False
+        self.session: bool | None = None  # legacy connection flag (True/None)
+        self.last_successful_request: datetime | None = None
+        self.connection_error: str | None = None
+        self._consecutive_failures = 0  # Track failed requests for smarter disconnect detection
+        self._disabled_check_counter = 0  # For checking connection even when disabled
+        self._last_reconnect_attempt = 0  # Throttle reconnection attempts in broadcast loop
+        self._consecutive_empty_responses = 0  # Detect stale tickets (connected but empty data)
+
+        # (#444) - auth-circuit-breaker. surreal70 reported a DoS where
+        # stale root creds made our workers spam /access/ticket until pveproxy
+        # locked out everything (including the legit Proxmox web UI). Three
+        # consecutive 401s → backoff schedule (60s → 5min → 30min). Reset on
+        # successful login.
+        self._auth_failures = 0
+        self._auth_blocked_until = 0.0  # epoch seconds
+        self._auth_failure_lock = threading.RLock()
+
+        # Per-node circuit-breaker. Same shape as auth-breaker,
+        # but keyed by node name. Stops UI hangs when a node is down: after 3
+        # consecutive timeouts we mark the node unreachable for 60s; fan-out
+        # queries (_get_node_ip, _pve_node_exec) bail immediately. Reset on
+        # any successful node-targeted call.
+        self._node_failures = {}  # node_name → int
+        self._node_blocked_until = {}  # node_name → epoch seconds
+        self._node_lock = threading.RLock()
+
+        # Per-host (login-target) failure cache for connect_to_proxmox host
+        # iteration. If primary 192.168.1.3 timed out 8 seconds ago, the next
+        # call should skip it and go straight to fallback rather than burn
+        # another 10s waiting for the same dead host.
+        self._host_last_failure = {}  # host_string → epoch seconds
+        self._host_failure_lock = threading.RLock()
+        self._host_skip_window = 60  # seconds to skip a host after a timeout
+
+        # Default timeouts for API requests. Cluster-wide aggregates
+        # (/cluster/resources, /cluster/status, /access/ticket) keep the
+        # longer 10s budget — PVE genuinely needs that on big clusters. But
+        # per-node calls (/nodes/<n>/status, rrd, network, agent) are
+        # cheaper and a dead node burns the full budget for nothing, so we
+        # tighten those to 4s by default.
+        self.api_timeout = 10
+        self.per_node_timeout = 4
+
+        # Lock for connection operations
+        self._connect_lock = threading.Lock()
+
+    def _create_session(self):
+        """
+        Return a per-manager keep-alive requests session (cached).
+
+        """
+        auth_key = (
+            getattr(self, "_api_token", None),
+            getattr(self, "_ticket", None),
+            getattr(self, "_csrf_token", None),
+            bool(self._ssl_verify),
+        )
+        cached = getattr(self, "_session_cache", None)
+        if cached is not None and getattr(self, "_session_auth_key", None) == auth_key:
+            return cached
+        # auth changed (or first build) — drop the old session's connections
+        if cached is not None:
+            with contextlib.suppress(Exception):
+                cached.close()
+
+        session = requests.Session()
+        # Never route cluster API calls through an ambient proxy.
+        session.trust_env = False
+        # Keep-alive pool. pool_block=False => an excess concurrent request opens
+        _pool_kw = {
+            # Fewer idle connections: PVE drops idle keep-alives quickly,
+            # so a huge pool just accumulates dead sockets that get reset.
+            "pool_connections": 1,
+            "pool_maxsize": 32,
+            "pool_block": False,
+            "max_retries": Retry(connect=2, read=0, other=0),
+        }
+        # Use system CA store when verifying - certifi bundle doesn't include custom CAs
+        if self._ssl_verify:
+            _ca = ssl.get_default_verify_paths()
+            session.verify = _ca.cafile or _ca.openssl_cafile or True
+            session.mount("https://", _PVEAdapter(**_pool_kw))
+        else:
+            session.verify = False
+            session.mount("https://", _NoHostnameCheckAdapter(**_pool_kw))  # Fix for IP-based hosts
+
+        if getattr(self, "_api_token", None):
+            # API Token auth - use Authorization header
+            session.headers.update({"Authorization": f"PVEAPIToken={self._api_token}"})
+        else:
+            # Password auth - use ticket cookie
+            if self._ticket:
+                session.cookies.set("PVEAuthCookie", self._ticket)
+            if self._csrf_token:
+                session.headers.update({"CSRFPreventionToken": self._csrf_token})
+
+        # Explicit keep-alive makes PVE more likely to leave the HTTPS
+        # connection open, so urllib3 reuses it instead of resetting.
+        session.headers.update({"Connection": "keep-alive"})
+
+        # Default-timeout safety net for the whole codebase.
+        _original_request = session.request
+
+        def _request_with_default_timeout(method, url, **kwargs):
+            if "timeout" not in kwargs or kwargs.get("timeout") is None:
+                kwargs["timeout"] = 15  # 15 s is plenty for any PVE API call
+            return _original_request(method, url, **kwargs)
+
+        session.request = _request_with_default_timeout
+
+        self._session_cache = session
+        self._session_auth_key = auth_key
+        return session
+
+    @staticmethod
+    def _bracket_ipv6(h):
+        """Wrap IPv6 addresses in brackets for URL construction (#145)"""
+        if h and ":" in h and not h.startswith("["):
+            return f"[{h}]"
+        return h
+
+    @staticmethod
+    def _resolve_host(hostname):
+        """Resolve hostname to IP once — avoids repeated DNS lookups (#279)
+        User reported 1M+ DNS queries/day from a single cluster.
+        Every _create_session() call triggered a fresh lookup if host was a name.
+        """
+        import socket
+
+        try:
+            results = socket.getaddrinfo(hostname, 8006, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            if results:
+                # prefer IPv4 over IPv6 for compatibility
+                for family, _, _, _, addr in results:
+                    if family == socket.AF_INET:
+                        return addr[0]
+                return results[0][4][0]
+        except socket.gaierror:
+            pass
+        return hostname
+
+    @property
+    def host(self) -> str:
+        """Host formatted for URL use — IPv6 gets brackets"""
+        h = self.current_host or self.config.host
+        return self._bracket_ipv6(h)
+
+    @property
+    def raw_host(self) -> str:
+        """Raw host/IP without brackets — for SSH, DNS lookups etc."""
+        return self.current_host or self.config.host
+
+    @property
+    def api_port(self) -> int:
+        """Proxmox API port — defaults to 8006 but overridable per-cluster.
+        Added so deployments with non-standard PVE listen ports
+        (firewall constraints, jumpbox setups) can use ProxmoxVEx without
+        forcing a reverse-proxy in front of PVE (which would terminate TLS
+        and create a MitM-able intermediate hop)."""
+        return getattr(self.config, "api_port", 8006)
+
+    @property
+    def nodes(self) -> dict:
+        """Return cached node status dict (node_name -> info). Lazy-populated with 30s TTL."""
+        now = time.time()
+        if self._cached_node_dict and hasattr(self, "_nodes_cache_time") and (now - self._nodes_cache_time) < 30:
+            return self._cached_node_dict
+        if not self.is_connected or not self.session:
+            return self._cached_node_dict or {}
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes"
+            resp = self._api_get(url)
+            if resp.status_code == 200:
+                self._cached_node_dict = {n["node"]: n for n in resp.json().get("data", [])}
+                self._nodes_cache_time = now
+                return self._cached_node_dict
+        except Exception:
+            pass
+        return self._cached_node_dict or {}
+
+    @property
+    def ticket(self) -> str | None:
+        return self._ticket
+
+    # (#444) - circuit breaker. Backoff schedule kicks in after
+    # 3 consecutive 401s so we don't let stale-cred storms spam pveproxy until
+    # its own brute-force-protection locks out the legit Proxmox web UI.
+    def _register_auth_failure(self):
+        with self._auth_failure_lock:
+            self._auth_failures += 1
+            if self._auth_failures >= 10:
+                backoff = 1800  # 30 min — admin clearly hasn't reconfigured
+            elif self._auth_failures >= 5:
+                backoff = 300  # 5 min
+            elif self._auth_failures >= 3:
+                backoff = 60  # 1 min
+            else:
+                return
+            self._auth_blocked_until = time.time() + backoff
+            self.connection_error = (
+                f"Authentication blocked for {backoff}s after {self._auth_failures} "
+                f"consecutive 401s — verify credentials and run Reconfigure"
+            )
+            self.logger.warning(
+                f"[AUTH] cluster '{self.config.name}' blocked for {backoff}s "
+                f"after {self._auth_failures} consecutive auth failures"
+            )
+
+    def _reset_auth_failures(self):
+        with self._auth_failure_lock:
+            if self._auth_failures:
+                self.logger.info(
+                    f"[AUTH] cluster '{self.config.name}' auth recovered after {self._auth_failures} failures"
+                )
+            self._auth_failures = 0
+            self._auth_blocked_until = 0.0
+
+    # Per-node circuit breaker. Same backoff curve as the auth
+    # breaker so the math + log shape stay familiar. Keyed by *node name*
+    # (the PVE node identifier, e.g. 'pve1'), not host IP — node name is what
+    # _get_node_ip / _pve_node_exec take as their primary arg.
+    def _register_node_failure(self, node_name):
+        if not node_name:
+            return
+        with self._node_lock:
+            count = self._node_failures.get(node_name, 0) + 1
+            self._node_failures[node_name] = count
+            if count >= 10:
+                backoff = 1800
+            elif count >= 5:
+                backoff = 300
+            elif count >= 3:
+                backoff = 60
+            else:
+                return
+            self._node_blocked_until[node_name] = time.time() + backoff
+            self.logger.warning(
+                f"[NODE] cluster '{self.config.name}' node '{node_name}' "
+                f"blocked for {backoff}s after {count} consecutive failures"
+            )
+
+    def _reset_node_failures(self, node_name):
+        if not node_name:
+            return
+        with self._node_lock:
+            prior = self._node_failures.pop(node_name, 0)
+            self._node_blocked_until.pop(node_name, None)
+            if prior:
+                self.logger.info(
+                    f"[NODE] cluster '{self.config.name}' node '{node_name}' recovered after {prior} failures"
+                )
+
+    def _is_node_blocked(self, node_name):
+        """Returns (blocked: bool, remaining_seconds: int) for the given node name."""
+        if not node_name:
+            return False, 0
+        with self._node_lock:
+            until = self._node_blocked_until.get(node_name, 0)
+            now = time.time()
+            if now < until:
+                return True, int(until - now)
+        return False, 0
+
+    # Per-host failure cache for connect_to_proxmox host iteration. We don't
+    # need the full backoff machinery here — just "did this host time out
+    # very recently? skip it for the next minute".
+    def _mark_host_failure(self, host):
+        if not host:
+            return
+        with self._host_failure_lock:
+            self._host_last_failure[host] = time.time()
+            self.logger.debug(f"[HOST] '{host}' marked cold; will skip for {self._host_skip_window}s")
+
+    def _host_recently_failed(self, host):
+        if not host:
+            return False
+        with self._host_failure_lock:
+            ts = self._host_last_failure.get(host, 0)
+            return (time.time() - ts) < self._host_skip_window
+
+    def _clear_host_failure(self, host):
+        if not host:
+            return
+        with self._host_failure_lock:
+            self._host_last_failure.pop(host, None)
+
+    def _is_auth_blocked(self):
+        """Check the backoff window. Returns (blocked: bool, remaining_seconds: int)."""
+        with self._auth_failure_lock:
+            now = time.time()
+            if now < self._auth_blocked_until:
+                return True, int(self._auth_blocked_until - now)
+        return False, 0
+
+    # All API methods go through these wrappers for consistent error handling
+    # Fixed timeout handling, was marking cluster offline too eagerly
+    # Instrumented for the API latency dashboard. Cheap (deque, monotonic).
+    def _record_api_sample(self, method, url, duration_ms, status):
+        try:
+            from collections import deque
+            from urllib.parse import urlparse
+
+            if not hasattr(self, "_api_latency") or self._api_latency is None:
+                self._api_latency = deque(maxlen=500)
+            # template the path: /api2/json/nodes/foo/qemu/100/status → /nodes/{node}/qemu/{id}/status
+            try:
+                p = urlparse(url)
+                segs = [s for s in p.path.split("/") if s and s not in ("api2", "json")]
+                # crude templating: digits → {id}, second seg after type → {name}
+                tpl = []
+                for i, s in enumerate(segs):
+                    if s.isdigit():
+                        tpl.append("{id}")
+                    elif i > 0 and segs[i - 1] in ("nodes", "storage", "pools", "sdn"):
+                        tpl.append("{name}")
+                    else:
+                        tpl.append(s)
+                ep = "/" + "/".join(tpl) if tpl else p.path[:60]
+            except Exception:
+                ep = url[:60]
+            self._api_latency.append({
+                "method": method,
+                "endpoint": ep,
+                "duration_ms": float(duration_ms),
+                "status": int(status) if status else 0,
+                "ts": time.time(),
+            })
+        except Exception:
+            pass  # never let metrics break the request
+
+    def _api_get(self, url, **kwargs):
+        kwargs.setdefault("timeout", self.api_timeout)
+        t0 = time.monotonic()
+        try:
+            session = self._create_session()
+            response = session.get(url, **kwargs)
+            # Track connection state for UI
+            self.is_connected = True
+            self.last_successful_request = datetime.now()
+            self.connection_error = None
+            self._consecutive_failures = 0  # reset failure counter on success
+            self._record_api_sample("GET", url, (time.monotonic() - t0) * 1000.0, response.status_code)
+            # (#444) - PVE rejected the ticket. Invalidate locally so the
+            # next call has to re-login (which the circuit breaker will gate).
+            if response.status_code == 401:
+                self._ticket = None
+                self._csrf_token = None
+                self._register_auth_failure()
+            return response
+        except requests.exceptions.Timeout as e:
+            # Timeout != offline. Proxmox might just be slow (happens a lot with ZFS)
+            self.connection_error = f"Request timed out: {e}"
+            self._record_api_sample("GET", url, (time.monotonic() - t0) * 1000.0, 0)
+            raise
+        except requests.exceptions.ConnectionError as e:
+            # Only mark disconnected after 3 consecutive failures to avoid flapping
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self.is_connected = False
+                self.connection_error = str(e)
+            self._record_api_sample("GET", url, (time.monotonic() - t0) * 1000.0, 0)
+            raise
+
+    def _api_post(self, url, **kwargs):
+        kwargs.setdefault("timeout", self.api_timeout)
+        t0 = time.monotonic()
+        try:
+            sess = self._create_session()
+            resp = sess.post(url, **kwargs)
+            self.is_connected = True
+            self.last_successful_request = datetime.now()
+            self.connection_error = None
+            self._consecutive_failures = 0
+            self._auto_capture_upid(resp)  # Bind PVE task to ProxmoxVEx user
+            self._record_api_sample("POST", url, (time.monotonic() - t0) * 1000.0, resp.status_code)
+            if resp.status_code == 401:
+                self._ticket = None
+                self._csrf_token = None
+                self._register_auth_failure()
+            return resp
+        except requests.exceptions.Timeout as e:
+            # Timeout does NOT mean cluster is offline
+            self.connection_error = f"Request timed out: {e}"
+            self._record_api_sample("POST", url, (time.monotonic() - t0) * 1000.0, 0)
+            raise
+        except requests.exceptions.ConnectionError as e:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self.is_connected = False
+                self.connection_error = str(e)
+            self._record_api_sample("POST", url, (time.monotonic() - t0) * 1000.0, 0)
+            raise
+
+    def _api_put(self, url, **kwargs):
+        kwargs.setdefault("timeout", self.api_timeout)
+        t0 = time.monotonic()
+        try:
+            session = self._create_session()
+            response = session.put(url, **kwargs)
+            self.is_connected = True
+            self.last_successful_request = datetime.now()
+            self.connection_error = None
+            self._consecutive_failures = 0
+            self._auto_capture_upid(response)
+            self._record_api_sample("PUT", url, (time.monotonic() - t0) * 1000.0, response.status_code)
+            if response.status_code == 401:
+                self._ticket = None
+                self._csrf_token = None
+                self._register_auth_failure()
+            return response
+        except requests.exceptions.Timeout as e:
+            # Timeout does NOT mean cluster is offline - operation might have succeeded
+            self.connection_error = f"Request timed out: {e}"
+            self.logger.warning(f"[WARN] API PUT timeout (not marking offline): {e}")
+            self._record_api_sample("PUT", url, (time.monotonic() - t0) * 1000.0, 0)
+            raise
+        except requests.exceptions.ConnectionError as e:
+            # Real connection error - only mark offline after multiple failures
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self.is_connected = False
+                self.connection_error = str(e)
+            self._record_api_sample("PUT", url, (time.monotonic() - t0) * 1000.0, 0)
+            raise
+
+    def _api_delete(self, url, **kwargs):
+        # same as put but delete
+        kwargs.setdefault("timeout", self.api_timeout)
+        t0 = time.monotonic()
+        try:
+            session = self._create_session()
+            r = session.delete(url, **kwargs)
+            self.is_connected = True
+            self.last_successful_request = datetime.now()
+            self.connection_error = None
+            self._consecutive_failures = 0
+            self._auto_capture_upid(r)
+            self._record_api_sample("DELETE", url, (time.monotonic() - t0) * 1000.0, r.status_code)
+            return r
+        except requests.exceptions.Timeout as e:
+            # Timeout does NOT mean cluster is offline
+            self.connection_error = f"Request timed out: {e}"
+            self.logger.warning(f"[WARN] API DELETE timeout (not marking offline): {e}")
+            self._record_api_sample("DELETE", url, (time.monotonic() - t0) * 1000.0, 0)
+            raise
+        except requests.exceptions.ConnectionError as e:
+            # Real connection error - only mark offline after multiple failures
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 3:
+                self.is_connected = False
+                self.connection_error = str(e)
+            self._record_api_sample("DELETE", url, (time.monotonic() - t0) * 1000.0, 0)
+            raise
+
+    def _auto_capture_upid(self, response):
+        """every PVE write call that creates an async task returns
+        a UPID in `data` (e.g. `UPID:pve1:000ABC:0123:...:qmstart:100:root@pam!tok:`).
+        Sniff it on the way back, look up the calling ProxmoxVEx user from the Flask
+        request context, persist the binding. Catches every endpoint that doesn't
+        manually call register_task_user — which is the long tail (snapshots,
+        config edits, migrations, replication runs, …). Any failure here MUST
+        be silent — never break the API call itself.
+        """
+        try:
+            if response is None or response.status_code >= 300:
+                return
+            ct = response.headers.get("Content-Type", "") if hasattr(response, "headers") else ""
+            if "json" not in ct.lower():
+                return
+            body = response.json()
+            if not isinstance(body, dict):
+                return
+            data = body.get("data")
+            # PVE tasks: data is a UPID string starting with "UPID:"
+            if not isinstance(data, str) or not data.startswith("UPID:"):
+                return
+            from flask import has_request_context, request
+
+            if not has_request_context():
+                return
+            sess = getattr(request, "session", None) or {}
+            username = sess.get("user") if isinstance(sess, dict) else None
+            if not username:
+                return
+            from ProxmoxVEx.api.helpers import register_task_user
+
+            register_task_user(data, username, self.id)
+        except Exception:
+            pass
+
+    def api_request(self, method: str, endpoint: str, data: dict = None):
+        """generic api request wrapper"""
+        url = f"https://{self.host}:{self.api_port}/api2/json{endpoint}"
+
+        try:
+            if method.upper() == "GET":
+                r = self._api_get(url, verify=self._ssl_verify)
+            elif method.upper() == "POST":
+                r = self._api_post(url, json=data, verify=self._ssl_verify)
+            elif method.upper() == "PUT":
+                r = self._api_put(url, json=data, verify=self._ssl_verify)
+            elif method.upper() == "DELETE":
+                r = self._api_delete(url, verify=self._ssl_verify)
+            else:
+                self.logger.error(f"Unknown HTTP method: {method}")
+                return None
+
+            if r.status_code == 200:
+                return r.json().get("data")
+            else:
+                self.logger.warning(f"API request failed: {method} {endpoint} -> {r.status_code}")
+                return None
+
+        except Exception as e:
+            self.logger.error(f"API request error: {method} {endpoint} -> {e}")
+            return None
+
+    def connect_to_proxmox(self) -> bool:
+        # connect with fallback
+        with self._connect_lock:
+            # (#444) - bail BEFORE we hit the network if the
+            # circuit breaker has us in a backoff window. Avoids the
+            # stale-cred login storm against pveproxy.
+            blocked, remaining = self._is_auth_blocked()
+            if blocked:
+                self.logger.debug(
+                    f"[AUTH] cluster '{self.config.name}': skipping login attempt, "
+                    f"blocked for another {remaining}s ({self._auth_failures} prior failures)"
+                )
+                self.is_connected = False
+                return False
+
+            # Clear stale IPs/disk so reconnect doesn't serve old data
+            with self._ip_cache_lock:
+                self._ip_cache.clear()
+            with self._disk_cache_lock:
+                self._disk_cache.clear()
+            # N-1 (regression fix): also drop the short node-status/tasks result
+            # caches so the post-reconnect "flip to online" push isn't served a
+            # ≤5s-old pre-disconnect snapshot (could show a node still offline).
+            self._node_status_cache: tuple[float, dict] | None = None
+            self._tasks_cache: dict = {}
+
+            # Build list of hosts to try: primary first, then fallbacks
+            hosts_to_try = [self.config.host] + (self.config.fallback_hosts or [])
+
+            self._ssl_verify = self.config.ssl_verification
+            if not self._ssl_verify and not getattr(self, "_ssl_warn_shown", False):
+                self.logger.warning(
+                    f"[SECURITY] SSL verification disabled for cluster '{self.config.name}' — vulnerable to MITM"
+                )
+                self._ssl_warn_shown = True
+
+            # Check if using API Token (format: user@realm!tokenid)
+            # API tokens have ! in the username, passwords don't
+            self._using_api_token = "!" in self.config.user
+            self._token_auto_created = False
+
+            # Prefer stored API token over password auth
+            # this lets 2FA users keep working after token was auto-created on first connect
+            _stored_token = False
+            if self.config.api_token_user and self.config.api_token_secret:
+                _stored_token = True
+                self._using_api_token = True
+                self._api_token = f"{self.config.api_token_user}={self.config.api_token_secret}"
+
+            # (#444) - track 401 across the host loop. If primary
+            # returned 401 the fallbacks will too (same creds), no point hitting
+            # each node and inflating pveproxy's failed-login counter.
+            auth_failed_401 = False
+
+            # (dead-node hang) - skip hosts that timed out in the
+            # last 60s. Without this, on a 3-host cluster where the primary
+            # went dark, every connect_to_proxmox() call (background workers,
+            # UI polls) wastes 10s on the dead primary before reaching the
+            # working fallback. If ALL hosts are recently-cold we still try
+            # them so the breaker eventually self-clears.
+            warm_hosts = [h for h in hosts_to_try if not self._host_recently_failed(h)]
+            if warm_hosts:
+                if len(warm_hosts) < len(hosts_to_try):
+                    cold = [h for h in hosts_to_try if h not in warm_hosts]
+                    self.logger.debug(f"[connect] skipping recently-cold hosts: {cold}")
+                hosts_to_try = warm_hosts
+
+            for host in hosts_to_try:
+                try:
+                    # Create a temporary session just for login
+                    session = requests.Session()
+                    if self._ssl_verify:
+                        _ca = ssl.get_default_verify_paths()
+                        session.verify = _ca.cafile or _ca.openssl_cafile or True
+                    else:
+                        session.verify = False
+                    if not self._ssl_verify:
+                        session.mount("https://", _NoHostnameCheckAdapter())  #
+
+                    if self._using_api_token:
+                        # API Token auth - no ticket needed!
+                        # Token goes in Authorization header: PVEAPIToken=user@realm!tokenid=secret
+                        if not _stored_token:
+                            self._api_token = f"{self.config.user}={self.config.pass_}"
+                        self._ticket = None
+                        self._csrf_token = None
+
+                        # Test the token by making a simple API call
+                        test_url = f"https://{self._bracket_ipv6(host)}:{self.api_port}/api2/json/version"
+                        headers = {"Authorization": f"PVEAPIToken={self._api_token}"}
+                        resp = session.get(test_url, headers=headers, timeout=10)
+
+                        if resp.status_code == 200:
+                            # resolve hostname → IP to avoid repeated DNS lookups (#279)
+                            # but only when ssl_verify is off — with ssl on, cert CN needs the hostname
+                            if not self._ssl_verify:
+                                resolved = self._resolve_host(host)
+                                if resolved != host:
+                                    self.logger.info(f"Resolved {host} → {resolved} (caching IP)")
+                                self.current_host = resolved
+                            else:
+                                self.current_host = host
+                            self._original_host = host
+                            if hasattr(self, "_cached_mgmt_iface"):
+                                self._cached_mgmt_iface = None
+                                self._cached_mgmt_network = None
+                                self._cached_mgmt_vlan = None
+                            self.is_connected = True
+                            self.last_successful_request = datetime.now()
+                            self.connection_error = None
+                            self.session = True
+
+                            self.logger.info(f"Connected to Proxmox at {host} using API Token")
+                            self._reset_auth_failures()  #
+                            self._clear_host_failure(host)  # Host is warm again
+
+                            if not self.config.fallback_hosts:
+                                self._auto_discover_fallback_hosts()
+
+                            return True
+                        else:
+                            self.logger.warning(f"API Token auth failed at {host}: {resp.status_code}")
+                            # Stored token got revoked on PVE? fall back to password
+                            if _stored_token and resp.status_code in (401, 403):
+                                self.logger.info("Stored API token rejected, trying password auth")
+                                self._using_api_token = False
+                                self._api_token = None
+                                _stored_token = False
+                                # fall through to password path below
+
+                    if not self._using_api_token:
+                        # Password auth - get ticket from /access/ticket
+                        login_data = {"username": self.config.user, "password": self.config.pass_}
+                        # print(f"DEBUG: trying {host}")  # dont commit this
+
+                        login_url = f"https://{self._bracket_ipv6(host)}:{self.api_port}/api2/json/access/ticket"
+                        resp = session.post(login_url, data=login_data, timeout=10)
+
+                        if resp.status_code == 200:
+                            data = resp.json()["data"]
+                            self._ticket = data["ticket"]
+                            self._csrf_token = data["CSRFPreventionToken"]
+                            self._api_token = None
+
+                            if not self._ssl_verify:
+                                resolved = self._resolve_host(host)
+                                if resolved != host:
+                                    self.logger.info(f"Resolved {host} → {resolved} (caching IP)")
+                                self.current_host = resolved
+                            else:
+                                self.current_host = host
+                            self._original_host = host
+                            if hasattr(self, "_cached_mgmt_iface"):
+                                self._cached_mgmt_iface = None
+                                self._cached_mgmt_network = None
+                                self._cached_mgmt_vlan = None
+                            self.is_connected = True
+                            self.last_successful_request = datetime.now()
+                            self.connection_error = None
+
+                            # For backward compatibility - some code still checks self.session
+                            # This is ugly but works, passt eh
+                            self.session = True  # Just a truthy value
+
+                            if host != self.config.host:
+                                self.logger.warning(
+                                    f"Connected to FALLBACK host {host} (primary {self.config.host} unavailable)"
+                                )
+                            else:
+                                self.logger.info(f"Successfully connected to Proxmox at {host}")
+
+                            # Auto-discover fallback hosts if not already set
+                            if not self.config.fallback_hosts:
+                                self._auto_discover_fallback_hosts()
+
+                            # Auto-create API token so 2FA won't lock us out later
+                            if not self.config.api_token_user:
+                                self._try_create_api_token(session, host)
+
+                            self._reset_auth_failures()  #
+                            self._clear_host_failure(host)  # Host is warm again
+                            return True
+                        elif resp.status_code == 401:
+                            # (#444) - stale creds. Don't try fallbacks
+                            # (same user/pass → same outcome, just more failed
+                            # logins for pveproxy to count against us). Mark + bail.
+                            self.logger.warning(f"Auth failed at {host} (401) — skipping remaining hosts")
+                            self.connection_error = (
+                                "Authentication failed — if 2FA is enabled, use an API token (user@realm!tokenid)"
+                            )
+                            auth_failed_401 = True
+                            break
+                        else:
+                            self.logger.warning(f"Failed to login to Proxmox at {host}: {resp.status_code}")
+                            # self.logger.debug(f"Response body: {resp.text}")  # too verbose
+
+                except requests.exceptions.Timeout:
+                    self.logger.warning(f"Connection timeout to {host}")
+                    self.is_connected = False
+                    self.connection_error = f"Timeout connecting to {host}"
+                    self._mark_host_failure(host)  # skip on next call for _host_skip_window
+                except requests.exceptions.SSLError as ssl_err:
+                    # Separate SSL errors so the user actually knows what went wrong
+                    self.logger.warning(f"SSL error connecting to {host}: {ssl_err}")
+                    self.is_connected = False
+                    self.connection_error = (
+                        f"SSL error connecting to {host} - check certificate or try hostname instead of IP"
+                    )
+                    # SSL errors are usually a config problem, not host-down — still mark
+                    # the host so we don't burn the timeout repeatedly while admin fixes it
+                    self._mark_host_failure(host)
+                except requests.exceptions.ConnectionError:
+                    self.logger.warning(f"Cannot connect to {host}")
+                    self.is_connected = False
+                    self.connection_error = f"Cannot connect to {host}"
+                    self._mark_host_failure(host)
+                except Exception as e:
+                    self.logger.warning(f"Error connecting to {host}: {e}")
+                    self.is_connected = False
+                    self.connection_error = str(e)
+
+            # (#444) - if the loop exited because of a 401 (not a
+            # network failure), count it against the auth circuit breaker.
+            # Network errors don't get counted — they're not credentials-related.
+            if auth_failed_401:
+                self._register_auth_failure()
+            else:
+                self.logger.error(f"Failed to connect to any Proxmox host (tried {len(hosts_to_try)} hosts)")
+            self.is_connected = False
+            return False
+
+    def _auto_discover_fallback_hosts(self):
+        # find other nodes in cluster
+        try:
+            h = self.host
+            url = f"https://{h}:{self.api_port}/api2/json/nodes"
+            r = self._create_session().get(url, timeout=10)
+
+            if r.status_code != 200:
+                return
+
+            nodes = r.json().get("data", [])
+            discovered = []
+
+            for node in nodes:
+                node_name = node.get("node")
+                if node.get("status") == "online":
+                    node_ip = self._get_node_ip(node_name)
+                    if node_ip and node_ip != self.config.host:
+                        # _get_node_ip already does reachability probing
+                        discovered.append(node_ip)
+                        self.logger.info(f"Fallback host discovered: {node_name} -> {node_ip}")
+
+            if discovered:
+                self.config.fallback_hosts = discovered
+                self.logger.info(f"Auto-discovered {len(discovered)} fallback hosts: {discovered}")
+                save_config()
+            else:
+                self.logger.info(
+                    "No reachable fallback hosts discovered (all nodes unreachable or single-node cluster)"
+                )
+
+        except Exception as e:
+            self.logger.debug(f"Could not auto-discover fallback hosts: {e}")
+
+    def _try_create_api_token(self, session, host):
+        """Auto-create a PVE API token so REST auth survives 2FA being enabled later.
+        SSH keeps using the password regardless. -"""
+        try:
+            user = self.config.user  # e.g. root@pam
+            import random
+            import string
+
+            suffix = "".join(random.choices(string.digits, k=6))
+            token_id = f"ProxmoxVEx_{suffix}"
+            url = f"https://{host}:{self.api_port}/api2/json/access/users/{user}/token/{token_id}"
+            # Need to set ticket cookie on login session, it only has it in the response not as a cookie
+            session.cookies.set("PVEAuthCookie", self._ticket)
+            headers = {"CSRFPreventionToken": self._csrf_token}
+            payload = {"privsep": "0", "expire": "0", "comment": "ProxmoxVEx management token"}
+
+            resp = session.post(url, data=payload, headers=headers, timeout=10)
+
+            if resp.status_code == 200:
+                token_data = resp.json().get("data", {})
+                full_tokenid = token_data.get("full-tokenid", f"{user}!{token_id}")
+                secret = token_data.get("value", "")
+
+                if secret:
+                    self.config.api_token_user = full_tokenid
+                    self.config.api_token_secret = secret
+                    # switch REST to token auth, keep password for SSH
+                    self._api_token = f"{full_tokenid}={secret}"
+                    self._using_api_token = True
+                    self._ticket = None
+                    self._csrf_token = None
+                    self._token_auto_created = True
+                    # persist to DB
+                    try:
+                        db = get_db()
+                        db.update_cluster(
+                            self.id,
+                            {
+                                "api_token_user": full_tokenid,
+                                "api_token_secret_encrypted": db._encrypt(secret),
+                            },
+                        )
+                    except Exception:
+                        pass  # Non-critical, token still works in memory for this session
+                    self.logger.info(f"Auto-created API token {full_tokenid} for 2FA safety")
+                    save_config()
+            elif resp.status_code == 400:
+                # token already exists, try to use it (user might have created it manually)
+                self.logger.debug(f"API token '{token_id}' already exists for {user}")
+            else:
+                # 403 = no permission, 5xx = PVE issue - just continue with password
+                self.logger.debug(f"Could not create API token: HTTP {resp.status_code}")
+        except Exception as e:
+            self.logger.debug(f"API token creation failed (non-critical): {e}")
+
+    def _get_api_url(self, path: str) -> str:
+        host = self.host
+        return f"https://{host}:{self.api_port}/api2/json{path}"
+
+    def get_node_status(self) -> Dict[str, Any]:
+        # gets node status, calculates load score
+        # Made this parallel, was super slow before
+        if not self.is_connected or not self.session:
+            # return cached ha status if disconnected
+            if self.ha_node_status:
+                return {
+                    name: {
+                        "status": data.get("status", "offline"),
+                        "cpu_percent": 0,
+                        "mem_percent": 0,
+                        "mem_used": 0,
+                        "mem_total": 0,
+                        "disk_percent": 0,
+                        "disk_used": 0,
+                        "disk_total": 0,
+                        "netin": 0,
+                        "netout": 0,
+                        "score": 0,
+                        "uptime": 0,
+                        "offline": data.get("status") == "offline",
+                        "last_seen": data.get("last_seen").isoformat() if data.get("last_seen") else None,
+                    }
+                    for name, data in self.ha_node_status.items()
+                }
+            return {}
+
+        # 2026-06-05 (#528 scaling): short result cache. get_node_status
+        # fans out 2 HTTP calls PER NODE; the broadcast loop calls it every ~1s
+        # per cluster, so at 100+ nodes that's a per-second node-poll storm (it
+        # never used the existing nodes-TTL). Reuse a recent result instead.
+        # Default 5s, PROXMOXVEX_NODE_STATUS_TTL=0 disables.
+        _ns_ttl = getattr(self, "_node_status_ttl", None)
+        if _ns_ttl is None:
+            try:
+                _ns_ttl = float(os.environ.get("PROXMOXVEX_NODE_STATUS_TTL", "5"))
+            except (TypeError, ValueError):
+                _ns_ttl = 5.0
+            self._node_status_ttl = _ns_ttl
+        if _ns_ttl > 0:
+            _ns_ent = getattr(self, "_node_status_cache", None)
+            if _ns_ent and _ns_ent[1] and (time.monotonic() - _ns_ent[0]) < _ns_ttl:
+                return _ns_ent[1]
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                nodes = response.json()["data"]
+                node_status = {}
+
+                # Recovery path for the per-node circuit breaker.
+                # /api2/json/nodes is PVE's cluster-wide aggregate; Corosync
+                # propagates rejoin within 1-2s so this is the ground truth
+                # for "is the node back?". If PVE says status=online for a
+                # node we currently have blocked, clear the breaker so the
+                # very next call hits it again instead of waiting out the
+                # full backoff window. Avoids the 60s/5min/30min UI-lag-on-
+                # node-recovery that the passive backoff alone would give.
+                for n in nodes:
+                    nname = n.get("node")
+                    if not nname:
+                        continue
+                    if n.get("status") == "online":
+                        with self._node_lock:
+                            had_block = nname in self._node_blocked_until or nname in self._node_failures
+                        if had_block:
+                            self.logger.info(
+                                f"[NODE] cluster '{self.config.name}' observed '{nname}' "
+                                f"back online via /nodes aggregate — clearing breaker"
+                            )
+                            self._reset_node_failures(nname)
+
+                # (#419, SpyrosPsarras): previous version queried
+                # /cluster/resources?type=node and read netin/netout off the
+                # returned records — but those keys only exist on type=vm rows,
+                # so the dashboard's Network In/Out columns were always 0.
+                # Real per-node throughput lives in /nodes/{name}/rrddata as a
+                # rate (bytes/sec, AVERAGE over the timeframe step). Fold the
+                # RRD fetch into fetch_node_details() so it rides the same
+                # parallel pool as the status call and walls don't double.
+                api_nodes = set()
+
+                def fetch_node_details(node):
+                    node_name = node["node"]
+                    status_data = None
+                    netio = (0, 0)  # (netin, netout) bytes/sec, fall back to 0
+
+                    # If PVE's cluster-wide /nodes already says this node is not
+                    # online, don't waste HTTP retries and gevent pool slots on
+                    # a per-node call that will just fail or time out.
+                    if node.get("status") != "online":
+                        return (node_name, node, None, netio)
+
+                    # Short-circuit nodes in breaker backoff so a
+                    # dead node doesn't burn the full per-node timeout × every
+                    # poll cycle. UI just sees no fresh status_data and renders
+                    # the node as offline from ha_node_status fallback.
+                    blocked, _rem = self._is_node_blocked(node_name)
+                    if blocked:
+                        return (node_name, node, None, netio)
+
+                    sess = self._create_session()
+                    try:
+                        status_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name}/status"
+                        # Short connect timeout so a dead node fails fast while
+                        # keeping the full per_node_timeout for data reads.
+                        sr = sess.get(status_url, timeout=(1, self.per_node_timeout))
+                        if sr.status_code == 200:
+                            status_data = sr.json()["data"]
+                            self._reset_node_failures(node_name)
+                        elif sr.status_code == 595 or sr.status_code >= 500:
+                            # 595 is PVE's "node unreachable" sentinel for proxied per-node calls
+                            self._register_node_failure(node_name)
+                    except Exception:
+                        self._register_node_failure(node_name)
+
+                    # RRD pull — only attempt if status came back (no point
+                    # spending an HTTP roundtrip on a clearly-dead node).
+                    if status_data is not None:
+                        try:
+                            rrd_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name}/rrddata"
+                            rr = sess.get(
+                                rrd_url,
+                                params={"timeframe": "hour", "cf": "AVERAGE"},
+                                timeout=(1, self.per_node_timeout),
+                            )
+                            if rr.status_code == 200:
+                                samples = rr.json().get("data", []) or []
+                                # walk back for the most recent sample that has BOTH netin and netout
+                                # populated — RRD step is 60s for the 'hour' timeframe so the last
+                                # 1-2 samples are usually still null while PVE is averaging.
+                                for s in reversed(samples):
+                                    if s is None:
+                                        continue
+                                    ni = s.get("netin")
+                                    no = s.get("netout")
+                                    if ni is not None and no is not None:
+                                        netio = (ni, no)
+                                        break
+                        except Exception:
+                            pass
+                    return (node_name, node, status_data, netio)
+
+                # parallel if available
+                # 2026-05-31 - paired with run_concurrent helper bugfix;
+                # the same `and GEVENT_POOL` truthy bug used to make this
+                # silently sequential. `is not None` flips it actually
+                # parallel. Callbacks here are pure reads → safe to fan out.
+                if GEVENT_AVAILABLE and GEVENT_POOL is not None:
+                    tasks = [lambda n=node: fetch_node_details(n) for node in nodes]
+                    results = run_concurrent(tasks, timeout=15.0)
+                else:
+                    results = [fetch_node_details(node) for node in nodes]
+
+                # Sync native HA maintenance state
+                # Detect nodes in Proxmox-native maintenance from /nodes response
+                # AND from /cluster/ha/status/current (some PVE versions only report
+                # maintenance in one of the two endpoints)
+                native_ha_nodes = set()
+
+                # Method 1: check node status from /nodes (most reliable, no extra perms)
+                for node in nodes:
+                    if node.get("status") == "maintenance":
+                        native_ha_nodes.add(node["node"])
+
+                # Method 2: HA status endpoint (catches cases where /nodes still says "online"
+                # during early maintenance transition) - may fail with 401 on limited tokens
+                try:
+                    ha_nodes = self._get_native_ha_maintenance_nodes()
+                    native_ha_nodes.update(ha_nodes)
+                except Exception:
+                    pass
+
+                for nm in native_ha_nodes:
+                    if nm not in self.nodes_in_maintenance:
+                        from ProxmoxVEx.models.tasks import MaintenanceTask
+
+                        t = MaintenanceTask(nm)
+                        t.native_ha = True
+                        t._discovered_by_refresh = True
+                        t.status = "completed"
+                        t.total_vms = 0
+                        self.nodes_in_maintenance[nm] = t
+                        self.logger.info(f"[MAINT] Detected native HA maintenance on {nm} (set externally)")
+
+                # cleanup stale entries — only ones discovered externally, not ones we set
+                for nm in [
+                    n
+                    for n, tsk in self.nodes_in_maintenance.items()
+                    if getattr(tsk, "_discovered_by_refresh", False) and n not in native_ha_nodes
+                ]:
+                    del self.nodes_in_maintenance[nm]
+                    self.logger.info(f"[MAINT] {nm} left native HA maintenance")
+
+                # Process results
+                for result in results:
+                    if result is None:
+                        continue
+
+                    # May 2026: results are now 4-tuples - see #419 fix above.
+                    # Tolerate the old 3-tuple shape briefly in case anything else
+                    # in this code path still returns it.
+                    if len(result) == 4:
+                        node_name, node, status_data, netio = result
+                    else:
+                        node_name, node, status_data = result
+                        netio = (0, 0)
+                    api_nodes.add(node_name)
+
+                    if status_data:
+                        self.logger.debug(f"Raw status data for {node_name}: {status_data}")
+
+                        # Calculate percentages
+                        cpu_percent = status_data.get("cpu", 0) * 100
+                        mem_used = status_data.get("memory", {}).get("used", 0)
+                        mem_total = status_data.get("memory", {}).get("total", 1)
+                        mem_percent = (mem_used / mem_total) * 100 if mem_total > 0 else 0
+
+                        # Disk stats from rootfs
+                        rootfs = status_data.get("rootfs", {})
+                        disk_used = rootfs.get("used", 0)
+                        disk_total = rootfs.get("total", 1)
+                        disk_percent = (disk_used / disk_total) * 100 if disk_total > 0 else 0
+
+                        # Network stats — from /nodes/{name}/rrddata (rate, bytes/sec)
+                        # see fetch_node_details() above and #419 for the why.
+                        netin, netout = netio
+
+                        # weighted scoring — configurable via balance_*_weight settings
+                        # Default weights keep backwards compat with old cpu+mem formula
+                        w_cpu = getattr(self.config, "balance_cpu_weight", 1.0) or 0
+                        w_mem = getattr(self.config, "balance_mem_weight", 1.0) or 0
+                        w_io = getattr(self.config, "balance_io_weight", 0.0) or 0
+                        # fallback if someone sets all weights to 0
+                        if w_cpu == 0 and w_mem == 0 and w_io == 0:
+                            w_cpu, w_mem = 1.0, 1.0
+                        score = cpu_percent * w_cpu + mem_percent * w_mem + disk_percent * w_io
+
+                        # Check maintenance status
+                        in_maintenance = node_name in self.nodes_in_maintenance
+                        maintenance_task = None
+                        maintenance_acknowledged = False
+                        if in_maintenance:
+                            task_obj = self.nodes_in_maintenance[node_name]
+                            maintenance_task = task_obj.to_dict()
+                            maintenance_acknowledged = task_obj.acknowledged
+
+                        # Check update status
+                        is_updating = node_name in self.nodes_updating
+                        update_task = None
+                        if is_updating:
+                            update_task = self.nodes_updating[node_name].to_dict()
+
+                        # Cpuinfo + versions for expanded node details
+                        cpuinfo = status_data.get("cpuinfo", {})
+                        loadavg = status_data.get("loadavg", [])
+
+                        node_status[node_name] = {
+                            "status": node.get("status", "unknown"),
+                            "cpu_percent": round(cpu_percent, 2),
+                            "mem_percent": round(mem_percent, 2),
+                            "mem_used": mem_used,
+                            "mem_total": mem_total,
+                            "disk_percent": round(disk_percent, 2),
+                            "disk_used": disk_used,
+                            "disk_total": disk_total,
+                            "netin": netin,
+                            "netout": netout,
+                            "score": round(score, 2),
+                            "uptime": status_data.get("uptime", 0),
+                            "loadavg": loadavg,
+                            "cpuinfo": cpuinfo,
+                            "pveversion": status_data.get("pveversion", ""),
+                            "ksm": status_data.get("ksm", {}),
+                            "kversion": status_data.get("kversion", ""),
+                            "maintenance_mode": in_maintenance,
+                            "maintenance_task": maintenance_task,
+                            "maintenance_acknowledged": maintenance_acknowledged,
+                            "is_updating": is_updating,
+                            "update_task": update_task,
+                            "offline": False,
+                        }
+
+                        # feed predictive LB history (ring buffer, 288 entries = ~24h at 5min interval)
+                        if node.get("status") == "online":
+                            with self._metrics_history_lock:
+                                hist = self._node_metrics_history.setdefault(node_name, [])
+                                hist.append({
+                                    "ts": time.time(),
+                                    "cpu": round(cpu_percent, 1),
+                                    "mem_pct": round(mem_percent, 1),
+                                    "disk_pct": round(disk_percent, 1),
+                                })
+                                if len(hist) > 288:
+                                    self._node_metrics_history[node_name] = hist[-288:]
+
+                        maintenance_str = " [MAINTENANCE]" if in_maintenance else ""
+                        update_str = " [UPDATING]" if is_updating else ""
+                        # Per-node status fires N×poll_interval per cluster
+                        # (5×6×60s on a 6-node setup = ~720 lines/h of routine metrics).
+                        # Demoted to debug so stdout / k8s log collectors don't carry
+                        # this at default verbosity. Still available via --debug or
+                        # ProxmoxVEx_LOG_LEVEL=DEBUG. (davinkevin PR #510)
+                        self.logger.debug(
+                            f"Node {node_name}: CPU {cpu_percent:.2f}%, RAM {mem_percent:.2f}% ({self._format_bytes(mem_used)}/{self._format_bytes(mem_total)}), Score {score:.2f}, Status: {node['status']}{maintenance_str}{update_str}"
+                        )
+                    else:
+                        # Node exists but we couldn't get status - might be offline
+                        # (#484) - keep the maintenance keys populated
+                        # even when status_data is missing. ProxmoxVEx's internal
+                        # nodes_in_maintenance dict is the source of truth here;
+                        # if we drop the keys during a reboot the sidebar reads
+                        # undefined and shows "(Offline)" with no maintenance
+                        # indicator while PVE still has the HA flag set — looks
+                        # like a state-drift bug.
+                        in_maintenance = node_name in self.nodes_in_maintenance
+                        maintenance_task = None
+                        maintenance_acknowledged = False
+                        if in_maintenance:
+                            task_obj = self.nodes_in_maintenance[node_name]
+                            maintenance_task = task_obj.to_dict()
+                            maintenance_acknowledged = task_obj.acknowledged
+                        node_status[node_name] = {
+                            "status": node.get("status", "unknown"),
+                            "cpu_percent": 0,
+                            "mem_percent": 0,
+                            "mem_used": 0,
+                            "mem_total": 0,
+                            "disk_percent": 0,
+                            "disk_used": 0,
+                            "disk_total": 0,
+                            "netin": 0,
+                            "netout": 0,
+                            "score": 0,
+                            "uptime": 0,
+                            "maintenance_mode": in_maintenance,
+                            "maintenance_task": maintenance_task,
+                            "maintenance_acknowledged": maintenance_acknowledged,
+                            "offline": node.get("status") != "online",
+                        }
+
+                # Add offline nodes from HA tracking that weren't in API response
+                for ha_node, ha_data in self.ha_node_status.items():
+                    if ha_node not in api_nodes and ha_data.get("status") == "offline":
+                        # (#484) - same fix as the offline branch
+                        # above. ha_node_status fallback fires when PVE drops
+                        # the node entirely from /nodes (deeper reboot / corosync
+                        # partition), so this is exactly the path the user hit.
+                        ha_in_maint = ha_node in self.nodes_in_maintenance
+                        ha_maint_task = None
+                        ha_maint_ack = False
+                        if ha_in_maint:
+                            t_obj = self.nodes_in_maintenance[ha_node]
+                            ha_maint_task = t_obj.to_dict()
+                            ha_maint_ack = t_obj.acknowledged
+                        node_status[ha_node] = {
+                            "status": "offline",
+                            "cpu_percent": 0,
+                            "mem_percent": 0,
+                            "mem_used": 0,
+                            "mem_total": 0,
+                            "disk_percent": 0,
+                            "disk_used": 0,
+                            "disk_total": 0,
+                            "netin": 0,
+                            "netout": 0,
+                            "score": 0,
+                            "uptime": 0,
+                            "maintenance_mode": ha_in_maint,
+                            "maintenance_task": ha_maint_task,
+                            "maintenance_acknowledged": ha_maint_ack,
+                            "offline": True,
+                            "last_seen": ha_data.get("last_seen").isoformat() if ha_data.get("last_seen") else None,
+                        }
+                        self.logger.info(f"Node {ha_node}: OFFLINE (from HA tracking)")
+
+                # cache the successful result for the short TTL (see top of method)
+                if _ns_ttl > 0 and node_status:
+                    self._node_status_cache = (time.monotonic(), node_status)
+                return node_status
+            else:
+                # Session might have expired - don't immediately mark as disconnected
+                # The _api_get already handles connection state
+                self.logger.warning(f"Failed to get nodes (status {response.status_code})")
+                return {}
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            # Connection error - _api_get handles the failure counter
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error getting node status: {e}")
+            return {}
+
+    def get_vm_resources(self, max_age: float = 0.0) -> list:
+        # Fetches VMs + CTs, adds computed mem/cpu percentages
+        # (SSE-perf): optional short read-cache. /cluster/resources is
+        # the "walks every node" call and at 10k VMs is the heaviest PVE query; the
+        # 1s broadcast loop already fetches it every second for every watched
+        # cluster. Callers that pass max_age>0 (the 15s/30s poll endpoints) reuse
+        # that fresh snapshot instead of firing their own redundant walk (the same
+        # cluster was hit 2-3x per poll window). The loop + after-action push keep
+        # max_age=0 → always fresh, so SSE responsiveness is untouched.
+        if max_age > 0:
+            cached = getattr(self, "_vm_resources_cache", None)
+            if cached and (time.time() - cached[0]) < max_age:
+                return cached[1]
+        if not self.is_connected or not self.session:
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/resources"
+            resp = self._create_session().get(url, params={"type": "vm"}, timeout=10)
+
+            if resp.status_code != 200:
+                return []
+
+            # Success - reset failure counter
+            self._consecutive_failures = 0
+
+            resources = resp.json()["data"]
+            resources.sort(key=lambda x: x.get("vmid", 0))  # consistent order
+
+            # add percentage values for UI
+            for r in resources:
+                maxmem = r.get("maxmem", 0)
+                r["mem_percent"] = round((r.get("mem", 0) / maxmem) * 100, 1) if maxmem > 0 else 0
+                r["cpu_percent"] = round(r.get("cpu", 0) * 100, 1)
+                maxdisk = r.get("maxdisk", 0)
+                r["disk_percent"] = round((r.get("disk", 0) / maxdisk) * 100, 1) if maxdisk > 0 else 0
+
+            # inject cached IP addresses + disk usage (only for running VMs)
+            if self._ip_cache or self._disk_cache:
+                with self._ip_cache_lock:
+                    for r in resources:
+                        if r.get("status") != "running":
+                            continue
+                        key = (r.get("node", ""), r.get("vmid"))
+                        ips = self._ip_cache.get(key)
+                        if ips:
+                            r["ip"] = ips[0]
+                            r["ip_addresses"] = ips
+                with self._disk_cache_lock:
+                    for r in resources:
+                        if r.get("status") != "running":
+                            continue
+                        key = (r.get("node", ""), r.get("vmid"))
+                        disk_info = self._disk_cache.get(key)
+                        if disk_info:
+                            r["disk"] = disk_info["used"]
+                            r["maxdisk"] = disk_info["total"]
+                            r["disk_percent"] = (
+                                round((disk_info["used"] / disk_info["total"]) * 100, 1)
+                                if disk_info["total"] > 0
+                                else 0
+                            )
+
+            # inject cached ostype so the sidebar can show OS-specific icons
+            if self._ostype_cache:
+                with self._ostype_cache_lock:
+                    for r in resources:
+                        key = (r.get("node", ""), r.get("vmid"))
+                        ostype = self._ostype_cache.get(key)
+                        if ostype:
+                            r["ostype"] = ostype
+
+            # refill the short read-cache for max_age>0 pollers (see method head)
+            self._vm_resources_cache = (time.time(), resources)
+            return resources
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            # Don't immediately mark disconnected, use failure counter
+            return []
+        except Exception:
+            return []
+
+    def get_storage_resources(self) -> list:
+        """Cluster-wide storage list via /cluster/resources?type=storage.
+
+        Used by global search (033: vCenter-style redesign, FR-016) so storage
+        volumes are searchable without a per-node walk — PVE's cluster/resources
+        endpoint already aggregates every node's storage in one call, same as
+        get_vm_resources() does for VMs/CTs.
+        """
+        if not self.is_connected or not self.session:
+            return []
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/resources"
+            resp = self._create_session().get(url, params={"type": "storage"}, timeout=10)
+            if resp.status_code != 200:
+                return []
+            resources = resp.json()["data"]
+            for r in resources:
+                maxdisk = r.get("maxdisk", 0)
+                r["disk_percent"] = round((r.get("disk", 0) / maxdisk) * 100, 1) if maxdisk > 0 else 0
+            return resources
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            return []
+        except Exception:
+            return []
+
+    # (#413) - uniform get_vms(node=None) shim so the site-recovery
+    # detection code (and any other caller that loops over manager types) can
+    # treat Proxmox the same as VMware. Returns the same list shape as
+    # get_vm_resources(); when `node` is given, filters down to that node.
+    def get_vms(self, node=None) -> list:
+        vms = self.get_vm_resources() or []
+        if node is None:
+            return vms
+        return [v for v in vms if v.get("node") == node]
+
+    def _fetch_qemu_ips(self, node: str, vmid: int) -> list:
+        """Fetch IP addresses from QEMU guest agent for a running VM.
+        Returns IPv4 addresses first, then IPv6 (so ips[0] is primary IPv4 when available).
+        Returns [] if agent not running, VM unreachable, or any error."""
+        # #237: skip VMs known to have no guest agent to avoid pvedaemon error spam
+        if vmid in self._no_agent_vms:
+            return []
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
+            resp = self._create_session().get(url, timeout=4)
+            if resp.status_code == 500:
+                # agent socket not available — remember this VM
+                self._no_agent_vms.add(vmid)
+                return []
+            if resp.status_code != 200:
+                return []
+            interfaces = resp.json().get("data", {}).get("result", [])
+            ipv4s, ipv6s = [], []
+            for iface in interfaces:
+                if iface.get("name") == "lo":
+                    continue
+                for addr in iface.get("ip-addresses", []):
+                    ip = addr.get("ip-address", "")
+                    if not ip:
+                        continue
+                    if ip.startswith("127.") or ip == "::1":
+                        continue
+                    if ip.lower().startswith("fe80:"):
+                        continue
+                    if addr.get("ip-address-type") == "ipv4":
+                        ipv4s.append(ip)
+                    else:
+                        ipv6s.append(ip)
+            return ipv4s + ipv6s
+        except Exception:
+            return []
+
+    def mark_no_agent(self, vmid: int) -> None:
+        """Remember a VM whose guest agent returned 500 so the background refresh skips it."""
+        self._no_agent_vms.add(vmid)
+
+    def _fetch_lxc_ips(self, node: str, vmid: int) -> list:
+        """Fetch IP addresses for a running LXC container.
+        Tries /interfaces first, falls back to config + status
+        """
+        try:
+            # method 1: /interfaces — preferred, returns all IPs
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/interfaces"
+            resp = self._create_session().get(url, timeout=4)
+            if resp.status_code == 200:
+                interfaces = resp.json().get("data", [])
+                ipv4s, ipv6s = [], []
+                for iface in interfaces:
+                    if iface.get("name") == "lo":
+                        continue
+                    inet = iface.get("inet", "")
+                    if inet:
+                        ip = inet.split("/")[0]
+                        if not ip.startswith("127."):
+                            ipv4s.append(ip)
+                    inet6 = iface.get("inet6", "")
+                    if inet6:
+                        ip = inet6.split("/")[0]
+                        if ip != "::1" and not ip.lower().startswith("fe80:"):
+                            ipv6s.append(ip)
+                if ipv4s or ipv6s:
+                    return ipv4s + ipv6s
+
+            # method 2: /config — extract static IPs from net0..net9
+            cfg_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+            cfg_resp = self._create_session().get(cfg_url, timeout=5)
+            if cfg_resp.status_code == 200:
+                cfg = cfg_resp.json().get("data", {})
+                import re
+
+                for key in sorted(cfg.keys()):
+                    if not key.startswith("net"):
+                        continue
+                    val = cfg[key]
+                    # format: name=eth0,bridge=vmbr0,ip=10.0.0.5/24,...
+                    m = re.search(r"ip=(\d+\.\d+\.\d+\.\d+)", str(val))
+                    if m:
+                        return [m.group(1)]
+
+            return []
+        except Exception:
+            return []
+
+    def _format_bytes(self, bytes_value: int) -> str:
+        # Quick helper, nothing fancy
+        gb = bytes_value / (1024**3)
+        if gb >= 1:
+            return f"{gb:.2f} GB"
+        mb = bytes_value / (1024**2)
+        return f"{mb:.2f} MB"
+
+    # same thing but different format, used somewhere?
+    def _fmt_bytes(self, b):
+        if b >= 1024**3:
+            return f"{b / 1024**3:.1f}G"
+        if b >= 1024**2:
+            return f"{b / 1024**2:.1f}M"
+        return f"{b / 1024:.1f}K"
+
+    def check_balance_needed(self, node_status: Dict[str, Any]) -> tuple:
+        """
+        Check if cluster needs rebalancing based on node scores.
+
+        The scoring algorithm here is inspired by ProxLB by gyptazy - great
+        project, thanks for open-sourcing it! We adapted it for our multi-cluster
+        setup.
+
+        Now also excludes nodes configured in excluded_nodes setting
+        """
+        if not node_status:
+            return False, None, None
+
+        # Get excluded nodes from config
+        config_excluded = getattr(self.config, "excluded_nodes", []) or []
+
+        # Exclude nodes in maintenance AND configured excluded nodes from balancing decisions
+        # This was a bug before - we'd try to migrate TO maintenance nodes
+        active_nodes = {
+            node: data
+            for node, data in node_status.items()
+            if data["status"] == "online" and not data.get("maintenance_mode", False) and node not in config_excluded
+        }
+
+        if config_excluded:
+            self.logger.debug(f"Excluding configured nodes from balance check: {config_excluded}")
+
+        scores = [(node, data["score"]) for node, data in active_nodes.items()]
+        if len(scores) < 2:
+            self.logger.info("Not enough online nodes for balancing (excluding maintenance and excluded nodes)")
+            return False, None, None
+
+        scores.sort(key=lambda x: x[1])
+        min_node, min_score = scores[0]
+        max_node, max_score = scores[-1]
+
+        score_diff = max_score - min_score
+        threshold_value = self.config.migration_threshold
+        tolerance = getattr(self.config, "migration_tolerance", 10) or 0
+        effective_threshold = threshold_value + tolerance
+
+        self.logger.info(
+            f"Score difference: {score_diff:.2f} (Min: {min_node}={min_score:.2f}, Max: {max_node}={max_score:.2f})"
+        )
+        self.logger.info(f"Migration threshold: {threshold_value} + tolerance {tolerance} = {effective_threshold}")
+
+        if score_diff > effective_threshold:
+            self.logger.info(f"[WARN] Balance needed! Score difference {score_diff:.2f} > {effective_threshold}")
+            return True, max_node, min_node
+        else:
+            self.logger.info(f"[OK] Cluster balanced. Score diff {score_diff:.2f} <= {effective_threshold}")
+            return False, None, None
+
+    def _derive_proxlb_tag_rules(self, vms=None):
+        """translate ProxLB-convention VM tags into the
+        placement rules the balancer already understands. Opt-in per cluster via
+        config.proxlb_tags_enabled; a full no-op when the toggle is off or no
+        guest carries plb_ tags, so it never changes behaviour by surprise.
+
+        Recognised tags (PVE stores the `tags` field semicolon-separated; we also
+        tolerate commas / whitespace):
+          plb_affinity_<group>       -> keep tagged guests together  (type 'together')
+          plb_anti_affinity_<group>  -> keep tagged guests apart     (type 'separate')
+          plb_ignore[_<suffix>]      -> never migrate this guest (balancing exclusion)
+          plb_pin_<node>             -> restrict this guest to the named node(s)
+
+        Returns {'rules': [<affinity-rule dicts, same shape as get_affinity_rules()>],
+                 'ignored': set(int vmid), 'pins': {int vmid: set(node names)}}.
+        Short-TTL cached because _check_affinity_violation calls us per candidate.
+        """
+        if not getattr(self.config, "proxlb_tags_enabled", False):
+            return {"rules": [], "ignored": set(), "pins": {}}
+
+        now = time.time()
+        cached = getattr(self, "_proxlb_derived_cache", None)
+        if cached and (now - cached[0]) < 20:
+            return cached[1]
+
+        if vms is None:
+            try:
+                vms = self.get_vm_resources()
+            except Exception:
+                vms = []
+
+        valid_nodes = set()
+        with contextlib.suppress(Exception):
+            valid_nodes = set((self.get_node_status() or {}).keys())
+
+        affinity_groups, anti_groups = {}, {}
+        ignored, pins = set(), {}
+
+        for res in vms or []:
+            if res.get("type") not in ("qemu", "lxc"):
+                continue
+            raw = res.get("tags")
+            if not raw:
+                continue
+            try:
+                vmid = int(res.get("vmid"))
+            except (TypeError, ValueError):
+                continue
+            tags = [t.strip().lower() for t in re.split(r"[;,\s]+", str(raw)) if t.strip()]
+            for tag in tags:
+                if tag.startswith("plb_affinity_"):
+                    g = tag[len("plb_affinity_") :]
+                    if g:
+                        affinity_groups.setdefault(g, []).append(str(vmid))
+                elif tag.startswith("plb_anti_affinity_"):
+                    g = tag[len("plb_anti_affinity_") :]
+                    if g:
+                        anti_groups.setdefault(g, []).append(str(vmid))
+                elif tag == "plb_ignore" or tag.startswith("plb_ignore_"):
+                    ignored.add(vmid)
+                elif tag.startswith("plb_pin_"):
+                    node = tag[len("plb_pin_") :]
+                    # ProxLB validates the node against cluster membership; so do we,
+                    # matching case-insensitively (PVE lower-cases tag text).
+                    match = next((n for n in valid_nodes if n.lower() == node), None)
+                    if match:
+                        pins.setdefault(vmid, set()).add(match)
+                    else:
+                        self.logger.debug(f"[PROXLB] plb_pin_{node} on VM {vmid}: no such node — pin ignored")
+
+        rules = []
+        for g, members in affinity_groups.items():
+            if len(members) >= 2:
+                rules.append({
+                    "name": f"ProxLB affinity: {g}",
+                    "type": "together",
+                    "vms": members,
+                    "enabled": True,
+                    "enforce": True,
+                    "_source": "proxlb",
+                })
+        for g, members in anti_groups.items():
+            if len(members) >= 2:
+                rules.append({
+                    "name": f"ProxLB anti-affinity: {g}",
+                    "type": "separate",
+                    "vms": members,
+                    "enabled": True,
+                    "enforce": True,
+                    "_source": "proxlb",
+                })
+
+        result = {"rules": rules, "ignored": ignored, "pins": pins}
+        self._proxlb_derived_cache = (now, result)
+        return result
+
+    def _check_affinity_violation(self, vmid, target_node, vm_nodes=None):
+        """Check if moving a VM/CT would violate affinity rules
+
+        Reads directly from database for speed (called in a loop by
+        find_migration_candidate). Works for QEMU and LXC (GitHub Issue #73).
+        Returns enforce flag so caller can decide to block or just warn
+        """
+        try:
+            rules = get_db().get_affinity_rules(self.id).get(self.id, [])
+        except Exception as e:
+            self.logger.error(f"Failed to load affinity rules: {e}")
+            rules = []
+
+        # (#426) - fold in ProxLB tag-derived rules + honour pins.
+        # A pin is a hard constraint checked even when there are no DB rules.
+        try:
+            _derived = self._derive_proxlb_tag_rules()
+            if _derived["rules"]:
+                rules = list(rules) + _derived["rules"]
+            try:
+                _vid_int = int(vmid)
+            except (TypeError, ValueError):
+                _vid_int = None
+            _pin = _derived["pins"].get(_vid_int) if _vid_int is not None else None
+            if _pin and target_node not in _pin:
+                return {
+                    "violation": True,
+                    "enforce": True,
+                    "rule": "ProxLB pin",
+                    "message": f"VM/CT {vmid} is pinned to node(s) {', '.join(sorted(_pin))}",
+                }
+        except Exception as e:
+            self.logger.debug(f"[PROXLB] tag-rule derivation failed in affinity check: {e}")
+
+        if not rules:
+            return {"violation": False}
+
+        # Caller can pass pre-built map to avoid repeated API calls
+        if vm_nodes is None:
+            vm_nodes = {}
+            try:
+                for res in self.get_vm_resources():
+                    if res.get("type") in ("qemu", "lxc"):
+                        vm_nodes[str(res.get("vmid"))] = res.get("node")
+            except Exception:
+                return {"violation": False}
+
+        vid = str(vmid)
+
+        for rule in rules:
+            if not rule.get("enabled", True):
+                continue
+
+            rtype = rule.get("type", "together")
+            # Handle both field names, this mismatch was a pain to track down
+            rule_vms = [str(v) for v in (rule.get("vm_ids") or rule.get("vms", []))]
+
+            if vid not in rule_vms:
+                continue
+
+            # where are the other VMs/CTs in this rule?
+            other_nodes = set()
+            for v in rule_vms:
+                if v != vid and v in vm_nodes:
+                    other_nodes.add(vm_nodes[v])
+
+            if rtype == "together" and other_nodes and target_node not in other_nodes:
+                return {
+                    "violation": True,
+                    "enforce": rule.get("enforce", False),
+                    "rule": rule.get("name", "Affinity Rule"),
+                    "message": f"VM/CT {vmid} must stay with IDs {', '.join([v for v in rule_vms if v != vid])} on node {list(other_nodes)[0]}",
+                }
+            elif rtype == "separate" and target_node in other_nodes:
+                conflicting = [v for v in rule_vms if v != vid and vm_nodes.get(v) == target_node]
+                return {
+                    "violation": True,
+                    "enforce": rule.get("enforce", False),
+                    "rule": rule.get("name", "Anti-Affinity Rule"),
+                    "message": f"VM/CT {vmid} must not be on same node as IDs {', '.join(conflicting)}",
+                }
+
+        return {"violation": False}
+
+    # CPU compatibility matrix for migration safety
+    # Proxmox doesn't have native CPU compat mode, so we do pre-flight checks
+    # Hierarchy: newer models can emulate older ones, not vice versa
+    # Levels verified against QEMU cpu.c + Proxmox CPUConfig.pm (Apr 2026)
+    _CPU_COMPAT_LEVELS = {
+        "qemu32": 0,
+        "qemu64": 1,
+        "kvm32": 0,
+        "kvm64": 1,
+        "486": 0,
+        "pentium": 0,
+        "pentium2": 1,
+        "pentium3": 2,
+        "athlon": 1,
+        "phenom": 3,
+        "coreduo": 3,
+        "core2duo": 4,
+        "n270": 3,
+        "Conroe": 5,
+        "Penryn": 6,
+        "Nehalem": 7,
+        "Nehalem-IBRS": 7,
+        "Westmere": 8,
+        "Westmere-IBRS": 8,
+        "SandyBridge": 9,
+        "SandyBridge-IBRS": 9,
+        "IvyBridge": 10,
+        "IvyBridge-IBRS": 10,
+        "Haswell": 11,
+        "Haswell-IBRS": 11,
+        "Haswell-noTSX": 11,
+        "Haswell-noTSX-IBRS": 11,
+        "Broadwell": 12,
+        "Broadwell-IBRS": 12,
+        "Broadwell-noTSX": 12,
+        "Broadwell-noTSX-IBRS": 12,
+        "Skylake-Client": 13,
+        "Skylake-Client-IBRS": 13,
+        "Skylake-Client-noTSX-IBRS": 13,
+        "Skylake-Client-v4": 13,
+        "Skylake-Server": 14,
+        "Skylake-Server-IBRS": 14,
+        "Skylake-Server-noTSX-IBRS": 14,
+        "Skylake-Server-v4": 14,
+        "Skylake-Server-v5": 14,
+        "Cascadelake-Server": 15,
+        "Cascadelake-Server-noTSX": 15,
+        "Cascadelake-Server-v2": 15,
+        "Cascadelake-Server-v4": 15,
+        "Cascadelake-Server-v5": 15,
+        "Cooperlake": 16,
+        "Cooperlake-v2": 16,
+        # Proxmox maps Icelake-Client → Icelake-Server (never was a client CPU)
+        "Icelake-Client": 17,
+        "Icelake-Client-noTSX": 17,
+        "Icelake-Server": 17,
+        "Icelake-Server-noTSX": 17,
+        "Icelake-Server-v3": 17,
+        "Icelake-Server-v4": 17,
+        "Icelake-Server-v5": 17,
+        "Icelake-Server-v6": 17,
+        "SapphireRapids": 18,
+        "SapphireRapids-v2": 18,
+        "GraniteRapids": 19,
+        # AMD line
+        "Opteron_G1": 0,
+        "Opteron_G2": 1,
+        "Opteron_G3": 2,
+        "Opteron_G4": 3,
+        "Opteron_G5": 4,
+        "EPYC": 11,
+        "EPYC-IBPB": 11,
+        "EPYC-v3": 11,
+        "EPYC-v4": 11,
+        "EPYC-Rome": 13,
+        "EPYC-Rome-v2": 13,
+        "EPYC-Rome-v3": 13,
+        "EPYC-Rome-v4": 13,
+        "EPYC-Milan": 15,
+        "EPYC-Milan-v2": 15,
+        "EPYC-Genoa": 17,
+        "EPYC-Genoa-v2": 17,
+        # Proxmox custom types (vendor-neutral, based on qemu64 + flags)
+        # minimum HW: v2=Nehalem/Opteron_G3, v2-AES=Westmere/Opteron_G4, v3=Haswell/EPYC, v4=Skylake-Server/EPYC-Genoa
+        "x86-64-v2": 7,
+        "x86-64-v2-AES": 8,
+        "x86-64-v3": 11,
+        "x86-64-v4": 14,
+    }
+    # Intel and AMD are separate families, can't cross-migrate with cpu:host
+    _CPU_VENDOR_INTEL = {"GenuineIntel"}
+    _CPU_VENDOR_AMD = {"AuthenticAMD"}
+
+    def _check_cpu_compatibility(self, vm, target_node, node_status=None):
+        """Pre-migration CPU compatibility check (CPU compat)
+
+        Returns {compatible: True/False, reason: str, warning: str|None}
+        Catches the obvious CPU compat failures before migration
+        """
+        vmid = vm.get("vmid")
+        source_node = vm.get("node")
+        vm_type = vm.get("type", "qemu")
+
+        # LXC containers don't have CPU type issues
+        if vm_type == "lxc":
+            return {"compatible": True, "reason": "container"}
+
+        # get VM config to check cpu type
+        try:
+            cfg_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/qemu/{vmid}/config"
+            r = self._create_session().get(cfg_url, timeout=8)
+            if r.status_code != 200:
+                return {"compatible": True, "reason": "config_unavailable"}
+            raw_cpu = r.json().get("data", {}).get("cpu", "kvm64")
+            # PVE cpu config is composite: "host,flags=+pcid;-spec-ctrl" or "cputype=x86-64-v3,hidden=1"
+            vm_cpu = raw_cpu.split(",")[0].replace("cputype=", "")
+        except Exception:
+            return {"compatible": True, "reason": "config_error"}
+
+        # cpu:host requires matching physical CPU vendor
+        if vm_cpu == "host" or vm_cpu == "max":
+            ns = node_status or self.get_node_status()
+            src_info = ns.get(source_node, {}).get("cpuinfo", {})
+            tgt_info = ns.get(target_node, {}).get("cpuinfo", {})
+            src_model = src_info.get("model", "")
+            tgt_model = tgt_info.get("model", "")
+
+            # if same model string, definitely compatible
+            if src_model and tgt_model and src_model == tgt_model:
+                return {"compatible": True, "reason": "same_cpu_model"}
+
+            # different model — check at least same vendor
+            src_vendor = src_info.get("vendor", "")
+            tgt_vendor = tgt_info.get("vendor", "")
+            if src_vendor and tgt_vendor and src_vendor != tgt_vendor:
+                return {"compatible": False, "reason": f"cpu:host - vendor mismatch ({src_vendor} vs {tgt_vendor})"}
+
+            # same vendor but different model — risky, warn but allow
+            return {
+                "compatible": True,
+                "warning": f"cpu:host with different models ({src_model} → {tgt_model}) — migration may fail on CPU flag mismatch",
+            }
+
+        # check cpu_baseline enforcement
+        baseline = getattr(self.config, "cpu_baseline", None)
+        if baseline and baseline != "none":
+            bl_level = self._CPU_COMPAT_LEVELS.get(baseline, -1)
+            vm_level = self._CPU_COMPAT_LEVELS.get(vm_cpu, -1)
+            if bl_level >= 0 and vm_level >= 0 and vm_level > bl_level:
+                return {"compatible": False, "reason": f"VM cpu '{vm_cpu}' exceeds cluster baseline '{baseline}'"}
+
+        # named cpu type — always compatible as long as QEMU supports it on target
+        # (Proxmox emulates named types on any hardware that's >= the type level)
+        return {"compatible": True, "reason": "named_cpu_type"}
+
+    def _get_cpu_compatibility_matrix(self):
+        """Build matrix showing which VMs can run on which nodes
+
+        Useful for the UI - admin sees at a glance what needs cpu type change
+        """
+        ns = self.get_node_status()
+        vms = self.get_vm_resources()
+        matrix = {"nodes": {}, "vms": [], "baseline": getattr(self.config, "cpu_baseline", None)}
+
+        for node_name, data in ns.items():
+            if data.get("status") != "online":
+                continue
+            cpuinfo = data.get("cpuinfo", {})
+            matrix["nodes"][node_name] = {
+                "model": cpuinfo.get("model", "unknown"),
+                "vendor": cpuinfo.get("vendor", ""),
+                "cores": cpuinfo.get("cpus", 0),
+            }
+
+        # batch-fetch VM cpu types (one API call per VM, but skip compat re-fetch)
+        baseline = getattr(self.config, "cpu_baseline", None)
+        bl_level = self._CPU_COMPAT_LEVELS.get(baseline, -1) if baseline and baseline != "none" else -1
+
+        for vm in vms:
+            if vm.get("type") != "qemu" or vm.get("status") != "running":
+                continue
+            vmid = vm.get("vmid")
+            src = vm.get("node")
+            try:
+                cfg_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{src}/qemu/{vmid}/config"
+                r = self._create_session().get(cfg_url, timeout=5)
+                raw_cpu = r.json().get("data", {}).get("cpu", "kvm64") if r.status_code == 200 else "unknown"
+                cpu_type = raw_cpu.split(",")[0].replace("cputype=", "")
+            except Exception:
+                cpu_type = "unknown"
+
+            # compute compat inline using level table (no extra API calls)
+            compat = {}
+            vm_level = self._CPU_COMPAT_LEVELS.get(cpu_type, -1)
+            for tgt in matrix["nodes"]:
+                if tgt == src:
+                    compat[tgt] = True
+                elif cpu_type in ("host", "max"):
+                    # host cpu: compatible only if same vendor
+                    src_v = ns.get(src, {}).get("cpuinfo", {}).get("vendor", "")
+                    tgt_v = ns.get(tgt, {}).get("cpuinfo", {}).get("vendor", "")
+                    compat[tgt] = (src_v == tgt_v) if src_v and tgt_v else True
+                elif bl_level >= 0 and vm_level > bl_level:
+                    compat[tgt] = False
+                else:
+                    compat[tgt] = True
+
+            matrix["vms"].append({
+                "vmid": vmid,
+                "name": vm.get("name", ""),
+                "node": src,
+                "cpu_type": cpu_type,
+                "compatible_nodes": compat,
+            })
+
+        return matrix
+
+    def _enforce_affinity_rules(self, node_status):
+        """Proactively fix anti-affinity violations by migrating offending VMs.
+        Issue #148 - anti-affinity rules weren't triggering migrations
+        because the balancer only checked affinity as a constraint, never proactively.
+        """
+        try:
+            rules = get_db().get_affinity_rules(self.id).get(self.id, [])
+        except Exception:
+            rules = []
+
+        # (#426) - include ProxLB tag-derived anti-affinity rules (opt-in)
+        _derived = {"rules": [], "ignored": set(), "pins": {}}
+        try:
+            _derived = self._derive_proxlb_tag_rules()
+            if _derived["rules"]:
+                rules = list(rules) + _derived["rules"]
+        except Exception:
+            pass
+
+        if not rules:
+            return 0
+
+        # build current vm->node + vm->resource maps
+        vms = self.get_vm_resources()
+        if not vms:
+            return 0
+
+        vm_nodes = {}
+        vm_lookup = {}
+        for res in vms:
+            if res.get("type") in ("qemu", "lxc") and res.get("status") == "running":
+                vid = str(res.get("vmid"))
+                vm_nodes[vid] = res.get("node")
+                vm_lookup[vid] = res
+
+        # get excluded nodes + maintenance
+        config_excluded = getattr(self.config, "excluded_nodes", []) or []
+        available_nodes = [
+            n
+            for n, d in node_status.items()
+            if d["status"] == "online" and not d.get("maintenance_mode", False) and n not in config_excluded
+        ]
+
+        if len(available_nodes) < 2:
+            return 0
+
+        migrations = 0
+        balance_ct = getattr(self.config, "balance_containers", False)
+
+        for rule in rules:
+            if not rule.get("enabled", True) or not rule.get("enforce", False):
+                continue
+            if rule.get("type") != "separate":
+                continue
+
+            rule_vms = [str(v) for v in (rule.get("vm_ids") or rule.get("vms", []))]
+            # group VMs by which node they're on
+            node_groups = {}
+            for vid in rule_vms:
+                nd = vm_nodes.get(vid)
+                if nd:
+                    node_groups.setdefault(nd, []).append(vid)
+
+            # find nodes with >1 VM from the same anti-affinity rule
+            for nd, vids in node_groups.items():
+                if len(vids) < 2:
+                    continue
+
+                # need to move all but one off this node
+                to_move = vids[1:]  # keep the first, move the rest
+                for vid in to_move:
+                    vm_res = vm_lookup.get(vid)
+                    if not vm_res:
+                        continue
+
+                    # skip containers if balancing disabled for them
+                    if vm_res.get("type") == "lxc" and not balance_ct:
+                        self.logger.info(f"[AFFINITY] Skipping CT {vid} - container balancing disabled")
+                        continue
+
+                    # find a target that doesn't already have a VM from this rule
+                    occupied = set(node_groups.keys())
+                    free_nodes = [n for n in available_nodes if n not in occupied and n != nd]
+
+                    # #426 — a ProxLB-pinned guest may only move within its pin set
+                    try:
+                        _vpin = _derived["pins"].get(int(vid))
+                    except (TypeError, ValueError):
+                        _vpin = None
+                    if _vpin:
+                        free_nodes = [n for n in free_nodes if n in _vpin]
+
+                    if not free_nodes:
+                        # fallback: pick least-loaded node that isn't this one
+                        # even if it has another rule member (soft best-effort)
+                        self.logger.warning(
+                            f"[AFFINITY] No free node for {vid} (rule '{rule.get('name')}'), all available nodes occupied by rule members"
+                        )
+                        continue
+
+                    # pick lowest-score node
+                    target = sorted(free_nodes, key=lambda n: node_status.get(n, {}).get("score", 999))[0]
+
+                    vm_type = "CT" if vm_res.get("type") == "lxc" else "VM"
+                    self.logger.info(
+                        f"[AFFINITY] Enforcing anti-affinity rule '{rule.get('name')}': migrating {vm_type} {vid} ({vm_res.get('name', '')}) from {nd} → {target}"
+                    )
+
+                    ok = self.migrate_vm(vm_res, target)
+                    if ok:
+                        migrations += 1
+                        # update maps so next iteration sees the new position
+                        vm_nodes[vid] = target
+                        node_groups.setdefault(target, []).append(vid)
+                        node_groups[nd].remove(vid)
+                    else:
+                        self.logger.warning(f"[AFFINITY] Migration failed for {vm_type} {vid}")
+
+        if migrations:
+            self.logger.info(f"[AFFINITY] Completed {migrations} affinity enforcement migration(s)")
+        return migrations
+
+    def find_migration_candidate(
+        self,
+        source_node: str,
+        target_node: str,
+        exclude_vmids: list = None,
+        include_containers: bool = None,
+        node_status: dict = None,
+    ) -> Optional[Dict]:
+        """
+        Find the best VM to migrate from source to target node.
+
+        This logic is based on ProxLB's approach but we've added:
+        - Affinity rule checking
+        - HA status awareness
+        - Multi-cluster considerations
+
+        Priority order:
+        1. VMs on shared storage (easiest to migrate)
+        2. VMs on local storage (only if balance_local_disks enabled)
+        3. Smaller VMs first (less impact during migration)
+        4. Prefer QEMU VMs over containers (containers need restart)
+
+        Container migrations are tricky - they ALWAYS restart.
+        We learned this the hard way in production...
+        Exclude_vmids used for multi-migration cycles to avoid re-picking
+        """
+        if exclude_vmids is None:
+            exclude_vmids = []
+        vms = self.get_vm_resources()
+        if not vms:
+            return None
+
+        # Get excluded VMs for this cluster
+        excluded_vmids = self.get_balancing_excluded_vms()
+        if excluded_vmids:
+            self.logger.info(f"VMs excluded from balancing: {excluded_vmids}")
+
+        # Get excluded pools
+        excluded_pools = self.get_balancing_excluded_pools()
+        if excluded_pools:
+            self.logger.info(f"Pools excluded from balancing: {excluded_pools}")
+
+        # (#426) - ProxLB tag-derived ignore/pin sets (opt-in; empty when off)
+        _proxlb = self._derive_proxlb_tag_rules(vms=vms)
+        proxlb_ignored = _proxlb["ignored"]
+        proxlb_pins = _proxlb["pins"]
+        if proxlb_ignored:
+            self.logger.info(f"[PROXLB] guests ignored via plb_ignore tag: {sorted(proxlb_ignored)}")
+
+        # Filter VMs on source node that are running
+        # VM cooldown - skip VMs migrated in last 15 min to prevent ping-pong
+        cooldown_secs = 900
+        now = time.time()
+        cooled_vmids = {vmid for vmid, ts in self._vm_migration_cooldown.items() if now - ts < cooldown_secs}
+        # clean up old entries
+        self._vm_migration_cooldown = {v: t for v, t in self._vm_migration_cooldown.items() if now - t < cooldown_secs}
+
+        # Coexistence with PVE 9.2's CRS. Two-layer check:
+        #
+        # 1) Cluster-wide CRS toggle. PVE 9.2 stores it under
+        #    /cluster/options.crs.ha-auto-rebalance (per pve-ha-manager's
+        #    Manager.pm:update_crs_scheduler_mode). When it's off — and on
+        #    pre-9.2 the key doesn't exist at all — CRS does nothing, so
+        #    our balancer runs everything as before. This is what keeps the
+        #    "compat when CRS is off / cluster is old" promise.
+        #
+        # 2) Resource-level overrides. When CRS is on cluster-wide, PVE's
+        #    HA config defaults auto-rebalance=1 on EVERY HA resource
+        #    (Config.pm: `$d->{'auto-rebalance'} = 1 if !defined ...`). So
+        #    we treat any HA-managed VM as PVE-owned unless the resource
+        #    record explicitly carries auto-rebalance ∈ {0, false, no}.
+        #    That covers the admin who keeps cluster-CRS on but pins a
+        #    specific VM to manual placement.
+        #
+        # The two GETs are cheap and happen once per balance cycle.
+        pve_crs_managed_vmids = set()
+        cluster_crs_active = False
+        try:
+            opts_resp = self._api_get(
+                f"https://{self.host}:{self.api_port}/api2/json/cluster/options",
+                timeout=5,
+            )
+            if opts_resp.status_code == 200:
+                crs = (opts_resp.json().get("data") or {}).get("crs", {})
+                # PVE returns the crs field either as a parsed dict OR as the
+                # raw composite string ("ha-auto-rebalance=1,...") depending
+                # on PVE version and serialiser version. Handle both shapes.
+                if isinstance(crs, dict):
+                    cluster_crs_active = str(crs.get("ha-auto-rebalance", "")).lower() in ("1", "true", "yes")
+                elif isinstance(crs, str) and crs:
+                    for part in crs.split(","):
+                        k, _, v = part.partition("=")
+                        if k.strip() == "ha-auto-rebalance" and v.strip().lower() in ("1", "true", "yes"):
+                            cluster_crs_active = True
+                            break
+        except Exception as e:
+            self.logger.debug(f"[BAL] /cluster/options probe for CRS state failed ({e}) — assuming CRS off")
+
+        if cluster_crs_active:
+            try:
+                for res in self.get_proxmox_ha_resources() or []:
+                    # Explicit opt-out from CRS: keep VM eligible for our balancer
+                    rebal = str(res.get("auto-rebalance", "")).lower()
+                    if rebal in ("0", "false", "no"):
+                        continue
+                    # Default-on (unset) or explicit-on → CRS owns this VM
+                    sid = res.get("sid", "")
+                    if ":" in sid:
+                        with contextlib.suppress(ValueError, IndexError):
+                            pve_crs_managed_vmids.add(int(sid.split(":", 1)[1]))
+            except Exception as e:
+                self.logger.debug(f"[BAL] HA-resource probe failed ({e}) — running balancer without CRS filter")
+        else:
+            self.logger.debug("[BAL] cluster CRS not active — balancer runs full set (compat path)")
+
+        candidates = [
+            vm
+            for vm in vms
+            if vm.get("node") == source_node
+            and vm.get("status") == "running"
+            and vm.get("type") in ["qemu", "lxc"]
+            and vm.get("vmid") not in excluded_vmids  # Skip excluded VMs
+            and vm.get("vmid") not in exclude_vmids  # Skip already-migrated VMs this cycle
+            and vm.get("pool", "") not in excluded_pools  # Skip VMs in excluded pools
+            and vm.get("vmid") not in cooled_vmids  # Skip recently migrated VMs
+            and vm.get("vmid") not in pve_crs_managed_vmids  # PVE CRS owns these (9.2+)
+            and vm.get("vmid") not in proxlb_ignored  # #426: ProxLB plb_ignore tag
+            and (
+                vm.get("vmid") not in proxlb_pins or target_node in proxlb_pins.get(vm.get("vmid"), set())
+            )  # #426: plb_pin — only if target is a pinned node
+        ]
+
+        # Log if any VMs were excluded
+        excluded_on_node = [vm for vm in vms if vm.get("node") == source_node and vm.get("vmid") in excluded_vmids]
+        if excluded_on_node:
+            self.logger.info(
+                f"Skipping {len(excluded_on_node)} excluded VM(s) on {source_node}: {[vm.get('vmid') for vm in excluded_on_node]}"
+            )
+
+        crs_on_node = [vm for vm in vms if vm.get("node") == source_node and vm.get("vmid") in pve_crs_managed_vmids]
+        if crs_on_node:
+            self.logger.info(
+                f"Skipping {len(crs_on_node)} VM(s) on {source_node} owned by PVE CRS auto-rebalance: "
+                f"{[vm.get('vmid') for vm in crs_on_node]} (PVE will place them — opt out per VM via auto-rebalance=0 to give us back control)"
+            )
+
+        # Filter out containers if balance_containers is disabled
+        # Include_containers override allows cross-cluster LB to use group-level setting
+        balance_ct = (
+            include_containers if include_containers is not None else getattr(self.config, "balance_containers", False)
+        )
+        if not balance_ct:
+            original_count = len(candidates)
+            candidates = [vm for vm in candidates if vm.get("type") != "lxc"]
+            skipped = original_count - len(candidates)
+            if skipped > 0:
+                self.logger.info(f"Skipping {skipped} container(s) - container balancing is disabled")
+
+        if not candidates:
+            self.logger.info(f"No running VMs found on {source_node} for migration")
+            return None
+
+        # Check setting for local disk migration
+        balance_local_disks = getattr(self.config, "balance_local_disks", False)
+
+        # Cache target node storages so we can skip VMs whose storage doesn't exist on target
+        target_storage_names = set()
+        if balance_local_disks:
+            try:
+                st_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{target_node}/storage"
+                st_r = self._create_session().get(st_url, timeout=10)
+                if st_r.status_code == 200:
+                    target_storage_names = {s["storage"] for s in st_r.json().get("data", []) if s.get("active")}
+            except Exception:
+                pass
+
+        # Check each candidate for local disks and filter accordingly
+        migratable_candidates = []
+        local_disk_candidates = []  # VMs with local disks (need special handling)
+
+        for vm in candidates:
+            vmid = vm.get("vmid")
+            vm_type = vm.get("type")
+            storage_type = self.check_vm_storage_type(source_node, vmid, vm_type)
+
+            if storage_type == "local":
+                if balance_local_disks:
+                    # check if target node actually has the storage
+                    vm_stor = self._get_vm_storage(source_node, vmid, vm_type)
+                    if vm_stor and target_storage_names and vm_stor not in target_storage_names:
+                        self.logger.info(
+                            f"Skipping {vm.get('name', 'unnamed')} (VMID {vmid}) - storage '{vm_stor}' not on {target_node}"
+                        )
+                        continue
+                    vm["_has_local_disks"] = True
+                    local_disk_candidates.append(vm)
+                    self.logger.info(
+                        f"Found {vm.get('name', 'unnamed')} (VMID {vmid}) with local storage - eligible for migration (balance_local_disks enabled)"
+                    )
+                else:
+                    self.logger.info(
+                        f"Skipping {vm.get('name', 'unnamed')} (VMID {vmid}) - uses local storage (enable 'Balance Local Disks' to include)"
+                    )
+                continue
+            elif storage_type == "unknown":
+                self.logger.warning(
+                    f"Could not determine storage type for {vm.get('name', 'unnamed')} (VMID {vmid}) - skipping to be safe"
+                )
+                continue
+
+            vm["_has_local_disks"] = False
+            migratable_candidates.append(vm)
+
+        # Prefer VMs on shared storage, but include local disk VMs if enabled and no shared ones available
+        all_candidates = migratable_candidates + local_disk_candidates
+
+        if not all_candidates:
+            self.logger.info(f"No migratable VMs found on {source_node}")
+            return None
+
+        # Sort by: shared storage first, then VMs over containers, then by memory (smallest first)
+        all_candidates.sort(key=lambda x: (x.get("_has_local_disks", False), x.get("type") == "lxc", x.get("mem", 0)))
+
+        # Build vm->node map once for affinity checks
+        vm_nodes = {}
+        for res in vms:
+            if res.get("type") in ("qemu", "lxc"):
+                vm_nodes[str(res.get("vmid"))] = res.get("node")
+
+        for vm in all_candidates:
+            vm_type = "CT" if vm.get("type") == "lxc" else "VM"
+            local_warning = " [LOCAL DISKS]" if vm.get("_has_local_disks") else ""
+            restart_warning = " (will restart!)" if vm.get("type") == "lxc" else ""
+            self.logger.info(
+                f"Potential migration candidate: {vm.get('name', 'unnamed')} ({vm_type} {vm.get('vmid')}, RAM: {self._format_bytes(vm.get('mem', 0))}){local_warning}{restart_warning}"
+            )
+
+        # Check affinity rules before picking candidate (Issue
+        # Simulate the move first so the check sees the VM's new position
+        # Also check CPU compatibility (CPU compat) before selecting
+        selected = None
+        for candidate in all_candidates:
+            cid = str(candidate.get("vmid"))
+            old_node = vm_nodes.get(cid)
+            vm_nodes[cid] = target_node
+            aff = self._check_affinity_violation(candidate.get("vmid"), target_node, vm_nodes)
+            vm_nodes[cid] = old_node  # restore
+
+            if aff.get("violation"):
+                if aff.get("enforce"):
+                    self.logger.warning(
+                        f"Skipping {candidate.get('name', 'unnamed')} (VMID {candidate.get('vmid')}) - enforced affinity rule '{aff['rule']}': {aff['message']}"
+                    )
+                    continue
+                else:
+                    self.logger.warning(
+                        f"Affinity warning for {candidate.get('name', 'unnamed')} (VMID {candidate.get('vmid')}) - rule '{aff['rule']}': {aff['message']} (allowing)"
+                    )
+
+            # CPU compatibility check
+            cpu_compat = self._check_cpu_compatibility(candidate, target_node)
+            if not cpu_compat.get("compatible", True):
+                self.logger.warning(
+                    f"Skipping {candidate.get('name', 'unnamed')} (VMID {candidate.get('vmid')}) - CPU incompatible: {cpu_compat.get('reason')}"
+                )
+                continue
+            if cpu_compat.get("warning"):
+                self.logger.warning(f"[CPU] {candidate.get('name', 'unnamed')}: {cpu_compat['warning']}")
+
+            # Overprovisioning gate: don't pick a target that can't fit the
+            # VM's RAM. Only enforced when the caller passes node_status (the balancer
+            # does); other callers keep the old behaviour. No existing balance var
+            # hard-checks target capacity, so this closes a real over-commit hole.
+            if node_status and target_node in node_status:
+                tn = node_status[target_node]
+                free_mem = (tn.get("mem_total") or 0) - (tn.get("mem_used") or 0)
+                vm_mem = candidate.get("mem", 0) or 0
+                if free_mem > 0 and vm_mem > free_mem:
+                    self.logger.info(
+                        f"Skipping {candidate.get('name', 'unnamed')} (VMID {candidate.get('vmid')}) - target {target_node} can't fit it ({self._format_bytes(free_mem)} free < {self._format_bytes(vm_mem)} needed)"
+                    )
+                    continue
+
+            selected = candidate
+            break
+
+        if not selected:
+            self.logger.info(f"No migratable VMs on {source_node} (all blocked by affinity rules or CPU compatibility)")
+            return None
+
+        vm_type = "CT" if selected.get("type") == "lxc" else "VM"
+        if selected.get("_has_local_disks"):
+            self.logger.warning(
+                f"Selected for migration: {selected.get('name', 'unnamed')} ({vm_type} {selected.get('vmid')}) - HAS LOCAL DISKS (will use --with-local-disks)"
+            )
+        elif selected.get("type") == "lxc":
+            self.logger.warning(
+                f"Selected container for migration: {selected.get('name', 'unnamed')} ({vm_type} {selected.get('vmid')}) - WILL CAUSE DOWNTIME!"
+            )
+        else:
+            self.logger.info(
+                f"Selected for migration: {selected.get('name', 'unnamed')} ({vm_type} {selected.get('vmid')})"
+            )
+        return selected
+
+    def get_best_target_node(self, exclude_nodes: List[str] = None, vmid: int = None) -> Optional[str]:
+        """Find the best target node for migration
+
+        Now also excludes nodes configured in excluded_nodes (like ProxLB)
+        (#426): pass vmid to honour a ProxLB plb_pin_<node> tag when
+        picking an evacuation/migration target for that specific guest.
+        """
+        if exclude_nodes is None:
+            exclude_nodes = []
+
+        # GitHub #40 - Exclude rebooting nodes
+        # Also exclude node currently being updated
+        # Race condition: node gets reboot command but rebooting_nodes isn't set yet
+        if hasattr(self, "_rolling_update") and self._rolling_update:
+            rebooting = self._rolling_update.get("rebooting_nodes", [])
+            current = self._rolling_update.get("current_node", "")
+            exclude_rolling = [n for n in rebooting + [current] if n]
+            if exclude_rolling:
+                exclude_nodes = list(set(exclude_nodes + exclude_rolling))
+                self.logger.debug(f"Excluding rolling-update nodes: {exclude_rolling}")
+
+        # Also exclude nodes configured in cluster settings
+        config_excluded = getattr(self.config, "excluded_nodes", []) or []
+        all_excluded = list(set(exclude_nodes + config_excluded))
+
+        if config_excluded:
+            self.logger.debug(f"Excluding configured nodes from balancing: {config_excluded}")
+
+        node_status = self.get_node_status()
+
+        # Filter available nodes
+        available_nodes = [
+            (node, data)
+            for node, data in node_status.items()
+            if data["status"] == "online" and not data.get("maintenance_mode", False) and node not in all_excluded
+        ]
+
+        if not available_nodes:
+            self.logger.debug("Insufficent target nodes for migration (all excluded or in maintenace)")
+            return None
+
+        # (#426) - if this guest carries a ProxLB plb_pin_<node> tag,
+        # restrict the target set to the pinned node(s).
+        if vmid is not None:
+            try:
+                _pin = self._derive_proxlb_tag_rules()["pins"].get(int(vmid))
+            except Exception:
+                _pin = None
+            if _pin:
+                available_nodes = [(n, d) for (n, d) in available_nodes if n in _pin]
+                if not available_nodes:
+                    self.logger.warning(f"[PROXLB] VM {vmid} pinned to {sorted(_pin)} but none are available targets")
+                    return None
+
+        # Sort by score (lowest first)
+        available_nodes.sort(key=lambda x: x[1]["score"])
+
+        return available_nodes[0][0]
+
+    def maintenance_capacity_preview(self, node_name, threshold=90.0):
+        """#611 — read-only pre-flight: would evacuating node_name push any
+        remaining node past `threshold`% RAM?
+
+        Simulates the SAME placement the evacuator performs (running qemu/lxc
+        guests, smallest-mem-first, onto the least-loaded remaining online /
+        non-maintenance / non-excluded node), using already-cached
+        get_node_status() + get_vm_resources() so it adds no PVE load at scale.
+        Never migrates or mutates anything — it is a non-blocking hint.
+
+        Returns {ok, threshold, guest_count, total_guest_mem,
+                 nodes:[{node,current_pct,projected_pct,mem_total}],
+                 over_threshold:[node...], headroom_sufficient, reason?}.
+        """
+        try:
+            threshold = float(threshold)
+        except (TypeError, ValueError):
+            threshold = 90.0
+        threshold = max(1.0, min(100.0, threshold))
+
+        node_status = self.get_node_status()
+        source = node_status.get(node_name)
+        if not source or source.get("status") != "online":
+            return {
+                "ok": True,
+                "reason": "node_not_online",
+                "threshold": threshold,
+                "guest_count": 0,
+                "total_guest_mem": 0,
+                "nodes": [],
+                "over_threshold": [],
+                "headroom_sufficient": True,
+            }
+
+        # Target pool — mirror get_best_target_node's filters (rolling-update
+        # exclusions + config excluded_nodes + online + not-in-maintenance) and
+        # drop the source node itself.
+        exclude = []
+        if hasattr(self, "_rolling_update") and self._rolling_update:
+            rebooting = self._rolling_update.get("rebooting_nodes", [])
+            current = self._rolling_update.get("current_node", "")
+            exclude = [n for n in rebooting + [current] if n]
+        config_excluded = getattr(self.config, "excluded_nodes", []) or []
+        all_excluded = set(exclude) | set(config_excluded) | {node_name}
+        targets = {
+            n: {
+                "mem_used": d.get("mem_used", 0),
+                "mem_total": d.get("mem_total", 0),
+                "mem_percent": d.get("mem_percent", 0),
+            }
+            for n, d in node_status.items()
+            if d.get("status") == "online" and not d.get("maintenance_mode", False) and n not in all_excluded
+        }
+
+        # Guests to evacuate — mirror _evacuate_node (running qemu/lxc on node).
+        vms = self.get_vm_resources() or []
+        node_vms = [
+            vm
+            for vm in vms
+            if vm.get("node") == node_name and vm.get("status") == "running" and vm.get("type") in ("qemu", "lxc")
+        ]
+        total_guest_mem = sum(int(vm.get("mem", 0) or 0) for vm in node_vms)
+
+        if not targets:
+            # single-node cluster / all peers offline: the evacuator SKIPS
+            # evacuation (guests stay running), so this is not a capacity
+            # overflow — flag it distinctly rather than as "over threshold".
+            return {
+                "ok": len(node_vms) == 0,
+                "reason": "no_target_nodes",
+                "threshold": threshold,
+                "guest_count": len(node_vms),
+                "total_guest_mem": total_guest_mem,
+                "nodes": [],
+                "over_threshold": [],
+                "headroom_sufficient": len(node_vms) == 0,
+            }
+
+        # Simulate: smallest-mem-first, each guest onto the target with the
+        # lowest projected mem% (mem-dominant proxy for the evacuator's score).
+        sim = {n: {"used": float(d["mem_used"]), "total": float(d["mem_total"])} for n, d in targets.items()}
+        for vm in sorted(node_vms, key=lambda x: int(x.get("mem", 0) or 0)):
+            gmem = float(int(vm.get("mem", 0) or 0))
+            best = min(
+                sim.keys(),
+                key=lambda n: (
+                    ((sim[n]["used"] + gmem) / sim[n]["total"] * 100.0) if sim[n]["total"] > 0 else float("inf")
+                ),
+            )
+            sim[best]["used"] += gmem
+
+        nodes_out, over_threshold = [], []
+        for n in sorted(sim.keys()):
+            total = sim[n]["total"]
+            proj = round(sim[n]["used"] / total * 100.0, 1) if total > 0 else 0.0
+            nodes_out.append({
+                "node": n,
+                "current_pct": round(targets[n]["mem_percent"], 1),
+                "projected_pct": proj,
+                "mem_total": int(total),
+            })
+            if proj > threshold:
+                over_threshold.append(n)
+
+        # Aggregate headroom: does the whole cluster even have room under the cap?
+        agg_free = sum(max(0.0, sim[n]["total"] * threshold / 100.0 - float(targets[n]["mem_used"])) for n in sim)
+        headroom_sufficient = total_guest_mem <= agg_free
+
+        return {
+            "ok": (not over_threshold) and headroom_sufficient,
+            "threshold": threshold,
+            "guest_count": len(node_vms),
+            "total_guest_mem": total_guest_mem,
+            "nodes": nodes_out,
+            "over_threshold": over_threshold,
+            "headroom_sufficient": headroom_sufficient,
+        }
+
+    def _get_vm_storage(self, node, vmid, vm_type):
+        """Get the primary storage name of a VM/CT (e.g. 'local-lvm')."""
+        try:
+            if vm_type == "lxc":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            r = self._create_session().get(url, timeout=10)
+            if r.status_code == 200:
+                cfg = r.json().get("data", {})
+                if vm_type == "lxc":
+                    rootfs = cfg.get("rootfs", "")
+                    if ":" in rootfs:
+                        return rootfs.split(":")[0]
+                else:
+                    for k in ["scsi0", "virtio0", "ide0", "sata0"]:
+                        v = cfg.get(k, "")
+                        if isinstance(v, str) and ":" in v:
+                            return v.split(":")[0]
+        except Exception:
+            pass
+        return None
+
+    def _get_vm_storage_map(self, node, vmid, vm_type):
+        """Get all local storages used by a VM/CT for migration mapping.
+        Returns dict like {'rootfs': 'local-lvm', 'mp0': 'local-zfs'} for LXC
+        or {'scsi0': 'local-lvm', 'scsi1': 'local-zfs'} for QEMU."""
+        result = {}
+        try:
+            ep = "lxc" if vm_type == "lxc" else "qemu"
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/{ep}/{vmid}/config"
+            r = self._create_session().get(url, timeout=10)
+            if r.status_code != 200:
+                return result
+            cfg = r.json().get("data", {})
+            if vm_type == "lxc":
+                # rootfs + mount points
+                for k, v in cfg.items():
+                    if (k == "rootfs" or k.startswith("mp")) and isinstance(v, str) and ":" in v:
+                        stor = v.split(":")[0]
+                        if stor and stor != "none":
+                            result[k] = stor
+            else:
+                for k, v in cfg.items():
+                    if k.startswith(("scsi", "virtio", "ide", "sata")) and isinstance(v, str) and ":" in v:
+                        stor = v.split(":")[0]
+                        if stor and stor != "none":
+                            result[k] = stor
+        except Exception:
+            pass
+        return result
+
+    # Predictive analysis engine for resource forecasting
+    # uses weighted moving average over historical metrics to predict bottlenecks
+    # before they happen. Feeds into the migration scheduler when enabled.
+    def _compute_predictive_score(self, node_name, window=24):
+        """Calculate predictive resource score for a node based on trend analysis"""
+        try:
+            with self._metrics_history_lock:
+                metrics = list(self._node_metrics_history.get(node_name, []))
+            if len(metrics) < 3:
+                return {"score": 0, "trend": "stable", "confidence": 0}
+
+            # weighted avg - recent samples matter more (exponential decay)
+            # Weights must match windowed slice length, not full history
+            windowed = metrics[-window:]
+            cpu_vals = [m.get("cpu", 0) for m in windowed]
+            mem_vals = [m.get("mem_pct", 0) for m in windowed]
+            weights = [0.7 ** (len(windowed) - i - 1) for i in range(len(windowed))]
+            w_sum = sum(weights)
+
+            cpu_trend = sum(c * w for c, w in zip(cpu_vals, weights)) / w_sum if w_sum else 0
+            mem_trend = sum(m * w for m, w in zip(mem_vals, weights)) / w_sum if w_sum else 0
+
+            # composite score: higher = more likely to need migration soon
+            score = round((cpu_trend * 0.6 + mem_trend * 0.4) * 1.15, 2)
+            confidence = min(len(metrics) / window, 1.0)
+
+            # Threshold from config, fallback 75
+            threshold = getattr(self.config, "predictive_threshold", 75)
+            if score > threshold:
+                trend = "critical"
+            elif score > threshold * 0.7:
+                trend = "rising"
+            else:
+                trend = "stable"
+
+            return {
+                "score": score,
+                "trend": trend,
+                "confidence": round(confidence, 2),
+                "cpu_forecast": round(cpu_trend, 1),
+                "mem_forecast": round(mem_trend, 1),
+                "samples": len(metrics),
+                "_engine": "proxmox-wma-v2",  # internal version tag
+            }
+        except Exception:
+            return {"score": 0, "trend": "unknown", "confidence": 0}
+
+    def get_predictive_analysis(self):
+        """Get predictive migration analysis for all nodes.
+
+        2026-04-24 - was referencing self.node_status (doesn't exist) - always
+        500'd since v0.9.0 rename. Use get_node_status() which returns the merged
+        view from ha_node_status + live PVE data."""
+        result = {}
+        try:
+            ns = self.get_node_status() or {}
+        except Exception:
+            ns = {}
+        for node_name in ns:
+            result[node_name] = self._compute_predictive_score(node_name)
+        return result
+
+    def migrate_vm(self, vm: Dict, target_node: str, dry_run: bool = None, wait_timeout: int = 600) -> bool:
+        """migrate vm to another node"""
+        # This handles the Proxmox API call
+        # Had to add iso unmount, was breaking migrations silently for weeks
+        if dry_run is None:
+            dry_run = self.config.dry_run
+
+        # dry run = just log, dont actually do it
+        if dry_run:
+            self.logger.info(f"[DRY RUN] Would migrate {vm.get('name', 'unnamed')} ({vm.get('vmid')}) to {target_node}")
+            self.last_migration_log.append({
+                "timestamp": datetime.now().isoformat(),
+                "vm": vm.get("name", "unnamed"),
+                "vmid": vm.get("vmid"),
+                "from_node": vm.get("node"),
+                "to_node": target_node,
+                "dry_run": True,
+                "success": True,
+            })
+            return True
+
+        try:
+            vmid = vm.get("vmid")
+            source_node = vm.get("node")
+            if not isinstance(source_node, str) or not isinstance(vmid, int):
+                return False
+            vm_type = vm.get("type")
+            # target_storage = vm.get('_target_storage')  # old code, not needed
+
+            # unmount iso first or migration fails (found this out the hard way)
+            if vm_type == "qemu":
+                config_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/qemu/{vmid}/config"
+                config_response = self._create_session().get(config_url, timeout=15)
+                if config_response.status_code == 200:
+                    config = config_response.json().get("data", {})
+                    for key in ["ide2", "cdrom"]:
+                        if key in config and "iso" in str(config.get(key, "")).lower():
+                            config[key]
+                            self.logger.info(f"unmounting iso from {key}")
+                            unmount_response = self._create_session().put(config_url, data={key: "none,media=cdrom"})
+                            if unmount_response.status_code != 200:
+                                self.logger.warning(f"couldnt unmount iso: {unmount_response.text}")
+
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/qemu/{vmid}/migrate"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/lxc/{vmid}/migrate"
+
+            has_local_disks = vm.get("_has_local_disks", False)
+
+            if vm_type == "lxc":
+                # LXC needs restart for migration
+                data = {"target": target_node, "restart": 1}
+                if has_local_disks:
+                    # PVE wants "rootfs=stor,mp0=stor2" mapping for LXC
+                    stor_map = self._get_vm_storage_map(source_node, vmid, "lxc")
+                    if stor_map:
+                        # map each volume to itself (same storage name on target)
+                        data["target-storage"] = ",".join(f"{k}={v}" for k, v in stor_map.items())
+                    else:
+                        stor = self._get_vm_storage(source_node, vmid, "lxc")
+                        if stor:
+                            data["target-storage"] = stor
+                    self.logger.info(f"container migration with restart, target-storage={data.get('target-storage')}")
+            else:
+                data = {"target": target_node, "online": 1}
+                if has_local_disks:
+                    data["with-local-disks"] = 1
+                    # PVE wants "source_stor:target_stor" mapping for QEMU local disks
+                    stor_map = self._get_vm_storage_map(source_node, vmid, "qemu")
+                    if stor_map:
+                        # dedupe: unique "stor:stor" pairs (same name = migrate to same storage on target)
+                        unique = list(dict.fromkeys(stor_map.values()))
+                        data["targetstorage"] = ",".join(f"{s}:{s}" for s in unique)
+                    else:
+                        stor = self._get_vm_storage(source_node, vmid, "qemu")
+                        if stor:
+                            data["targetstorage"] = stor
+                    self.logger.info(f"local disk migration, targetstorage={data.get('targetstorage')}")
+
+            local_info = " (local disks)" if has_local_disks else ""
+            self.logger.info(
+                f"migrating {vm.get('name', 'unnamed')} ({vmid}) {source_node} -> {target_node}{local_info}"
+            )
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                task_id = response.json().get("data")
+                self.logger.info(
+                    f"[OK] Migration initiated for {vm.get('name', 'unnamed')} to {target_node} (Task: {task_id})"
+                )
+
+                # Wait for migration to complete
+                if isinstance(task_id, str) and task_id:
+                    success = self._wait_for_task(source_node, task_id, timeout=wait_timeout)
+                    if success:
+                        self.logger.info(f"[OK] Successfully migrated {vm.get('name', 'unnamed')} to {target_node}")
+                        self.last_migration_log.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "vm": vm.get("name", "unnamed"),
+                            "vmid": vmid,
+                            "from_node": source_node,
+                            "to_node": target_node,
+                            "dry_run": False,
+                            "success": True,
+                        })
+                        return True
+                    else:
+                        # (#340): HA + negative-affinity setups fail the original
+                        # `hamigrate` task because the requested target violates the rule,
+                        # then HA internally retries to a different node and succeeds.
+                        # Before declaring failure, verify the VM is still on the source node
+                        # if it's moved anywhere else, the evacuation goal is met even if the
+                        # specific task we kicked off didn't land on its chosen target.
+                        try:
+                            current_vms = self.get_vm_resources()
+                            post = next((v for v in current_vms if v.get("vmid") == vmid), None)
+                            actual_node = post.get("node") if post else None
+                        except Exception:
+                            actual_node = None
+                        if actual_node and actual_node != source_node:
+                            self.logger.info(
+                                f"[OK] Migration task reported failure, but {vm.get('name', 'unnamed')} "
+                                f"ended up on {actual_node} (HA likely re-routed from {target_node}). "
+                                "Treating as success."
+                            )
+                            self.last_migration_log.append({
+                                "timestamp": datetime.now().isoformat(),
+                                "vm": vm.get("name", "unnamed"),
+                                "vmid": vmid,
+                                "from_node": source_node,
+                                "to_node": actual_node,
+                                "requested_target": target_node,
+                                "dry_run": False,
+                                "success": True,
+                                "note": "HA re-routed during evacuation",
+                            })
+                            return True
+                        self.logger.error(f"[ERROR] Migration task failed for {vm.get('name', 'unnamed')}")
+                        self.last_migration_log.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "vm": vm.get("name", "unnamed"),
+                            "vmid": vmid,
+                            "from_node": source_node,
+                            "to_node": target_node,
+                            "dry_run": False,
+                            "success": False,
+                            "error": "Task failed",
+                        })
+                        return False
+
+                return True
+            else:
+                self.logger.error(
+                    f"[ERROR] Failed to migrate {vm.get('name', 'unnamed')}: {response.status_code} - {response.text}"
+                )
+                self.last_migration_log.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "vm": vm.get("name", "unnamed"),
+                    "vmid": vmid,
+                    "from_node": source_node,
+                    "to_node": target_node,
+                    "dry_run": False,
+                    "success": False,
+                    "error": response.text,
+                })
+                return False
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Error migrating VM: {e}")
+            return False
+
+    def _wait_for_task(self, node: str, task_id: str, timeout: int = 600) -> bool:
+        """
+        Wait for a Proxmox task to complete.
+
+        This polls the task status endpoint until the task is done or times out.
+        Used after migrations, backups, etc. to ensure they complete before proceeding.
+
+        Polling interval: 2s normally, 5s after errors (to avoid hammering a failing node)
+        Default timeout: 10 minutes (should be enough for most migrations)
+
+        Returns True only if task completed with exitstatus 'OK'.
+        """
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            try:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/tasks/{task_id}/status"
+                response = self._api_get(url)
+
+                if response.status_code == 200:
+                    task_status = response.json()["data"]
+                    status = task_status.get("status")
+
+                    if status == "stopped":
+                        # Task finished - check if successful
+                        exit_status = task_status.get("exitstatus", "")
+                        # #184: WARNINGS = task succeeded with non-fatal warnings (NUMA, local disks, etc.)
+                        # PVE may also return "WARNINGS: N" so we treat any warning-prefixed exit as success
+                        ok = exit_status == "OK" or (exit_status and exit_status.startswith("WARNINGS"))
+                        if not ok:
+                            self.logger.warning(f"Task {task_id} finished with exit status: {exit_status}")
+                        return ok
+
+                time.sleep(2)  # Poll every 2 seconds
+
+            except Exception as e:
+                self.logger.error(f"Error checking task status: {e}")
+                time.sleep(5)  # Back off on errors
+
+        self.logger.error(f"Task {task_id} timed out after {timeout} seconds")
+        return False
+
+    def enter_maintenance_mode(self, node_name, skip_evacuation=False, allow_local_disks=False):
+        # Tries native HA first, falls back to our own evacuation logic
+        # (#330): allow_local_disks opts the evacuator into
+        # --with-local-disks migration for local-storage VMs. Off by default
+        # because it copies disks across the cluster network and can take ages
+        # on bigger VMs; xrcam needed it for a nothing-shared setup.
+        with self.maintenance_lock:
+            if node_name in self.nodes_in_maintenance:
+                return self.nodes_in_maintenance[node_name]
+
+            task = MaintenanceTask(node_name)
+            task.allow_local_disks = bool(allow_local_disks)
+            self.nodes_in_maintenance[node_name] = task
+
+        self.logger.info(
+            f"[MAINT] Entering maintenance mode for node: {node_name}"
+            f"{' (with-local-disks ENABLED)' if allow_local_disks else ''}"
+        )
+
+        # set ceph flags before evacuating (#141)
+        self._set_ceph_maintenance_flags(node_name)
+
+        if skip_evacuation:
+            # Skip evacuation - for non-reboot updates where user accepts the risk
+            self.logger.warning(
+                f"[MAINT] Skipping VM evacuation for {node_name} - VMs may be affected if update fails!"
+            )
+            task.status = "completed"
+            task.total_vms = 0
+            task.migrated_vms = 0
+        else:
+            # Set HA maintenance flag first if available, then always evacuate ourselves.
+            # Before we just did "return True" after ha-manager succeeded and assumed PVE handles it,
+            # but PVE HA only migrates HA-managed resources and gives no feedback. So we do both:
+            # 1) tell PVE we're going into maintenance (so it doesn't fence us)
+            # 2) actively evacuate all VMs ourselves (HA-managed or not)
+            if self._try_native_ha_maintenance(node_name, task):
+                self.logger.info(f"[MAINT] HA flag set for {node_name}, now evacuating VMs ourselves")
+            # always run our own evacuation
+            t = threading.Thread(target=self._evacuate_node, args=(node_name, task))
+            t.daemon = True
+            t.start()
+
+        return task
+
+    def _set_ceph_maintenance_flags(self, node_name):
+        """Set ceph noout+norebalance before maintenance to prevent unnecessary data movement (#141).
+
+        Returns a dict: {'present': bool, 'flags_set': bool, 'error': str|None}
+        The rolling-update flow reads this to report Ceph status to the admin (#181).
+        """
+        result = {"present": False, "flags_set": False, "error": None}
+        try:
+            node_ip = self._get_node_ip(node_name)
+            if not node_ip:
+                result["error"] = "node not reachable"
+                return result
+            # check if ceph is even installed
+            cmd = (
+                "which ceph >/dev/null 2>&1 && ceph osd set norebalance 2>&1 && ceph osd add-noout "
+                + node_name
+                + " 2>&1 && echo CEPH_OK || echo CEPH_SKIP"
+            )
+            out = self._ssh_node_output(node_name, cmd, timeout=30)
+            if out and "CEPH_OK" in out:
+                result["present"] = True
+                result["flags_set"] = True
+                self.logger.info(f"[MAINT] Ceph flags set for {node_name} (norebalance + noout)")
+            else:
+                self.logger.debug(f"[MAINT] No ceph on {node_name} or flags skipped")
+        except Exception as e:
+            result["error"] = str(e)
+            self.logger.debug(f"[MAINT] Ceph flag set failed for {node_name}: {e}")
+        return result
+
+    def get_ceph_health_summary(self, via_node=None):
+        """Fetch a one-shot Ceph health snapshot via SSH for the rolling-update log (#181).
+
+        Returns None if ceph isn't present. On success:
+          {'status': 'HEALTH_OK|HEALTH_WARN|HEALTH_ERR', 'osd_up': int, 'osd_in': int,
+           'pgs': '1024 active+clean', 'warnings': [str, ...]}
+        Best-effort: any parse failure collapses to a minimal dict with status='unknown'.
+        """
+        try:
+            if not via_node:
+                # pick any online node
+                try:
+                    node_status = self.get_node_status()
+                    for nn, info in node_status.items():
+                        if info.get("status") == "online":
+                            via_node = nn
+                            break
+                except Exception:
+                    pass
+            if not via_node:
+                return None
+            # (PVE 9.1.9) - old detection swallowed stderr and
+            # collapsed every failure mode (binary missing, keyring perms, sudo
+            # not allowed, ceph daemon down) into a single "NO_CEPH" → silent
+            # "not deployed" log. Now we inspect each step:
+            #   no-binary  → genuinely no ceph on cluster (return None as before)
+            #   cmd-failed → cluster has ceph, but probe couldn't reach it. Surface
+            #                the stderr in 'warnings' so the rolling-update log
+            #                explains what went wrong instead of misclassifying.
+            cmd = (
+                "set +e; "
+                "if ! command -v ceph >/dev/null 2>&1; then echo CEPH_NOT_INSTALLED; exit 0; fi; "
+                "out=$(ceph -s --format=json 2>&1); rc=$?; "
+                'if [ $rc -eq 0 ]; then echo "$out"; '
+                'else printf \'CEPH_CMD_FAILED rc=%s\\n\' "$rc"; echo "$out" | head -c 400; fi'
+            )
+            out = self._ssh_node_output(via_node, cmd, timeout=15)
+            if not out:
+                # SSH itself didn't return anything — distinct from "ceph not deployed"
+                self.logger.debug(f"[CEPH] probe via {via_node} returned no output")
+                return {
+                    "status": "unknown",
+                    "osd_up": 0,
+                    "osd_in": 0,
+                    "pgs": "",
+                    "warnings": ["ceph probe: no SSH output"],
+                }
+            if "CEPH_NOT_INSTALLED" in out:
+                return None
+            if "CEPH_CMD_FAILED" in out:
+                # Genuine failure with ceph deployed — extract the probe-side message
+                tail = out.split("CEPH_CMD_FAILED", 1)[1].strip()
+                short = (tail.replace("\n", " ").strip())[:200]
+                # (#403 proxforge): ceph-common is often installed
+                # cluster-wide on nodes that don't actually run ceph. `ceph -s`
+                # then fails because there's no conf/monmap here — that's "not
+                # deployed", NOT a degraded cluster. Returning 'unknown' made the
+                # rolling-update log shout ✗ and then wait 120s per node for a
+                # cluster that has no ceph. Treat the no-config signatures as
+                # not-deployed (None); a real ceph that's merely unreachable still
+                # falls through to 'unknown' below so we keep surfacing that.
+                low = short.lower()
+                no_cluster = (
+                    "conf_read_file" in low
+                    or "rados object not found" in low
+                    or "get_monmap_and_config failed" in low
+                    or "unable to read conf" in low
+                    or "did not load config file" in low
+                    or "unable to find any mon" in low
+                    or ("monclient" in low and "fail" in low)
+                )
+                if no_cluster:
+                    self.logger.debug(
+                        f"[CEPH] {via_node}: ceph binary present but no cluster config here → not deployed ({short})"
+                    )
+                    return None
+                self.logger.warning(f"[CEPH] probe failed via {via_node}: {short}")
+                return {
+                    "status": "unknown",
+                    "osd_up": 0,
+                    "osd_in": 0,
+                    "pgs": "",
+                    "warnings": [f"ceph probe failed: {short or 'no detail'}"],
+                }
+            import json as _json
+
+            # sometimes there's a leading banner — pluck the first JSON object
+            start = out.find("{")
+            if start < 0:
+                return {"status": "unknown", "osd_up": 0, "osd_in": 0, "pgs": "", "warnings": []}
+            data = _json.loads(out[start:])
+            health = data.get("health", {}) or {}
+            status = health.get("status") or "unknown"
+            checks = health.get("checks", {}) or {}
+            warnings = list(checks.keys())[:5]
+            osdmap = data.get("osdmap", {}) or {}
+            osd_up = osdmap.get("num_up_osds", osdmap.get("osdmap", {}).get("num_up_osds", 0))
+            osd_in = osdmap.get("num_in_osds", osdmap.get("osdmap", {}).get("num_in_osds", 0))
+            pgmap = data.get("pgmap", {}) or {}
+            pg_summary = ""
+            states = pgmap.get("pgs_by_state") or []
+            if states:
+                pg_summary = ", ".join(f"{s.get('count', 0)} {s.get('state_name', '')}" for s in states[:3])
+            return {"status": status, "osd_up": osd_up, "osd_in": osd_in, "pgs": pg_summary, "warnings": warnings}
+        except Exception as e:
+            self.logger.debug(f"[CEPH] health summary failed: {e}")
+            return {"status": "unknown", "osd_up": 0, "osd_in": 0, "pgs": "", "warnings": []}
+
+    def _unset_ceph_maintenance_flags(self, node_name):
+        """Remove ceph noout+norebalance after maintenance (#141)
+        Mar 2026: try target node first, fall back to any online node
+        (ceph commands are cluster-wide, same as ha-manager)"""
+        cmd_raw = (
+            "which ceph >/dev/null 2>&1 && ceph osd rm-noout "
+            + node_name
+            + " 2>&1 && ceph osd unset norebalance 2>&1 && echo CEPH_OK || echo CEPH_SKIP"
+        )
+        try:
+            # try target node
+            out = self._ssh_node_output(node_name, cmd_raw, timeout=30)
+            if out and "CEPH_OK" in out:
+                self.logger.info(f"[MAINT] Ceph flags cleared for {node_name}")
+                return
+            if out and "CEPH_SKIP" in out:
+                return  # no ceph on this cluster
+
+            # target unreachable — try other online nodes
+            try:
+                node_status = self.get_node_status()
+                for nn, info in node_status.items():
+                    if nn == node_name:
+                        continue
+                    if info.get("status") == "online" or not info.get("offline", True):
+                        out = self._ssh_node_output(nn, cmd_raw, timeout=30)
+                        if out and "CEPH_OK" in out:
+                            self.logger.info(f"[MAINT] Ceph flags cleared for {node_name} (via {nn})")
+                            return
+            except Exception:
+                pass
+        except Exception as e:
+            self.logger.debug(f"[MAINT] Ceph flag unset failed for {node_name}: {e}")
+
+    def refresh_maintenance_status(self):
+        """Force-refresh native HA maintenance state from PVE. Call before rolling update checks. (#141)"""
+        try:
+            native_ha_nodes = set()
+            # re-poll /cluster/ha/status/current
+            ha_nodes = self._get_native_ha_maintenance_nodes()
+            native_ha_nodes.update(ha_nodes)
+
+            # also check /nodes status
+            host = self.host
+            resp = self._api_get(f"https://{host}:{self.api_port}/api2/json/nodes")
+            if resp and resp.status_code == 200:
+                for node in resp.json().get("data", []):
+                    if node.get("status") == "maintenance":
+                        native_ha_nodes.add(node["node"])
+
+            # sync into nodes_in_maintenance (only add externally detected ones)
+            for nm in native_ha_nodes:
+                if nm not in self.nodes_in_maintenance:
+                    from ProxmoxVEx.models.tasks import MaintenanceTask
+
+                    t = MaintenanceTask(nm)
+                    t.native_ha = True
+                    t._discovered_by_refresh = True
+                    t.status = "completed"
+                    t.total_vms = 0
+                    self.nodes_in_maintenance[nm] = t
+                    self.logger.info(f"[MAINT] refresh: detected maintenance on {nm}")
+
+            # Only clean up nodes that were DISCOVERED by refresh (not ones we put there).
+            # PVE drops the HA maintenance flag fast, but we want to keep tracking until user exits.
+            for nm in [
+                n
+                for n, tsk in self.nodes_in_maintenance.items()
+                if getattr(tsk, "_discovered_by_refresh", False) and n not in native_ha_nodes
+            ]:
+                del self.nodes_in_maintenance[nm]
+                self.logger.info(f"[MAINT] refresh: {nm} no longer in maintenance")
+
+            return native_ha_nodes
+        except Exception as e:
+            self.logger.debug(f"[MAINT] refresh failed: {e}")
+            return set()
+
+    def _get_native_ha_maintenance_nodes(self):
+        # Polls /cluster/ha/status/current for nodes in native maintenance
+        # The HA status response has two relevant entry types:
+        #   type=node with status="maintenance"
+        #   id=manager_status with multi-line text "node1 master\nnode2 maintenance\n..."
+        # We check both because single-node clusters only have manager_status
+        try:
+            host = self.host
+            resp = self._api_get(f"https://{host}:{self.api_port}/api2/json/cluster/ha/status/current")
+            if resp.status_code != 200:
+                self.logger.debug(f"[MAINT] HA status endpoint returned {resp.status_code}")
+                return set()
+
+            data = resp.json().get("data", [])
+            result = set()
+            for entry in data:
+                # type=node entries (PVE 8.x with HA resources)
+                if entry.get("type") == "node" and entry.get("status") == "maintenance":
+                    result.add(entry.get("node", ""))
+                # manager_status entry (always present when HA is active)
+                elif entry.get("id") == "manager_status":
+                    # "pve1 master\npve2 maintenance\npve3 online\n"
+                    for line in entry.get("status", "").split("\n"):
+                        parts = line.strip().split()
+                        if len(parts) >= 2 and parts[1] == "maintenance":
+                            result.add(parts[0])
+                # Some PVE versions use quorum/manager with "node" field
+                elif entry.get("status") == "maintenance" and entry.get("node"):
+                    result.add(entry["node"])
+
+            if result:
+                self.logger.debug(f"[MAINT] HA poll found maintenance nodes: {result}")
+            return result
+        except Exception as e:
+            self.logger.debug(f"[MAINT] HA status poll failed: {e}")
+            return set()
+
+    # Try ha-manager crm-command node-maintenance enable
+    # returns True if proxmox takes over, False = we do our own evacuation
+    def _try_native_ha_maintenance(self, node_name, task):
+        try:
+            node_ip = self._get_node_ip(node_name)
+            if not node_ip:
+                self.logger.warning(f"[MAINT] can't resolve {node_name} IP, custom evacuation")
+                return False
+
+            ssh_user = (self.config.user or "root").split("@")[0]
+            # non-root PAM users need sudo for ha-manager
+            prefix = "sudo " if ssh_user != "root" else ""
+            cmd = f"{prefix}ha-manager crm-command node-maintenance enable {node_name}"
+            self.logger.info(f"[MAINT] Trying native HA for {node_name} (user={ssh_user})")
+
+            ok = False
+            ssh_key = getattr(self.config, "ssh_key", "")
+            if ssh_key:
+                ok = self._ssh_run_command_with_key(node_ip, ssh_user, cmd, ssh_key)
+            if not ok:
+                ok = self._ssh_run_command(node_ip, ssh_user, cmd)
+            if not ok and self.config.pass_:
+                ok = self._ssh_run_command_with_password(node_ip, ssh_user, cmd, self.config.pass_)
+
+            if ok:
+                task.native_ha = True
+                # don't set completed here — let _evacuate_node handle the actual migration
+                self.logger.info(f"[MAINT] native HA flag set for {node_name}")
+                return True
+
+            self.logger.warning(f"[MAINT] native HA failed for {node_name}, falling back")
+            return False
+        except Exception as e:
+            self.logger.warning(f"[MAINT] native HA error on {node_name}: {e}")
+            return False
+
+    def _evacuate_node(self, node_name: str, task: MaintenanceTask):
+        # move all VMs off this node
+        try:
+            task.status = "evacuating"
+
+            # Get all VMs on this node
+            vms = self.get_vm_resources()
+            node_vms = [
+                vm
+                for vm in vms
+                if vm.get("node") == node_name and vm.get("status") == "running" and vm.get("type") in ["qemu", "lxc"]
+            ]
+
+            task.total_vms = len(node_vms)
+            task.pending_vms = node_vms.copy()
+
+            if task.total_vms == 0:
+                self.logger.info(f"[OK] No running VMs on {node_name}, maintenance mode ready")
+                task.status = "completed"
+                return
+
+            self.logger.info(f"[PKG] Found {task.total_vms} VMs to evacuate from {node_name}")
+
+            # BUG (single-node maintenance stuck): on a standalone / single-node cluster
+            # — or when every peer is offline — there is NOWHERE to migrate to. The old
+            # path tried each VM (all failed 'no target node'), then STILL entered the
+            # 5-minute post-evacuation wait loop below, so the node sat "stuck" in
+            # maintenance for ~5 min before finishing with errors. Detect the no-target
+            # case up front and skip evacuation: a single node can't live-migrate its
+            # guests, so maintenance just flags the node (guests stay running; the admin
+            # owns any reboot downtime).
+            if self.get_best_target_node(exclude_nodes=[node_name]) is None:
+                self.logger.warning(
+                    f"[MAINT] No other online node to evacuate {task.total_vms} guest(s) from "
+                    f"{node_name} (single-node cluster or all peers offline) — skipping "
+                    f"evacuation; guests stay running."
+                )
+                task.migrated_vms = 0
+                task.pending_vms = []
+                task.note = (
+                    f"Single node: {task.total_vms} guest(s) not evacuated — no other "
+                    f"node to migrate to. They stay running (a reboot will take them down)."
+                )
+                task.status = "completed"
+                return
+
+            # Sort VMs by memory (smallest first for faster evacuation)
+            node_vms.sort(key=lambda x: x.get("mem", 0))
+
+            for vm in node_vms:
+                vm_name = vm.get("name", "unnamed")
+                vmid = vm.get("vmid")
+
+                task.current_vm = {"vmid": vmid, "name": vm_name}
+
+                # #78 - check if VM is still on this node before migrating.
+                # PVE HA might have already moved it while we were busy with other VMs
+                try:
+                    current_vms = self.get_vm_resources()
+                    still_here = any(v.get("vmid") == vmid and v.get("node") == node_name for v in current_vms)
+                    if not still_here:
+                        self.logger.info(f"[OK] {vm_name} ({vmid}) already migrated (HA or manual), skipping")
+                        task.migrated_vms += 1
+                        task.pending_vms = [v for v in task.pending_vms if v.get("vmid") != vmid]
+                        continue
+                except Exception:
+                    pass  # if check fails, try migrating anyway
+
+                # Find best target node (#426: honour a plb_pin tag for this guest)
+                target_node = self.get_best_target_node(exclude_nodes=[node_name], vmid=vmid)
+
+                if not target_node:
+                    self.logger.error(f"[ERROR] No available target node for {vm_name}")
+                    task.failed_vms.append({"vmid": vmid, "name": vm_name, "error": "No target node available"})
+                    task.pending_vms = [v for v in task.pending_vms if v.get("vmid") != vmid]
+                    continue
+
+                # (#330): when the user opted into local-disk evacuation,
+                # probe storage type here and tag the dict so migrate_vm emits
+                # --with-local-disks. Pre-flight check keeps the migrate path honest.
+                if getattr(task, "allow_local_disks", False):
+                    try:
+                        stor_type = self.check_vm_storage_type(node_name, vmid, vm.get("type"))
+                    except Exception as e:
+                        stor_type = None
+                        self.logger.debug(f"[MAINT] storage type probe for {vmid} failed: {e}")
+                    if stor_type == "local":
+                        vm["_has_local_disks"] = True
+                        self.logger.info(
+                            f"[MAINT] {vm_name} ({vmid}) has local disks -- migrating with "
+                            "--with-local-disks (this can take a while on big VMs)"
+                        )
+
+                self.logger.info(f"[SYNC] Evacuating {vm_name} (VMID: {vmid}) to {target_node}")
+
+                # #78 - use longer timeout for evacuations. Local storage
+                # migrations with large disks can easily take 30+ min
+                success = self.migrate_vm(vm, target_node, dry_run=False, wait_timeout=1800)
+
+                if success:
+                    task.migrated_vms += 1
+                    self.logger.info(
+                        f"[OK] Evacuated {vm_name} to {target_node} ({task.migrated_vms}/{task.total_vms})"
+                    )
+                else:
+                    task.failed_vms.append({"vmid": vmid, "name": vm_name, "error": "Migration failed"})
+                    self.logger.error(f"[ERROR] Failed to evacuate {vm_name}")
+
+                task.pending_vms = [v for v in task.pending_vms if v.get("vmid") != vmid]
+
+            task.current_vm = None
+
+            # #78: verify node is actually empty — PVE HA or parallel migrations
+            # might still be running. Give them up to 5 min to finish.
+            remaining = self._count_vms_on_node(node_name)
+            if remaining != 0:  # -1 = API error, also warrants a recheck
+                if remaining > 0:
+                    self.logger.info(f"[MAINT] {remaining} VMs still on {node_name} after evacuation loop, waiting...")
+                else:
+                    self.logger.info(f"[MAINT] couldn't check VMs on {node_name}, retrying...")
+                waited = 0
+                while waited < 300:
+                    time.sleep(10)
+                    waited += 10
+                    remaining = self._count_vms_on_node(node_name)
+                    if remaining == 0:
+                        self.logger.info(f"[OK] All VMs cleared from {node_name} after {waited}s")
+                        break
+                    if remaining < 0:
+                        continue  # API error, just retry
+                    if waited % 60 == 0:
+                        self.logger.info(f"[MAINT] still {remaining} VMs on {node_name} ({waited}s)")
+                if remaining > 0:
+                    self.logger.warning(f"[WARN] {remaining} VMs still on {node_name} after post-evacuation wait")
+                elif remaining < 0:
+                    self.logger.warning(f"[WARN] could not verify VM count on {node_name} - API unreachable")
+
+            if len(task.failed_vms) == 0:
+                task.status = "completed"
+                self.logger.info(f"[OK] Maintenance mode ready for {node_name} - all VMs evacuated")
+            else:
+                task.status = "completed_with_errors"
+                self.logger.warning(
+                    f"[WARN] Maintenance mode for {node_name} completed with {len(task.failed_vms)} failed migrations"
+                )
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Error during evacuation: {e}")
+            task.status = "failed"
+            task.error = str(e)
+
+    def _count_vms_on_node(self, node_name):
+        """Quick check how many running VMs/CTs are still on a node"""
+        try:
+            vms = self.get_vm_resources()
+            return len([
+                v
+                for v in vms
+                if v.get("node") == node_name and v.get("type") in ("qemu", "lxc") and v.get("status") == "running"
+            ])
+        except Exception:
+            return -1
+
+    def exit_maintenance_mode(self, node_name):
+        # Clear native HA flag *before* clearing the internal state.
+        # Old order: del state -> ssh call. If ssh failed (e.g. node still booting
+        # ha-services), PVE stayed in maintenance with no ProxmoxVEx-side trace.
+        with self.maintenance_lock:
+            if node_name not in self.nodes_in_maintenance:
+                return False
+            native = self.nodes_in_maintenance[node_name].native_ha
+
+        if native:
+            ok = False
+            # Retry up to 3 times (10s, 20s, 40s) — gives HA services time to
+            # come up after a node reboot. The actual ssh helper already tries
+            # multiple cluster IPs, so each iteration is a real "try harder".
+            for delay in (0, 10, 20):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    ok = self._try_disable_native_ha_maintenance(node_name)
+                    if ok:
+                        break
+                except Exception as e:
+                    self.logger.warning(f"[MAINT] exit retry for {node_name}: {e}")
+            if not ok:
+                self.logger.error(
+                    f"[MAINT] could not disable native HA maintenance on {node_name} "
+                    f"after 3 retries — PVE may still report it as in maintenance. "
+                    f"Run `ha-manager crm-command node-maintenance disable {node_name}` manually."
+                )
+                # Leave the in-memory state intact so the UI shows the stuck
+                # maintenance and the user can retry. Returning False signals
+                # the caller (rolling-update etc.) that something needs review.
+                return False
+
+        # only now drop the local state — we either disabled HA upstream or
+        # never had native_ha set in the first place
+        with self.maintenance_lock:
+            self.nodes_in_maintenance.pop(node_name, None)
+        self.logger.info(f"[OK] Exited maintenance mode for {node_name}")
+
+        # unset ceph flags after maintenance (#141)
+        self._unset_ceph_maintenance_flags(node_name)
+        return True
+
+    # Reverse of _try_native_ha_maintenance
+    # #141 fix: ha-manager is a cluster command — if target node is offline,
+    # run it on any other reachable node instead
+    def _try_disable_native_ha_maintenance(self, node_name):
+        try:
+            ssh_user = (self.config.user or "root").split("@")[0]
+            prefix = "sudo " if ssh_user != "root" else ""
+            cmd = f"{prefix}ha-manager crm-command node-maintenance disable {node_name}"
+            ssh_key = getattr(self.config, "ssh_key", "")
+
+            # build list of IPs to try: target node first, then other cluster nodes
+            candidate_ips = []
+            target_ip = self._get_node_ip(node_name)
+            if target_ip:
+                candidate_ips.append(target_ip)
+
+            # Gather other online nodes as fallback - the ha-manager command
+            # is cluster-wide so it works from any node
+            try:
+                node_status = self.get_node_status()
+                for nn, info in node_status.items():
+                    if nn == node_name:
+                        continue
+                    if info.get("status") == "online" or not info.get("offline", True):
+                        other_ip = self._get_node_ip(nn)
+                        if other_ip and other_ip not in candidate_ips:
+                            candidate_ips.append(other_ip)
+            except Exception:
+                pass
+
+            if not candidate_ips:
+                self.logger.error(f"[MAINT] no reachable nodes to disable HA maintenance for {node_name}")
+                return
+
+            for ip in candidate_ips:
+                ok = False
+                if ssh_key:
+                    ok = self._ssh_run_command_with_key(ip, ssh_user, cmd, ssh_key)
+                if not ok:
+                    ok = self._ssh_run_command(ip, ssh_user, cmd)
+                if not ok and self.config.pass_:
+                    ok = self._ssh_run_command_with_password(ip, ssh_user, cmd, self.config.pass_)
+
+                if ok:
+                    self.logger.info(f"[MAINT] disabled native HA maintenance for {node_name} (via {ip})")
+                    return True
+                else:
+                    self.logger.debug(f"[MAINT] SSH to {ip} failed for HA disable, trying next...")
+
+            # If all SSH attempts fail the user needs to do it manually
+            self.logger.error(f"[MAINT] couldn't disable HA maintenance for {node_name} via any node")
+            self.logger.error(f"[MAINT] manual fix: sudo ha-manager crm-command node-maintenance disable {node_name}")
+            return False
+        except Exception as e:
+            self.logger.error(f"[MAINT] disable HA maint error {node_name}: {e}")
+            return False
+
+    def get_maintenance_status(self, node_name: str) -> Optional[Dict]:
+        with self.maintenance_lock:
+            if node_name in self.nodes_in_maintenance:
+                return self.nodes_in_maintenance[node_name].to_dict()
+            return None
+
+    # =====================================================
+    # HIGH AVAILABILITY (HA) FUNCTIONS
+    # Our own HA implementation - doesn't use Proxmox HA
+    # Monitors nodes and can restart VMs on other nodes if one fails
+    # Oct 2025: Added quorum host checking for 2-node clusters
+    # =====================================================
+
+    def _ha_discover_fallback_hosts(self):
+        # find all node IPs for fallback
+        self.logger.info("[HA] Auto-discovering cluster node IPs for fallback...")
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return
+
+        try:
+            h = self.host
+            url = f"https://{h}:{self.api_port}/api2/json/nodes"
+            r = self._create_session().get(url, timeout=10)
+
+            if r.status_code != 200:
+                self.logger.error("[HA] Failed to get nodes for auto-discovery")
+                return
+
+            nodes = r.json().get("data", [])
+            discovered_hosts = []
+            skipped = []
+
+            for node in nodes:
+                node_name = node.get("node")
+                node_ip = self._get_node_ip(node_name)
+
+                if node_ip and node_ip != self.config.host:
+                    discovered_hosts.append(node_ip)
+                    self.logger.info(f"[HA] Discovered fallback host: {node_name} -> {node_ip}")
+                elif node_ip == self.config.host:
+                    pass  # This is the primary, skip
+                else:
+                    skipped.append(node_name)
+                    self.logger.warning(f"[HA] Could not find reachable IP for node '{node_name}' - skipped")
+
+            # Update fallback hosts
+            self.config.fallback_hosts = discovered_hosts
+            self.logger.info(f"[HA] Auto-configured {len(discovered_hosts)} fallback hosts: {discovered_hosts}")
+            if skipped:
+                self.logger.warning(f"[HA] Nodes without reachable management IP: {skipped}")
+
+            # Save config
+            save_config()
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error discovering fallback hosts: {e}")
+
+    def _ha_update_fallback_hosts(self):
+        # update fallback hosts periodically
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            response = self._create_session().get(url, timeout=10)
+
+            if response.status_code != 200:
+                return
+
+            nodes = response.json().get("data", [])
+            current_hosts = set()
+
+            for node in nodes:
+                node_name = node.get("node")
+                if node.get("status") == "online":
+                    node_ip = self._get_node_ip(node_name)
+                    if node_ip and node_ip != self.config.host:
+                        current_hosts.add(node_ip)
+
+            # Update if changed
+            if set(self.config.fallback_hosts or []) != current_hosts:
+                old_hosts = self.config.fallback_hosts
+                self.config.fallback_hosts = list(current_hosts)
+                self.logger.info(f"[HA] Updated fallback hosts: {old_hosts} -> {list(current_hosts)}")
+                save_config()
+
+        except Exception as e:
+            self.logger.debug(f"[HA] Error updating fallback hosts: {e}")
+
+    def start_ha_monitor(self):
+        # start HA thread
+        if self.ha_thread and self.ha_thread.is_alive():
+            self.logger.info("HA monitor already running")
+            return
+
+        # Auto-discover fallback hosts
+        self._ha_discover_fallback_hosts()
+
+        # Check cluster size and warn about 2-node clusters
+        try:
+            if self.is_connected or self.connect_to_proxmox():
+                host = self.host
+                url = f"https://{host}:{self.api_port}/api2/json/nodes"
+                resp = self._create_session().get(url, timeout=10)
+                if resp.status_code == 200:
+                    nodes = resp.json().get("data", [])
+                    node_count = len(nodes)
+
+                    if node_count == 2:
+                        self.logger.warning("[HA] ════════════════════════════════════════════════════════")
+                        self.logger.warning("[HA] 2-NODE CLUSTER DETECTED!")
+                        self.logger.warning("[HA] ")
+                        self.logger.warning("[HA] In a 2-node Proxmox cluster, when one node fails,")
+                        self.logger.warning("[HA] the surviving node loses quorum and cannot start VMs!")
+                        self.logger.warning("[HA] ")
+                        self.logger.warning("[HA] RECOMMENDED SOLUTIONS:")
+                        self.logger.warning("[HA] 1. Add a QDevice: pvecm qdevice setup <third-machine-IP>")
+                        self.logger.warning("[HA] 2. Configure fencing in HA settings (IPMI/iLO)")
+                        self.logger.warning("[HA] 3. Enable 'force_quorum_on_failure' (DANGEROUS!)")
+                        self.logger.warning("[HA] ════════════════════════════════════════════════════════")
+                    elif node_count == 1:
+                        self.logger.warning("[HA] Single-node cluster - HA has limited functionality")
+                    else:
+                        self.logger.info(f"[HA] Cluster has {node_count} nodes - quorum should work normally")
+        except Exception as e:
+            self.logger.debug(f"[HA] Could not check cluster size: {e}")
+
+        self.ha_enabled = True
+        self.config.ha_enabled = True
+        self.ha_thread = threading.Thread(target=self._ha_monitor_loop, daemon=True)
+        self.ha_thread.start()
+        self.logger.info("[HA] High Availability monitor started (checking every 10s)")  # 10s hardcoded for now
+
+        # ═══════════════════════════════════════════════════════════════
+        # AUTOMATIC SPLIT-BRAIN PROTECTION SETUP
+        # No manual configuration needed!
+        # ═══════════════════════════════════════════════════════════════
+
+        # Auto-discover shared storage if not already configured
+        if not self.ha_config.get("storage_heartbeat_path"):
+            self.logger.info("[HA] 🔍 Auto-discovering shared storages...")
+            storage_path = self._ha_get_best_shared_storage_path()
+
+            if storage_path:
+                self.logger.info(f"[HA] ✓ Found shared storage: {storage_path}")
+                self.ha_config["storage_heartbeat_path"] = storage_path
+                self.ha_config["storage_heartbeat_enabled"] = True
+                self.ha_config["dual_network_mode"] = True
+
+                # Auto-install agents in background
+                def auto_install():
+                    time.sleep(5)  # Wait for HA to fully start
+                    self.logger.info("[HA] 🔧 Auto-installing node agents...")
+                    results = self._ha_install_agents_on_all_nodes()
+                    success = sum(1 for v in results.values() if v)
+                    self.logger.info(f"[HA] ✓ Node agents: {success}/{len(results)} installed")
+
+                threading.Thread(target=auto_install, daemon=True).start()
+            else:
+                self.logger.warning("[HA] ⚠️ No shared storage found - SSH-only protection mode")
+                self.logger.warning("[HA] ⚠️ Add shared storage (NFS/CephFS) for full dual-network protection")
+
+        # Start storage-based heartbeat if configured
+        if self.ha_config.get("storage_heartbeat_enabled") and self.ha_config.get("storage_heartbeat_path"):
+            self._ha_storage_heartbeat_init()
+            self.logger.info("[HA] ✓ Storage-based split-brain protection ACTIVE")
+            self.logger.info(f"[HA] ✓ Heartbeat path: {self.ha_config.get('storage_heartbeat_path')}")
+        else:
+            self.logger.info("[HA] Split-brain protection: SSH verification active")
+
+        # Restart self-fence agents if they were installed
+        if self.ha_config.get("self_fence_installed"):
+            self.logger.info("[HA] 🛡️ Restarting self-fence agents on nodes...")
+            threading.Thread(target=self._ha_start_self_fence_agents, daemon=True).start()
+
+    def stop_ha_monitor(self):
+        self.ha_enabled = False
+        self.config.ha_enabled = False
+
+        # Stop storage heartbeat thread
+        if self.ha_heartbeat_thread and self.ha_heartbeat_thread.is_alive():
+            self.ha_heartbeat_stop.set()
+            self.ha_heartbeat_thread.join(timeout=5)
+            self.logger.info("[HA] Storage heartbeat thread stopped")
+
+        # Stop self-fence agents on nodes (but don't uninstall)
+        if self.ha_config.get("self_fence_installed"):
+            self.logger.info("[HA] Stopping self-fence agents on nodes...")
+            threading.Thread(target=self._ha_stop_self_fence_agents, daemon=True).start()
+
+        self.logger.info("[HA] High Availability monitor stopped")
+
+    def _ha_monitor_loop(self):
+        # main loop - checks every 10s
+        self.logger.info("[HA] HA monitor loop started")
+        update_counter = 0
+
+        while self.ha_enabled and not self.stop_event.is_set():
+            try:
+                self._ha_check_nodes()
+
+                # Update fallback hosts every 60 seconds (6 iterations)
+                update_counter += 1
+                if update_counter >= 6:
+                    self._ha_update_fallback_hosts()
+                    update_counter = 0
+
+            except Exception as e:
+                self.logger.error(f"[HA] Error in HA monitor: {e}")
+
+            # Wait 10 seconds between checks
+            for _ in range(10):
+                if not self.ha_enabled or self.stop_event.is_set():
+                    break
+                time.sleep(1)
+
+        self.logger.info("[HA] HA monitor loop ended")
+
+    def _ha_check_nodes(self):
+        if not self.is_connected and not self.connect_to_proxmox():
+            self.logger.error("[HA] Cannot connect to Proxmox for HA check")
+            return
+
+        try:
+            # Use current connected host
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+
+            if resp.status_code != 200:
+                self.logger.error(f"[HA] Failed to get nodes: {resp.status_code}")
+                # Try to reconnect (might switch to fallback host)
+                self.session = None
+                self.connect_to_proxmox()
+                return
+
+            nodes = resp.json().get("data", [])
+            current_time = datetime.now()
+
+            with self.ha_lock:
+                for node in nodes:
+                    node_name = node.get("node")
+                    node_status = node.get("status", "unknown")
+
+                    # init tracking for new nodes
+                    if node_name not in self.ha_node_status:
+                        self.ha_node_status[node_name] = {
+                            "last_seen": current_time,
+                            "status": "online",
+                            "consecutive_failures": 0,
+                            "last_status": node_status,
+                        }
+
+                    prev_status = self.ha_node_status[node_name]["status"]
+
+                    if node_status == "online":
+                        # Node is healthy
+                        self.ha_node_status[node_name]["last_seen"] = current_time
+                        self.ha_node_status[node_name]["consecutive_failures"] = 0
+
+                        if prev_status == "offline":
+                            self.logger.info(f"[HA] ✓ Node {node_name} is back ONLINE")
+                            self.ha_node_status[node_name]["status"] = "online"
+                            # Clear recovery flag
+                            self.ha_recovery_in_progress.pop(node_name, None)
+
+                            # Restore quorum if all nodes are back online
+                            self._ha_check_restore_quorum()
+
+                            # Broadcast node online event
+                            try:
+                                broadcast_sse(
+                                    "node_status",
+                                    {
+                                        "node": node_name,
+                                        "status": "online",
+                                        "event": "node_online",
+                                        "message": f"Node {node_name} is back online",
+                                        "cluster_id": self.id,
+                                    },
+                                    self.id,
+                                )
+                            except Exception as e:
+                                self.logger.error(f"[HA] Failed to broadcast node online: {e}")
+                    else:
+                        # Node appears offline
+                        self.ha_node_status[node_name]["consecutive_failures"] += 1
+                        failures = self.ha_node_status[node_name]["consecutive_failures"]
+
+                        self.logger.warning(
+                            f"[HA] ⚠ Node {node_name} check failed ({failures}/{self.ha_failure_threshold})"
+                        )
+
+                        if failures >= self.ha_failure_threshold and prev_status == "online":
+                            self.logger.error(f"[HA] ✗ Node {node_name} declared OFFLINE after {failures} failures!")
+                            self.ha_node_status[node_name]["status"] = "offline"
+
+                            # Broadcast node offline event immediately
+                            try:
+                                broadcast_sse(
+                                    "node_status",
+                                    {
+                                        "node": node_name,
+                                        "status": "offline",
+                                        "event": "node_offline",
+                                        "message": f"Node {node_name} is offline!",
+                                        "cluster_id": self.id,
+                                        "severity": "critical",
+                                    },
+                                    self.id,
+                                )
+                            except Exception as e:
+                                self.logger.error(f"[HA] Failed to broadcast node offline: {e}")
+
+                            # Skip if in maintenance or already recovering
+                            if node_name in self.nodes_in_maintenance:
+                                self.logger.info(f"[HA] Node {node_name} is in maintenance, skipping HA recovery")
+                            elif node_name in self.ha_recovery_in_progress:
+                                self.logger.info(f"[HA] Recovery already in progress for {node_name}")
+                            else:
+                                # Trigger HA recovery
+                                self._ha_trigger_recovery(node_name)
+
+                    self.ha_node_status[node_name]["last_status"] = node_status
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error checking nodes: {e}")
+
+    def _ha_trigger_recovery(self, failed_node: str):
+        """trigger HA recovery for a failed node - restart VMs on surviving nodes"""
+        self.logger.info(f"[HA] ========== STARTING HA RECOVERY FOR {failed_node} ==========")
+
+        # Mark recovery in progress
+        self.ha_recovery_in_progress[failed_node] = True
+
+        # Start recovery in background thread
+        recovery_thread = threading.Thread(target=self._ha_recovery_worker, args=(failed_node,), daemon=True)
+        recovery_thread.start()
+
+    def _ha_recovery_worker(self, failed_node: str):
+
+        try:
+            # ============================================
+            # STEP 0: Try to acquire recovery lock (if storage configured)
+            # ============================================
+            if self.ha_config.get("storage_heartbeat_enabled") and not self._ha_acquire_recovery_lock(failed_node):
+                self.logger.warning(f"[HA] Another instance is already recovering {failed_node}")
+                return
+
+            # ============================================
+            # SPLIT-BRAIN PREVENTION STEP 1: Wait period
+            # ============================================
+            recovery_delay = self.ha_config.get("recovery_delay", 30)
+            self.logger.info(f"[HA] Waiting {recovery_delay}s before recovery (split-brain prevention)...")
+            time.sleep(recovery_delay)
+
+            # Check if node came back online during wait
+            with self.ha_lock:
+                if failed_node in self.ha_node_status and self.ha_node_status[failed_node].get("status") == "online":
+                    self.logger.info(f"[HA] Node {failed_node} came back online - cancelling recovery")
+                    self._ha_release_recovery_lock(failed_node)
+                    return
+
+            # ============================================
+            # SPLIT-BRAIN PREVENTION STEP 2: SSH CHECK (AUTOMATIC!)
+            # ============================================
+            # This is the KEY to automatic split-brain prevention:
+            # If we can SSH to the "dead" node, it's actually alive!
+            # This means we have a NETWORK SPLIT, not a node failure.
+
+            self.logger.info("[HA] ═══════════════════════════════════════════════════════")
+            self.logger.info("[HA] STEP 2: AUTOMATIC SPLIT-BRAIN CHECK")
+            self.logger.info("[HA] ═══════════════════════════════════════════════════════")
+
+            node_is_alive = False
+            running_vms = []
+            running_cts = []
+
+            # Method 1: SSH Check (works if server network is up)
+            self.logger.info("[HA] 2a. Checking via SSH...")
+            ssh_check = self._ha_check_node_via_ssh(failed_node)
+
+            if ssh_check["reachable"]:
+                node_is_alive = True
+                running_vms = ssh_check.get("running_vms", [])
+                running_cts = ssh_check.get("running_cts", [])
+                self.logger.warning(f"[HA] ⚠️ Node {failed_node} IS REACHABLE via SSH!")
+
+            # Method 2: Storage Heartbeat Check (works even if server network is down!)
+            # This is CRITICAL for dual-network setups!
+            if self.ha_config.get("dual_network_mode") or self.ha_config.get("storage_heartbeat_enabled"):
+                self.logger.info("[HA] 2b. Checking via STORAGE HEARTBEAT (survives server network failure)...")
+
+                heartbeat = self._ha_check_node_agent_heartbeat(failed_node)
+
+                if heartbeat.get("alive"):
+                    age = heartbeat.get("age_seconds", 0)
+                    self.logger.critical("[HA] ════════════════════════════════════════════════════════")
+                    self.logger.critical(f"[HA] ⚠️ NODE {failed_node} STORAGE HEARTBEAT IS ACTIVE!")
+                    self.logger.critical(
+                        f"[HA] ⚠️ Heartbeat age: {age:.1f}s (timeout: {self.ha_config.get('storage_heartbeat_timeout', 30)}s)"
+                    )
+                    self.logger.critical("[HA] ⚠️ Node is ALIVE on storage network!")
+                    self.logger.critical("[HA] ════════════════════════════════════════════════════════")
+                    node_is_alive = True
+                    # Get VMs from heartbeat if we didn't get them from SSH
+                    if not running_vms:
+                        running_vms = heartbeat.get("running_vms", [])
+                    if not running_cts:
+                        running_cts = heartbeat.get("running_cts", [])
+                elif heartbeat.get("age_seconds") is not None:
+                    self.logger.info(f"[HA] ✓ Storage heartbeat is STALE ({heartbeat.get('age_seconds'):.1f}s old)")
+                else:
+                    self.logger.info(f"[HA] No storage heartbeat found for {failed_node}")
+
+            # Now handle based on combined results
+            if node_is_alive:
+                # NODE IS ALIVE! This is a network split!
+                self.logger.critical("[HA] ☠️ SPLIT-BRAIN RISK DETECTED!")
+                self.logger.critical(f"[HA] Node {failed_node} is ALIVE but not responding to Proxmox API")
+                self.logger.critical("[HA] This is a NETWORK PARTITION, not a node failure!")
+
+                has_running_vms = bool(running_vms or running_cts)
+
+                if has_running_vms:
+                    # CRITICAL: Must stop VMs on the partitioned node first!
+                    self.logger.critical("[HA] ═══════════════════════════════════════════════════════")
+                    self.logger.critical("[HA] STOPPING VMs ON PARTITIONED NODE TO PREVENT CORRUPTION")
+                    self.logger.critical(f"[HA] Running VMs: {running_vms}")
+                    self.logger.critical(f"[HA] Running CTs: {running_cts}")
+                    self.logger.critical("[HA] ═══════════════════════════════════════════════════════")
+
+                    vms_stopped = False
+
+                    # Try SSH method first
+                    if ssh_check["reachable"]:
+                        vms_stopped = self._ha_ssh_stop_vms_on_node(
+                            failed_node,
+                            vmids=running_vms,
+                            ctids=running_cts,
+                            reachable_ips=ssh_check.get("reachable_ips", []),
+                        )
+
+                    # If SSH didn't work, use poison pill via storage
+                    if not vms_stopped and (
+                        self.ha_config.get("dual_network_mode") or self.ha_config.get("storage_heartbeat_enabled")
+                    ):
+                        self.logger.info("[HA] SSH stop failed, using POISON PILL via storage...")
+                        if self._ha_write_poison_pill(failed_node, "Recovery initiated - stop all VMs"):
+                            # Wait for the node agent to see the poison and stop VMs
+                            self.logger.info("[HA] Waiting 30s for node agent to stop VMs...")
+                            time.sleep(30)
+
+                            # Check if VMs stopped
+                            heartbeat = self._ha_check_node_agent_heartbeat(failed_node)
+                            if not heartbeat.get("running_vms") and not heartbeat.get("running_cts"):
+                                vms_stopped = True
+                                self.logger.info("[HA] ✓ Poison pill worked - VMs stopped")
+                            else:
+                                self.logger.warning("[HA] ⚠️ VMs may still be running after poison pill")
+
+                    if not vms_stopped:
+                        strict_mode = self.ha_config.get("strict_fencing", False)
+                        if strict_mode:
+                            self.logger.error(f"[HA] ✗ STRICT MODE: Could not stop VMs on {failed_node} - ABORTING!")
+                            self._ha_release_recovery_lock(failed_node)
+                            return
+                        else:
+                            self.logger.warning(f"[HA] ⚠️ Could not confirm VMs stopped on {failed_node}")
+                            self.logger.warning("[HA] ⚠️ Proceeding anyway - SPLIT-BRAIN RISK EXISTS!")
+                    else:
+                        self.logger.info(f"[HA] ✓ VMs stopped on {failed_node}")
+
+                    # Wait a moment for VMs to fully stop
+                    self.logger.info("[HA] Waiting 10s for VMs to fully stop...")
+                    time.sleep(10)
+                else:
+                    self.logger.info(f"[HA] No running VMs on {failed_node} - safe to proceed")
+            else:
+                # Node is truly unreachable on ALL networks - safe to proceed
+                self.logger.info(f"[HA] ✓ Node {failed_node} confirmed UNREACHABLE (SSH failed, no storage heartbeat)")
+                self.logger.info("[HA] ✓ Safe to proceed with recovery")
+
+            # ============================================
+            # ENSURE CONNECTION (might need to switch hosts)
+            # ============================================
+            if self.current_host and failed_node in self.current_host:
+                self.logger.warning(f"[HA] Currently connected to failing node {self.current_host}, reconnecting...")
+                self.session = None
+                self.is_connected = False
+
+            if not self.is_connected or not self.session:
+                if not self.connect_to_proxmox():
+                    self.logger.error("[HA] Cannot connect to any Proxmox node for recovery!")
+                    self._ha_release_recovery_lock(failed_node)
+                    return
+                self.logger.info(f"[HA] Connected to {self.current_host} for recovery operations")
+
+            # ============================================
+            # SPLIT-BRAIN PREVENTION STEP 3: Quorum check
+            # ============================================
+            if self.ha_config.get("quorum_enabled", True):
+                if not self._ha_check_quorum():
+                    self.logger.error("[HA] ✗ NO QUORUM - Cannot proceed with recovery!")
+                    self.logger.error("[HA] This prevents split-brain: we might be the isolated node")
+                    self.logger.error("[HA] Configure quorum_hosts in HA config or disable quorum check")
+                    self._ha_release_recovery_lock(failed_node)
+                    return
+                self.logger.info("[HA] ✓ Quorum confirmed - safe to proceed with recovery")
+
+            # ============================================
+            # SPLIT-BRAIN PREVENTION STEP 4: Network check
+            # ============================================
+            if self.ha_config.get("verify_network_before_recovery", True):
+                if not self._ha_verify_network():
+                    self.logger.error("[HA] ✗ Network verification failed - we might be isolated!")
+                    self.logger.error("[HA] Not proceeding with recovery to prevent split-brain")
+                    self._ha_release_recovery_lock(failed_node)
+                    return
+                self.logger.info("[HA] ✓ Network connectivity confirmed")
+
+            # ============================================
+            # Optional: Hardware fencing (IPMI/iLO if configured)
+            # ============================================
+            fenced = self._ha_fence_node(failed_node)
+            if fenced:
+                self.logger.info(f"[HA] ✓ Hardware fencing successful for {failed_node}")
+
+            # Get list of VMs that were on the failed node
+            vms_on_failed_node = self._ha_get_vms_on_node(failed_node)
+
+            if not vms_on_failed_node:
+                self.logger.info(f"[HA] No VMs found on failed node {failed_node}")
+                self._ha_release_recovery_lock(failed_node)
+                return
+
+            self.logger.info(f"[HA] Found {len(vms_on_failed_node)} VMs on failed node {failed_node}")
+
+            # Get available target nodes
+            available_nodes = self._ha_get_available_nodes(exclude_node=failed_node)
+
+            if not available_nodes:
+                self.logger.error("[HA] No available nodes for HA recovery!")
+                return
+
+            # Special handling for 2-node cluster
+            # recovery order is by vmid ascending, lowest id gets started first
+            # (consistent ordering prevents races when both nodes try to recover)
+            if len(available_nodes) == 1:
+                self.logger.warning(f"[HA] 2-NODE CLUSTER DETECTED - Only {available_nodes[0]} available for recovery")
+                self.logger.warning(f"[HA] All VMs will be started on {available_nodes[0]}")
+
+            self.logger.info(f"[HA] Available target nodes: {available_nodes}")
+
+            # For each VM, check storage type and try to recover
+            recovered = 0
+            failed = 0
+            skipped_local = 0
+
+            for vm in vms_on_failed_node:
+                vmid = vm.get("vmid")
+                if not isinstance(vmid, int) or not vmid:
+                    continue
+                vm_name = vm.get("name", f"VM {vmid}")
+                vm_type = vm.get("type", "qemu")
+
+                # check VM uses shared storage
+                storage_type = self._ha_check_vm_storage(vmid, vm_type, failed_node)
+
+                if storage_type == "local":
+                    self.logger.warning(f"[HA] ⚠ SKIPPING {vm_name} ({vmid}) - Uses LOCAL storage, cannot recover!")
+                    self.logger.warning("[HA]   → To enable HA for this VM, move its disks to shared storage")
+                    skipped_local += 1
+                    continue
+
+                # Select target node (round-robin or least loaded)
+                target_node = self._ha_select_target_node(available_nodes, vm)
+
+                if not target_node:
+                    self.logger.error(f"[HA] No target node available for {vm_name}")
+                    failed += 1
+                    continue
+
+                self.logger.info(f"[HA] Attempting to recover {vm_name} ({vmid}) to {target_node}")
+
+                # Try to start the VM on the target node
+                # Note: This relies on shared storage - the VM config should already be available
+                success = self._ha_start_vm_on_node(vmid, vm_type, target_node, failed_node)
+
+                if success:
+                    self.logger.info(f"[HA] ✓ Successfully recovered {vm_name} on {target_node}")
+                    recovered += 1
+                else:
+                    self.logger.error(f"[HA] ✗ Failed to recover {vm_name}")
+                    failed += 1
+
+                # Small delay between VM starts
+                time.sleep(2)
+
+            self.logger.info("[HA] ========== HA RECOVERY COMPLETE ==========")
+            self.logger.info(f"[HA] Recovered: {recovered}, Failed: {failed}, Skipped (local storage): {skipped_local}")
+
+            if skipped_local > 0:
+                self.logger.warning(f"[HA] {skipped_local} VMs were skipped because they use local storage!")
+                self.logger.warning("[HA] Move these VMs to shared storage for full HA protection.")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error in recovery worker: {e}")
+        finally:
+            # Release recovery lock
+            self._ha_release_recovery_lock(failed_node)
+
+            # Keep recovery flag for a while to prevent duplicate recovery
+            time.sleep(60)  # 60s cooldown, maybe make this configurable?
+            self.ha_recovery_in_progress.pop(failed_node, None)
+
+    def _ha_check_vm_storage(self, vmid: int, vm_type: str, node: str) -> str:
+        """check if VM uses shared or local storage
+
+        Checks Proxmox 'shared' flag since LVM/ZFS can go either way
+        """
+        try:
+            host = self.host
+
+            # Get VM config
+            if vm_type == "qemu":
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            response = self._create_session().get(url, timeout=10)
+
+            if response.status_code != 200:
+                return "unknown"
+
+            config = response.json().get("data", {})
+
+            # Get storage configurations
+            storage_url = f"https://{host}:{self.api_port}/api2/json/storage"
+            storage_response = self._create_session().get(storage_url, timeout=10)
+            storage_configs = {}
+            if storage_response.status_code == 200:
+                for s in storage_response.json().get("data", []):
+                    storage_configs[s["storage"]] = s
+
+            shared_types = [
+                "nfs",
+                "cifs",
+                "glusterfs",
+                "cephfs",
+                "rbd",
+                "iscsi",
+                "iscsidirect",
+                "drbd",
+                "pbs",
+                "starlvm",
+            ]
+            # Starlvm = StarWind shared thin-LVM (snapshots on a shared SAN LUN), always added with -shared 1
+            local_types = ["dir", "lvmthin"]
+            # LVM/ZFS treated as local unless Proxmox 'shared' flag is set
+
+            has_local = False
+            has_shared = False
+
+            for key, value in config.items():
+                # Check QEMU disks (scsi0, virtio0, ide0, sata0, etc.)
+                if (
+                    vm_type == "qemu"
+                    and any(key.startswith(p) for p in ["scsi", "virtio", "ide", "sata", "efidisk", "tpmstate"])
+                    and isinstance(value, str)
+                    and ":" in value
+                ):
+                    storage_name = value.split(":")[0]
+                    if storage_name in storage_configs:
+                        storage_cfg = storage_configs[storage_name]
+                        storage_type = storage_cfg.get("type", "")
+                        is_shared_flag = storage_cfg.get("shared", 0)
+
+                        if is_shared_flag or storage_type in shared_types:
+                            has_shared = True
+                        elif storage_type in local_types:
+                            has_local = True
+                        else:
+                            has_local = True
+
+                # Check LXC rootfs and mount points
+                if (
+                    vm_type == "lxc"
+                    and (key == "rootfs" or key.startswith("mp"))
+                    and isinstance(value, str)
+                    and ":" in value
+                ):
+                    storage_name = value.split(":")[0]
+                    if storage_name in storage_configs:
+                        storage_cfg = storage_configs[storage_name]
+                        storage_type = storage_cfg.get("type", "")
+                        is_shared_flag = storage_cfg.get("shared", 0)
+
+                        if is_shared_flag or storage_type in shared_types:
+                            has_shared = True
+                        elif storage_type in local_types:
+                            has_local = True
+                        else:
+                            has_local = True
+
+            # If any disk is local, the VM can't be recovered
+            if has_local:
+                return "local"
+            elif has_shared:
+                return "shared"
+            else:
+                return "unknown"
+
+        except Exception as e:
+            self.logger.debug(f"[HA] Error checking VM storage: {e}")
+            return "unknown"
+
+    def get_balancing_excluded_vms(self) -> List[int]:
+        """Get list of VMIDs excluded from load balancing for this cluster
+
+        VMs can be excluded from balancing in the VM config.
+        This is useful for VMs with GPU passthrough, local-only storage,
+        or other reasons why they shouldn't be migrated automatically.
+        """
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            cursor.execute("SELECT vmid FROM balancing_excluded_vms WHERE cluster_id = ?", (self.id,))
+            return [row["vmid"] for row in cursor.fetchall()]
+        except Exception as e:
+            self.logger.error(f"Error getting excluded VMs: {e}")
+            return []
+
+    def set_vm_balancing_excluded(self, vmid: int, excluded: bool, reason: str = None, user: str = "system") -> bool:
+        """Set whether a VM should be excluded from load balancing
+
+        Returns True on success, False on error.
+        """
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+
+            # Ensure table exists (migration for existing databases)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS balancing_excluded_vms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    reason TEXT,
+                    created_by TEXT,
+                    created_at TEXT,
+                    UNIQUE(cluster_id, vmid)
+                )
+            """)
+
+            if excluded:
+                # Use INSERT OR REPLACE for SQLite compatibility
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO balancing_excluded_vms (cluster_id, vmid, reason, created_by, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """,
+                    (self.id, vmid, reason, user, datetime.now().isoformat()),
+                )
+                self.logger.info(f"VM {vmid} excluded from balancing (reason: {reason})")
+            else:
+                cursor.execute("DELETE FROM balancing_excluded_vms WHERE cluster_id = ? AND vmid = ?", (self.id, vmid))
+                self.logger.info(f"VM {vmid} removed from balancing exclusion")
+
+            db.conn.commit()
+            return True
+        except Exception as e:
+            self.logger.error(f"Error setting VM balancing exclusion: {e}")
+            return False
+
+    def is_vm_balancing_excluded(self, vmid: int) -> dict:
+        """Check if a VM is excluded from balancing and get the reason"""
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            cursor.execute(
+                "SELECT vmid, reason, created_by, created_at FROM balancing_excluded_vms WHERE cluster_id = ? AND vmid = ?",
+                (self.id, vmid),
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "excluded": True,
+                    "reason": row["reason"],
+                    "created_by": row["created_by"],
+                    "created_at": row["created_at"],
+                }
+            return {"excluded": False}
+        except Exception as e:
+            self.logger.error(f"Error checking VM balancing exclusion: {e}")
+            return {"excluded": False}
+
+    def get_balancing_excluded_pools(self) -> list:
+        """Get list of pool names excluded from balancing"""
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            cursor.execute("SELECT pool_name FROM balancing_excluded_pools WHERE cluster_id = ?", (self.id,))
+            return [row["pool_name"] for row in cursor.fetchall()]
+        except Exception:
+            return []
+
+    def set_pool_balancing_excluded(self, pool_name: str, excluded: bool, reason: str = "", user: str = ""):
+        try:
+            db = get_db()
+            cursor = db.conn.cursor()
+            if excluded:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO balancing_excluded_pools (cluster_id, pool_name, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (self.id, pool_name, reason, user, datetime.now().isoformat()),
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM balancing_excluded_pools WHERE cluster_id = ? AND pool_name = ?", (self.id, pool_name)
+                )
+            db.conn.commit()
+            return True
+        except Exception as e:
+            self.logger.error(f"Error setting pool exclusion: {e}")
+            return False
+
+    def check_vm_storage_type(self, node: str, vmid: int, vm_type: str) -> str:
+        # public wrapper for _ha_check_vm_storage
+        return self._ha_check_vm_storage(vmid, vm_type, node)
+
+    def _ha_get_vms_on_node(self, node: str) -> List[Dict]:
+        try:
+            # Ensure we're connected to a working node
+            if not self.is_connected and not self.connect_to_proxmox():
+                self.logger.error(f"[HA] Cannot connect to get VMs on {node}")
+                return []
+
+            h = self.host
+            url = f"https://{h}:{self.api_port}/api2/json/cluster/resources"
+            r = self._create_session().get(url, params={"type": "vm"}, timeout=10)
+
+            if r.status_code == 200:
+                res = r.json().get("data", [])
+                # Get VMs that were on the failed node AND were running
+                vms = [x for x in res if x.get("node") == node and x.get("status") == "running"]
+                self.logger.info(f"[HA] Found {len(vms)} running VMs on node {node}")
+                return vms
+            else:
+                self.logger.error(f"[HA] Failed to get cluster resources: {r.status_code}")
+            return []
+        except Exception as e:
+            self.logger.error(f"[HA] Error getting VMs on node: {e}")
+            return []
+
+    def _ha_get_available_nodes(self, exclude_node: str = None) -> List[str]:
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            response = self._create_session().get(url, timeout=10)
+
+            if response.status_code == 200:
+                nodes = response.json().get("data", [])
+                available = []
+                for n in nodes:
+                    nm = n.get("node")
+                    if nm == exclude_node:
+                        continue
+                    if n.get("status") != "online":
+                        continue
+                    if nm in self.nodes_in_maintenance:
+                        continue
+                    available.append(nm)
+                return available
+            return []
+        except Exception:
+            return []
+
+    def _ha_select_target_node(self, available_nodes: List[str], vm: Dict) -> Optional[str]:
+        # pick least loaded node
+        if not available_nodes:
+            return None
+
+        node_status = self.get_node_status()
+
+        if not node_status:
+            return available_nodes[0]  # fallback
+
+        # Sort by score (lower is better)
+        scored_nodes = []
+        for node in available_nodes:
+            if node in node_status:
+                score = node_status[node].get("score", 100)
+                scored_nodes.append((node, score))
+            else:
+                scored_nodes.append((node, 50))  # Default score
+
+        scored_nodes.sort(key=lambda x: x[1])
+        return scored_nodes[0][0] if scored_nodes else None
+
+    def _ha_start_vm_on_node(self, vmid: int, vm_type: str, target_node: str, original_node: str) -> bool:
+        """Attempt to start a VM on a target node after HA failover
+
+        CRITICAL FOR 2-NODE CLUSTERS:
+        1. FIRST force quorum (otherwise pmxcfs is read-only!)
+        2. THEN move config, clear locks, start VM
+
+        Without quorum, /etc/pve is read-only and nothing works!
+        """
+        host = self.host
+
+        try:
+            # Force quorum first (for 2-node clusters)
+            # Without quorum, pmxcfs is read-only - we can't do anything!
+            two_node_mode = self.ha_config.get("two_node_mode", False)
+            force_quorum = self.ha_config.get("force_quorum_on_failure", False)
+
+            if two_node_mode or force_quorum:
+                self.logger.info(f"[HA] Forcing quorum on {target_node} (2-node mode)")
+
+                if self._ha_try_force_quorum(target_node):
+                    self.logger.info("[HA] ✓ Quorum forced successfully")
+                    time.sleep(3)  # Give corosync/pmxcfs time to update
+                else:
+                    self.logger.error("[HA] ✗ Could not force quorum - SSH access required!")
+                    self.logger.error(f"[HA] Manual fix: SSH to {target_node} and run: pvecm expected 1")
+                    # Continue anyway - maybe it will work
+
+            # Try to fence the dead node (if fencing is configured)
+            self.logger.info(f"[HA] Attempting to fence {original_node}")
+            fenced = self._ha_fence_node(original_node)
+            if not fenced:
+                self.logger.warning(f"[HA] ⚠ Could not fence node {original_node}")
+
+            # Check current VM status
+            self.logger.info(f"[HA] Checking VM {vmid} status")
+            try:
+                status_url = f"https://{host}:{self.api_port}/api2/json/cluster/resources"
+                status_resp = self._create_session().get(status_url, params={"type": "vm"}, timeout=10)
+                if status_resp.status_code == 200:
+                    resources = status_resp.json().get("data", [])
+                    vm_resource = next((r for r in resources if r.get("vmid") == vmid), None)
+                    if vm_resource:
+                        vm_status = vm_resource.get("status")
+                        vm_node = vm_resource.get("node")
+                        self.logger.info(f"[HA] VM {vmid} current state: {vm_status} on {vm_node}")
+            except Exception as e:
+                self.logger.warning(f"[HA] Could not check VM state: {e}")
+
+            # Clear any locks on the VM
+            self.logger.info(f"[HA] Clearing locks on VM {vmid}")
+            if not self._ha_clear_vm_lock(vmid, vm_type, target_node, original_node):
+                self.logger.warning(f"[HA] ⚠ Failed to clear lock on {vm_type}/{vmid} - continuing anyway")
+
+            # Move VM config to target node
+            # The config must be in /etc/pve/nodes/<target>/qemu-server/<vmid>.conf
+            self.logger.info(f"[HA] Moving VM {vmid} config from {original_node} to {target_node}")
+            config_moved = self._ha_move_vm_config(vmid, vm_type, original_node, target_node)
+            if config_moved:
+                self.logger.info(f"[HA] ✓ VM {vmid} config moved to {target_node}")
+                time.sleep(2)  # Give pmxcfs time to sync
+            else:
+                self.logger.warning("[HA] Could not move config - will try to start anyway")
+
+            # Start the VM on target node
+            self.logger.info(f"[HA] Starting VM {vmid} on {target_node}")
+
+            if vm_type == "qemu":
+                start_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/qemu/{vmid}/status/start"
+            else:
+                start_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/lxc/{vmid}/status/start"
+
+            start_response = self._create_session().post(start_url, timeout=15)
+
+            if start_response.status_code == 200:
+                self.logger.info(f"[HA] ✓ VM {vmid} started successfully on {target_node}")
+                return True
+
+            error_text = start_response.text.lower()
+            self.logger.error(f"[HA] Failed to start VM {vmid}: {start_response.text}")
+
+            # Handle specific errors
+            if "no quorum" in error_text or "cluster not ready" in error_text:
+                self.logger.error("[HA] ✗ Still no quorum - force quorum may have failed")
+                if not (two_node_mode or force_quorum):
+                    self.logger.error("[HA] Enable '2-Node Cluster Mode' in HA settings!")
+                return False
+
+            if "does not exist" in error_text or "not found" in error_text:
+                self.logger.error(f"[HA] ✗ VM config not found on {target_node}")
+                self.logger.error("[HA] Config move may have failed - check SSH access")
+                return False
+
+            # Try with skiplock if there's a lock — only works for *password*-auth root@pam,
+            # API tokens are rejected by PVE even when owned by root.  (#391):
+            # gate on the token flag too so we don't waste an HTTP call we know will fail.
+            if (
+                "lock" in error_text
+                and self.config.user.lower().startswith("root@")
+                and not getattr(self, "_using_api_token", False)
+            ):
+                self.logger.info(f"[HA] VM {vmid} has lock, trying with skiplock=1")
+                start_response = self._create_session().post(start_url, data={"skiplock": 1}, timeout=15)
+                if start_response.status_code == 200:
+                    self.logger.info(f"[HA] ✓ VM {vmid} started with skiplock")
+                    return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error starting VM {vmid} on {target_node}: {e}")
+            return False
+
+    def _ha_check_quorum(self) -> bool:
+        """check if we have quorum by pinging external hosts
+
+        Crucial for 2-node clusters - prevents split-brain
+        """
+        quorum_hosts = self.ha_config.get("quorum_hosts", [])
+        gateway = self.ha_config.get("quorum_gateway")
+        required_votes = self.ha_config.get("quorum_required_votes", 2)
+
+        # Build list of hosts to check
+        hosts_to_check = list(quorum_hosts)
+        if gateway:
+            hosts_to_check.insert(0, gateway)
+
+        # If no quorum hosts configured, try to auto-detect
+        if not hosts_to_check:
+            # Try common external hosts
+            hosts_to_check = [
+                "8.8.8.8",  # Google DNS
+                "1.1.1.1",  # Cloudflare DNS
+                "9.9.9.9",  # Quad9 DNS
+            ]
+            self.logger.debug(f"[HA] No quorum hosts configured, using defaults: {hosts_to_check}")
+
+        # Count successful pings
+        votes = 0
+        for host in hosts_to_check:
+            if self._ha_ping_host(host):
+                votes += 1
+                self.logger.debug(f"[HA] Quorum vote from {host}: ✓")
+            else:
+                self.logger.debug(f"[HA] Quorum vote from {host}: ✗")
+
+        # We always count ourselves as 1 vote
+        total_possible = len(hosts_to_check) + 1  # +1 for ourselves
+        votes += 1  # Our own vote
+
+        has_quorum = votes >= required_votes
+
+        self.ha_have_quorum = has_quorum
+        self.ha_last_quorum_check = datetime.now()
+
+        self.logger.info(f"[HA] Quorum check: {votes}/{total_possible} votes (need {required_votes})")
+
+        return has_quorum
+
+    def _ha_verify_network(self) -> bool:
+        """Verify network connectivity before HA recovery
+
+        This is an additional safety check beyond quorum.
+        We verify we can reach important infrastructure.
+        """
+        check_hosts = self.ha_config.get("network_check_hosts", [])
+        required = self.ha_config.get("network_check_required", 1)
+
+        # If no hosts configured, use gateway or skip
+        if not check_hosts:
+            gateway = self.ha_config.get("quorum_gateway")
+            if gateway:
+                check_hosts = [gateway]
+            else:
+                # Try to detect default gateway
+                try:
+                    result = subprocess.run(
+                        ["ip", "route", "show", "default"], capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0 and "via" in result.stdout:
+                        gateway = result.stdout.split("via")[1].split()[0]
+                        check_hosts = [gateway]
+                except Exception:
+                    pass
+
+        if not check_hosts:
+            self.logger.debug("[HA] No network check hosts, skipping verification")
+            return True
+
+        successful = 0
+        for host in check_hosts:
+            if self._ha_ping_host(host):
+                successful += 1
+
+        if successful >= required:
+            return True
+        else:
+            self.logger.warning(
+                f"[HA] Network check: only {successful}/{len(check_hosts)} hosts reachable (need {required})"
+            )
+            return False
+
+    def _ha_ping_host(self, host: str, timeout: int = 3) -> bool:
+        # ping check
+        try:
+            result = subprocess.run(
+                ["ping", "-c", "1", "-W", str(timeout), host], capture_output=True, timeout=timeout + 2
+            )
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+        except FileNotFoundError:
+            # ping not available, try socket
+            try:
+                import socket
+
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                connect_result = sock.connect_ex((host, 80))
+                sock.close()
+                return connect_result == 0
+            except Exception:
+                return False
+        except Exception:
+            return False
+
+    def _ha_self_fence(self):
+        """self-fence: stop our VMs if we lose quorum (2-node safety)"""
+        if not self.ha_config.get("self_fence_enabled", True):
+            return
+
+        self.logger.error("[HA] ========== SELF-FENCING TRIGGERED ==========")
+        self.logger.error("[HA] This node has lost quorum and will fence itself")
+        self.logger.error("[HA] This prevents split-brain data corruption")
+
+        # Mark that we should not start any VMs
+        self.ha_have_quorum = False
+
+        # If watchdog is enabled, trigger it
+        if self.ha_config.get("watchdog_enabled", False):
+            self.logger.error("[HA] Triggering hardware watchdog reboot in 60 seconds...")
+            try:
+                # Write to watchdog device - this will reboot the system
+                # if not reset within the timeout
+                with open("/dev/watchdog", "w") as wd:
+                    wd.write("V")  # Magic close character
+                self.logger.error("[HA] Watchdog armed - system will reboot if quorum not restored")
+            except Exception as e:
+                self.logger.error(f"[HA] Could not arm watchdog: {e}")
+
+    def _ha_fence_node(self, node: str) -> bool:
+        """fence (power off) a node via IPMI/iLO/DRAC"""
+        # check fencing is configured for this node
+        fencing_config = getattr(self.config, "fencing", {})
+        node_fencing = fencing_config.get(node, {})
+
+        if not node_fencing:
+            self.logger.warning(f"[HA] No fencing configured for node {node}")
+            self.logger.warning(f"[HA] Configure fencing in config: fencing.{node}.type = 'ipmi'")
+            return False
+
+        fence_type = node_fencing.get("type", "").lower()
+
+        try:
+            if fence_type == "ipmi":
+                # IPMI fencing
+                ipmi_host = node_fencing.get("host")
+                ipmi_user = node_fencing.get("user", "ADMIN")
+                ipmi_pass = node_fencing.get("password")
+
+                if not ipmi_host or not ipmi_pass:
+                    self.logger.error("[HA] IPMI fencing requires host and password")
+                    return False
+
+                self.logger.info(f"[HA] Fencing node {node} via IPMI at {ipmi_host}")
+
+                # Power off via ipmitool
+                result = subprocess.run(
+                    ["ipmitool", "-I", "lanplus", "-H", ipmi_host, "-U", ipmi_user, "-P", ipmi_pass, "power", "off"],
+                    capture_output=True,
+                    timeout=30,
+                )
+
+                if result.returncode == 0:
+                    self.logger.info(f"[HA] ✓ Successfully fenced node {node}")
+                    time.sleep(5)  # Wait for node to fully power off
+                    return True
+                else:
+                    self.logger.error(f"[HA] IPMI fencing failed: {result.stderr.decode()}")
+                    return False
+
+            elif fence_type == "ssh":
+                # SSH fencing (emergency shutdown)
+                ssh_host = node_fencing.get("host", node)
+                ssh_user = node_fencing.get("user", "root")
+
+                self.logger.info(f"[HA] Fencing node {node} via SSH shutdown")
+
+                result = subprocess.run(
+                    [
+                        "ssh",
+                        "-o",
+                        "ConnectTimeout=5",
+                        "-o",
+                        "StrictHostKeyChecking=no",
+                        f"{ssh_user}@{ssh_host}",
+                        "poweroff",
+                    ],
+                    capture_output=True,
+                    timeout=15,
+                )
+
+                # SSH might fail if node is really dead, that's OK
+                time.sleep(10)  # Wait for shutdown
+                return True
+
+            elif fence_type == "proxmox":
+                # Use Proxmox's built-in HA fencing
+                self.logger.info(f"[HA] Using Proxmox HA fencing for {node}")
+                # Proxmox handles this automatically if HA is configured
+                return True
+
+            else:
+                self.logger.warning(f"[HA] Unknown fencing type: {fence_type}")
+                return False
+
+        except subprocess.TimeoutExpired:
+            self.logger.warning(f"[HA] Fencing timed out for {node}")
+            return False
+        except FileNotFoundError:
+            self.logger.error("[HA] Fencing tool not found (ipmitool/ssh)")
+            return False
+        except Exception as e:
+            self.logger.error(f"[HA] Fencing error for {node}: {e}")
+            return False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # AUTOMATIC SPLIT-BRAIN PROTECTION
+    #
+    # ZERO MANUAL SETUP REQUIRED! Uses existing SSH credentials.
+    #
+    # How it works:
+    # 1. Node appears dead (no API response)
+    # 2. ProxmoxVEx tries SSH to the "dead" node
+    # 3. If SSH works → Node is ALIVE (network split!)
+    #    → Stop VMs on that node via SSH
+    #    → Then start VMs on surviving node
+    # 4. If SSH fails → Node is truly DEAD
+    #    → Safe to start VMs on surviving node
+    #
+    # This prevents split-brain WITHOUT requiring:
+    # - Manual agent installation
+    # - Hardware fencing (IPMI/iLO)
+    # - QDevice setup
+    # - Shared storage configuration
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _ha_check_node_via_ssh(self, node: str) -> dict:
+        """check if node is alive via SSH on ALL networks (split-brain prevention).
+        returns dict with reachable, reachable_ips, has_running_vms, running_vms, running_cts, has_storage_locks"""
+        result: Dict[str, Any] = {
+            "reachable": False,
+            "reachable_ips": [],
+            "has_running_vms": False,
+            "running_vms": [],
+            "running_cts": [],
+            "has_storage_locks": False,
+        }
+
+        try:
+            # Get ALL IPs for this node (all networks!)
+            all_ips = self._ha_get_all_node_ips(node)
+
+            if not all_ips:
+                self.logger.warning(f"[HA] Cannot get any IP for node {node}")
+                # Still check storage locks!
+                lock_check = self._ha_check_vm_locks_on_storage(node)
+                result["has_storage_locks"] = lock_check.get("has_active_locks", False)
+                if result["has_storage_locks"]:
+                    self.logger.critical(f"[HA] ⚠️ Node {node} has ACTIVE STORAGE LOCKS!")
+                    self.logger.critical("[HA] ⚠️ Node is likely alive on storage network!")
+                    result["reachable"] = True  # Treat as reachable!
+                return result
+
+            self.logger.info(f"[HA] 🔍 Checking node {node} on ALL networks: {all_ips}")
+
+            # Get SSH credentials from cluster config
+            api_user = self.config.user
+            ssh_user = (api_user or "root").split("@")[0]  # PR #62 (ry-ops): null-safe
+            ssh_password = self.config.pass_
+            ssh_key = getattr(self.config, "ssh_key", "")
+
+            # Try SSH on ALL IPs (parallel for speed - reduces worst-case from N*30s to 30s)
+            check_cmd = "qm list 2>/dev/null | grep running | awk '{print $1}' | tr '\\n' ',' ; echo '|' ; pct list 2>/dev/null | grep running | awk '{print $1}' | tr '\\n' ','"
+
+            def _try_ssh_ip(ip):
+                """Try all SSH auth methods for one IP, return (ip, output) or None."""
+                self.logger.info(f"[HA] Trying SSH to {node} via {ip}...")
+                output = None
+                if ssh_key:
+                    output = self._ssh_run_command_with_key_output(ip, ssh_user, check_cmd, ssh_key)
+                if output is None:
+                    output = self._ssh_run_command_output(ip, ssh_user, check_cmd)
+                if output is None and ssh_password:
+                    output = self._ssh_run_command_with_password_output(ip, ssh_user, check_cmd, ssh_password)
+                return (ip, output) if output is not None else None
+
+            # Run SSH checks in parallel using gevent pool
+            if GEVENT_AVAILABLE and len(all_ips) > 1:
+                from gevent.pool import Pool as _Pool
+
+                pool = _Pool(size=len(all_ips))
+                ssh_results = pool.map(_try_ssh_ip, all_ips)
+            else:
+                ssh_results = [_try_ssh_ip(ip) for ip in all_ips]
+
+            # First successful result wins
+            for r in ssh_results:
+                if r is not None:
+                    ip, output = r
+                    result["reachable"] = True
+                    result["reachable_ips"].append(ip)
+                    self.logger.warning(f"[HA] ⚠️ Node {node} IS REACHABLE via {ip}!")
+
+                    # Parse output: "vmid1,vmid2,|ctid1,ctid2,"
+                    parts = output.strip().split("|")
+                    if len(parts) >= 1 and parts[0].strip():
+                        vms = [v.strip() for v in parts[0].split(",") if v.strip()]
+                        result["running_vms"] = vms
+                    if len(parts) >= 2 and parts[1].strip():
+                        cts = [c.strip() for c in parts[1].split(",") if c.strip()]
+                        result["running_cts"] = cts
+
+                    result["has_running_vms"] = bool(result["running_vms"] or result["running_cts"])
+                    break
+
+            if result["reachable"]:
+                self.logger.critical("[HA] ════════════════════════════════════════════════════════")
+                self.logger.critical("[HA] ⚠️ NETWORK SPLIT DETECTED - NOT A NODE FAILURE!")
+                self.logger.critical(f"[HA] Node {node} reachable via: {result['reachable_ips']}")
+                self.logger.critical(f"[HA] Running VMs: {result['running_vms']}")
+                self.logger.critical(f"[HA] Running CTs: {result['running_cts']}")
+                self.logger.critical("[HA] ════════════════════════════════════════════════════════")
+            else:
+                # SSH failed on all IPs - but check storage locks as final safety check!
+                self.logger.info(f"[HA] SSH failed on all IPs ({all_ips})")
+                self.logger.info("[HA] Checking storage locks as final safety check...")
+
+                lock_check = self._ha_check_vm_locks_on_storage(node)
+                result["has_storage_locks"] = lock_check.get("has_active_locks", False)
+
+                if result["has_storage_locks"]:
+                    self.logger.critical("[HA] ════════════════════════════════════════════════════════")
+                    self.logger.critical("[HA] ⚠️ DANGER: SSH UNREACHABLE BUT STORAGE LOCKS ACTIVE!")
+                    self.logger.critical(f"[HA] ⚠️ Node {node} may still be writing to storage!")
+                    self.logger.critical(f"[HA] ⚠️ Locked VMs: {lock_check.get('locked_vms', [])}")
+                    self.logger.critical("[HA] ════════════════════════════════════════════════════════")
+                    # Treat as reachable to prevent split-brain!
+                    result["reachable"] = True
+                else:
+                    self.logger.info(f"[HA] ✓ Node {node} confirmed UNREACHABLE (SSH failed, no storage locks)")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error in multi-network SSH check: {e}")
+
+        return result
+
+    def _ha_ssh_stop_vms_on_node(
+        self, node: str, vmids: list = None, ctids: list = None, reachable_ips: list = None
+    ) -> bool:
+        """stop VMs/CTs on a node via SSH (tries all IPs) - used during network split to stop VMs before failover"""
+        try:
+            # Use IPs that we know work, or get all IPs
+            all_ips = reachable_ips if reachable_ips else self._ha_get_all_node_ips(node)
+            if not all_ips:
+                self.logger.error(f"[HA] No IPs available for node {node}")
+                return False
+
+            api_user = self.config.user
+            ssh_user = (api_user or "root").split("@")[0]  # PR #62 (ry-ops): null-safe
+            ssh_password = self.config.pass_
+            ssh_key = getattr(self.config, "ssh_key", "")
+
+            self.logger.warning("[HA] ═══════════════════════════════════════════════════════")
+            self.logger.warning(f"[HA] STOPPING VMs ON {node} VIA SSH (Split-Brain Prevention)")
+            self.logger.warning(f"[HA] Trying IPs: {all_ips}")
+            self.logger.warning("[HA] ═══════════════════════════════════════════════════════")
+
+            # Find a working IP
+            working_ip = None
+            for ip in all_ips:
+                # Quick connectivity test
+                test_output = self._ssh_run_command_output(ip, ssh_user, "echo OK")
+                if test_output is None and ssh_key:
+                    test_output = self._ssh_run_command_with_key_output(ip, ssh_user, "echo OK", ssh_key)
+                if test_output is None and ssh_password:
+                    test_output = self._ssh_run_command_with_password_output(ip, ssh_user, "echo OK", ssh_password)
+
+                if test_output is not None:
+                    working_ip = ip
+                    self.logger.info(f"[HA] Using IP {ip} for VM stop commands")
+                    break
+
+            if not working_ip:
+                self.logger.error(f"[HA] Cannot reach node {node} on any IP!")
+                return False
+
+            stopped = []
+            failed = []
+
+            # Stop VMs
+            if vmids:
+                for vmid in vmids:
+                    self.logger.info(f"[HA] Stopping VM {vmid} on {node}...")
+                    stop_cmd = f"qm stop {vmid} --timeout 30 2>&1 || qm stop {vmid} --skiplock --timeout 30 2>&1"
+
+                    success = False
+                    if ssh_key:
+                        success = self._ssh_run_command_with_key(working_ip, ssh_user, stop_cmd, ssh_key)
+                    if not success:
+                        success = self._ssh_run_command(working_ip, ssh_user, stop_cmd)
+                    if not success and ssh_password:
+                        success = self._ssh_run_command_with_password(working_ip, ssh_user, stop_cmd, ssh_password)
+
+                    if success:
+                        stopped.append(f"VM {vmid}")
+                    else:
+                        failed.append(f"VM {vmid}")
+
+            # Stop containers
+            if ctids:
+                for ctid in ctids:
+                    self.logger.info(f"[HA] Stopping CT {ctid} on {node}...")
+                    stop_cmd = f"pct stop {ctid} --timeout 30 2>&1"
+
+                    success = False
+                    if ssh_key:
+                        success = self._ssh_run_command_with_key(working_ip, ssh_user, stop_cmd, ssh_key)
+                    if not success:
+                        success = self._ssh_run_command(working_ip, ssh_user, stop_cmd)
+                    if not success and ssh_password:
+                        success = self._ssh_run_command_with_password(working_ip, ssh_user, stop_cmd, ssh_password)
+
+                    if success:
+                        stopped.append(f"CT {ctid}")
+                    else:
+                        failed.append(f"CT {ctid}")
+
+            self.logger.info(f"[HA] Stopped on {node}: {stopped}")
+            if failed:
+                self.logger.warning(f"[HA] Failed to stop on {node}: {failed}")
+
+            return len(failed) == 0
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error stopping VMs via SSH: {e}")
+            return False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SIMPLE SELF-FENCE AGENT
+    #
+    # Ultra-simple split-brain protection:
+    # - Each node pings the manager AND the other node
+    # - If BOTH unreachable → I'm isolated → stop my VMs
+    # - No shared storage needed! Works with LVM, iSCSI, anything.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    _SELF_FENCE_AGENT_SCRIPT = """#!/bin/bash
+# ProxmoxVEx Self-Fence Agent
+# Split-brain prevention + auto-recovery of the ProxmoxVEx VM itself
+
+MANAGER_IP="__MANAGER_IP__"
+OTHER_NODES="__OTHER_NODES__"  # comma-separated list
+ProxmoxVEx_VMID="__ProxmoxVEx_VMID__"
+# 2026-06-03: 'quorum' (default for 3+ nodes or 2-node-with-qdevice)
+# uses corosync's vote to gate destructive actions. 'wait' (2-node WITHOUT
+# qdevice) skips fencing entirely because corosync loses quorum on every
+# single-node reboot and an aggressive fence would tear the cluster down
+# on every planned maintenance. Detected at install time from `pvecm status`.
+FENCE_STRATEGY="__FENCE_STRATEGY__"
+CHECK_INTERVAL=5
+FAIL_THRESHOLD=3
+FAIL_COUNT=0
+MGR_DOWN_COUNT=0
+MGR_RECOVERY_THRESHOLD=6  # 6 * 5s = 30s before trying restart
+RECOVERY_COOLDOWN=300      # 5 min between restart attempts
+RECOVERY_LOCKDIR="/tmp/.ProxmoxVEx-recovery.lock"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a /var/log/ProxmoxVEx-agent.log
+}
+
+can_reach_manager() {
+    ping -c1 -W2 $MANAGER_IP >/dev/null 2>&1
+}
+
+can_reach_other_nodes() {
+    [ -z "$OTHER_NODES" ] && return 1
+    IFS=',' read -ra NODES <<< "$OTHER_NODES"
+    for node_ip in "${NODES[@]}"; do
+        if [ -n "$node_ip" ] && ping -c1 -W2 $node_ip >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 2026-06-03: quorum-aware gate. Before any destructive action we ask
+# corosync whether the cluster is currently quorate. If yes, we're not
+# isolated regardless of what ICMP says — corosync sees us as part of a
+# voting majority, and a destructive self-fence here would be a false
+# positive (typical trigger: a peer node rebooting briefly drops manager
+# pings while corosync stays quorate for the rest of us). Returns 0
+# when quorate, 1 otherwise (including pvecm absent / non-PVE host).
+is_quorate() {
+    command -v pvecm >/dev/null 2>&1 || return 1
+    pvecm status 2>/dev/null | grep -qE "^Quorate:[[:space:]]+Yes"
+}
+
+stop_all_vms() {
+    log "STOPPING ALL VMs AND CONTAINERS!"
+    for vmid in $(qm list 2>/dev/null | grep running | awk '{print $1}'); do
+        log "Stopping VM $vmid"
+        qm stop $vmid --timeout 30 2>/dev/null &
+    done
+    for ctid in $(pct list 2>/dev/null | grep running | awk '{print $1}'); do
+        log "Stopping CT $ctid"
+        pct stop $ctid --timeout 30 2>/dev/null &
+    done
+    wait
+    log "All VMs/CTs stopped"
+}
+
+# Try to bring back ProxmoxVEx when manager is down but cluster is healthy
+try_restart_ProxmoxVEx_vm() {
+    [ -z "$ProxmoxVEx_VMID" ] && return 1
+
+    # atomic lock via mkdir - only one node wins
+    if ! mkdir "$RECOVERY_LOCKDIR" 2>/dev/null; then
+        lock_age=$(( $(date +%s) - $(stat -c %Y "$RECOVERY_LOCKDIR" 2>/dev/null || echo 0) ))
+        if [ $lock_age -lt $RECOVERY_COOLDOWN ]; then
+            log "Recovery lock held (age ${lock_age}s < ${RECOVERY_COOLDOWN}s cooldown), skipping"
+            return 1
+        fi
+        rmdir "$RECOVERY_LOCKDIR" 2>/dev/null
+        mkdir "$RECOVERY_LOCKDIR" 2>/dev/null || return 1
+    fi
+
+    log "════════════════════════════════════════════════════════"
+    log "MANAGER DOWN - attempting ProxmoxVEx VM $ProxmoxVEx_VMID restart"
+    log "════════════════════════════════════════════════════════"
+
+    # check if we can see this VM at all
+    if ! qm status $ProxmoxVEx_VMID >/dev/null 2>&1; then
+        log "VM $ProxmoxVEx_VMID not accessible from this node"
+        rmdir "$RECOVERY_LOCKDIR" 2>/dev/null
+        return 1
+    fi
+
+    vm_status=$(qm status $ProxmoxVEx_VMID 2>/dev/null | awk '{print $2}')
+    log "VM $ProxmoxVEx_VMID current status: $vm_status"
+
+    if [ "$vm_status" != "running" ]; then
+        qm unlock $ProxmoxVEx_VMID 2>/dev/null
+        log "Starting VM $ProxmoxVEx_VMID..."
+        qm start $ProxmoxVEx_VMID 2>&1 | tee -a /var/log/ProxmoxVEx-agent.log
+
+        # give it time to boot
+        sleep 30
+        if can_reach_manager; then
+            log "ProxmoxVEx VM recovered successfully"
+        else
+            log "VM started but manager not yet reachable, might need more time"
+        fi
+    else
+        log "VM already running - manager might still be booting"
+    fi
+    return 0
+}
+
+log "ProxmoxVEx Self-Fence Agent starting"
+log "Manager: $MANAGER_IP | Other nodes: $OTHER_NODES"
+log "ProxmoxVEx VMID: ${ProxmoxVEx_VMID:-not configured}"
+log "Thresholds: isolation=$FAIL_THRESHOLD, recovery=$MGR_RECOVERY_THRESHOLD"
+
+while true; do
+    mgr_ok=0; nodes_ok=0
+    can_reach_manager && mgr_ok=1
+    can_reach_other_nodes && nodes_ok=1
+
+    if [ $mgr_ok -eq 1 ]; then
+        # everything fine
+        if [ $FAIL_COUNT -gt 0 ] || [ $MGR_DOWN_COUNT -gt 0 ]; then
+            log "Recovered (fail=$FAIL_COUNT mgr_down=$MGR_DOWN_COUNT)"
+        fi
+        FAIL_COUNT=0
+        MGR_DOWN_COUNT=0
+    elif [ $nodes_ok -eq 1 ]; then
+        # manager down but nodes reachable -> ProxmoxVEx probably crashed
+        ((MGR_DOWN_COUNT++))
+        FAIL_COUNT=0
+        log "Manager unreachable, other nodes OK ($MGR_DOWN_COUNT/$MGR_RECOVERY_THRESHOLD)"
+
+        if [ $MGR_DOWN_COUNT -ge $MGR_RECOVERY_THRESHOLD ]; then
+            try_restart_ProxmoxVEx_vm
+            MGR_DOWN_COUNT=0
+        fi
+    else
+        # nobody reachable -> isolated
+        ((FAIL_COUNT++))
+        MGR_DOWN_COUNT=0
+        log "WARNING: Cannot reach anyone! $FAIL_COUNT/$FAIL_THRESHOLD"
+
+        if [ $FAIL_COUNT -ge $FAIL_THRESHOLD ]; then
+            # 2026-06-03: quorum-aware gate. Before fencing, ask corosync
+            # whether the cluster considers us quorate. If yes, this is a
+            # transient ICMP blip (peer reboot / brief network glitch), not
+            # genuine isolation — fencing here would be a false positive
+            # that kills VMs unnecessarily. Reset FAIL_COUNT and keep going.
+            if is_quorate; then
+                log "FAIL_THRESHOLD reached but pvecm says Quorate: Yes — skipping fence (transient blip, not real isolation)"
+                FAIL_COUNT=0
+                sleep $CHECK_INTERVAL
+                continue
+            fi
+            # 2026-06-03: 2-node cluster WITHOUT qdevice can never be
+            # quorate during a peer reboot. The original ping-isolation
+            # behaviour would fence the surviving node on every planned
+            # maintenance and take down ALL VMs cluster-wide. FENCE_STRATEGY
+            # is detected at install time and baked in. 'wait' means we
+            # log + sit on our hands — admin must add a qdevice to enable
+            # safe automatic fencing, OR live with the no-auto-fence trade-off.
+            if [ "$FENCE_STRATEGY" = "wait" ]; then
+                log "ISOLATED but FENCE_STRATEGY=wait (2-node cluster, no qdevice)"
+                log "Keeping VMs running — add a qdevice to enable proper quorum-based fencing"
+                FAIL_COUNT=0
+                sleep $CHECK_INTERVAL
+                continue
+            fi
+            log "════════════════════════════════════════════════════════"
+            log "ISOLATED! Self-fencing to prevent split-brain..."
+            log "(pvecm not quorate AND manager/peers unreachable for ${FAIL_THRESHOLD} cycles)"
+            log "════════════════════════════════════════════════════════"
+            stop_all_vms
+
+            log "Waiting for network recovery..."
+            while ! can_reach_manager && ! can_reach_other_nodes; do
+                sleep 10
+            done
+            log "Network recovered, resuming."
+            FAIL_COUNT=0
+            MGR_DOWN_COUNT=0
+        fi
+    fi
+
+    sleep $CHECK_INTERVAL
+done
+"""
+
+    def _ha_install_self_fence_agent(self, node_name: str, node_ip: str) -> bool:
+        """install self-fence agent on a node via SSH"""
+        try:
+            # Get manager IP (this ProxmoxVEx server)
+            manager_ip = self._get_ProxmoxVEx_server_ip()
+            if not manager_ip:
+                self.logger.error("[HA] Cannot determine ProxmoxVEx server IP!")
+                return False
+
+            # Get other node IPs
+            other_nodes = self._ha_get_other_node_ips(node_name)
+            other_nodes_str = ",".join(other_nodes)
+
+            self.logger.info(f"[HA] Installing self-fence agent on {node_name}")
+            self.logger.info(f"[HA]   Manager IP: {manager_ip}")
+            self.logger.info(f"[HA]   Other nodes: {other_nodes_str}")
+
+            # Prepare agent script
+            agent_script = self._SELF_FENCE_AGENT_SCRIPT
+            agent_script = agent_script.replace("__MANAGER_IP__", manager_ip)
+            agent_script = agent_script.replace("__OTHER_NODES__", other_nodes_str)
+            agent_script = agent_script.replace("__ProxmoxVEx_VMID__", str(self.ha_config.get("ProxmoxVEx_vmid", "")))
+            # 2026-06-03: bake the fence-strategy decision in at install
+            # time. Default to 'quorum' if detection fails; 'wait' is only
+            # selected for confirmed 2-node-no-qdevice topology so admins
+            # of those clusters don't lose every VM on a planned reboot.
+            agent_script = agent_script.replace("__FENCE_STRATEGY__", self._ha_detect_fence_strategy())
+
+            # SSH credentials - try multiple sources
+            ssh_user = getattr(self.config, "ssh_user", None) or "root"
+            ssh_key = getattr(self.config, "ssh_key_path", None) or getattr(self.config, "ssh_key", None)
+            ssh_password = (
+                getattr(self.config, "ssh_password", None) or self.config.pass_
+            )  # Fallback to Proxmox password
+
+            self.logger.debug(
+                f"[HA] SSH credentials: user={ssh_user}, has_key={bool(ssh_key)}, has_password={bool(ssh_password)}"
+            )
+
+            # Create agent script on node
+            import base64
+
+            script_b64 = base64.b64encode(agent_script.encode()).decode()
+
+            install_cmd = f'''
+echo "{script_b64}" | base64 -d > /usr/local/bin/ProxmoxVEx-agent.sh
+chmod +x /usr/local/bin/ProxmoxVEx-agent.sh
+
+cat > /etc/systemd/system/ProxmoxVEx-agent.service << 'SERVICEEOF'
+[Unit]
+Description=ProxmoxVEx Self-Fence Agent
+After=network.target pve-cluster.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ProxmoxVEx-agent.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+systemctl daemon-reload
+systemctl enable ProxmoxVEx-agent.service
+systemctl restart ProxmoxVEx-agent.service
+echo "AGENT_INSTALLED"
+'''
+
+            # Execute installation - try different methods
+            result = None
+
+            # 1. Try with SSH key if available
+            if result is None and ssh_key:
+                self.logger.info(f"[HA] Trying SSH key authentication to {node_ip}...")
+                result = self._ssh_run_command_with_key_output(node_ip, ssh_user, install_cmd, ssh_key)
+
+            # 2. Try with sshpass (password) if available
+            if result is None and ssh_password:
+                # Check if sshpass is installed
+                import shutil
+
+                if shutil.which("sshpass"):
+                    self.logger.info(f"[HA] Trying SSH password authentication to {node_ip}...")
+                    result = self._ssh_run_command_with_password_output(node_ip, ssh_user, install_cmd, ssh_password)
+                else:
+                    self.logger.warning(
+                        "[HA] sshpass not installed - cannot use password auth. Install with: apt install sshpass"
+                    )
+
+            # 3. Try with default SSH (requires pre-configured keys)
+            if result is None:
+                self.logger.info(f"[HA] Trying default SSH authentication to {node_ip}...")
+                result = self._ssh_run_command_output(node_ip, ssh_user, install_cmd)
+
+            if result and "AGENT_INSTALLED" in result:
+                self.logger.info(f"[HA] ✓ Self-fence agent installed on {node_name}")
+                return True
+            else:
+                self.logger.error(f"[HA] SSH to {node_ip} failed (key={bool(ssh_key)}, pass={bool(ssh_password)})")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error installing self-fence agent on {node_name}: {e}")
+            return False
+
+    def _get_ProxmoxVEx_server_ip(self) -> str:
+        """Get the IP address of this ProxmoxVEx server that nodes can reach"""
+        import socket
+
+        # Try to get the IP we use to connect to the cluster
+        try:
+            host = self.host
+            # Create a socket to the cluster to find our outgoing IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((host, 8006))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception:
+            pass
+
+        # Fallback: try to get default interface IP
+        try:
+            hostname = socket.gethostname()
+            return socket.gethostbyname(hostname)
+        except Exception:
+            return ""
+
+    def _ha_get_other_node_ips(self, exclude_node: str) -> list:
+        """Get IP addresses of all nodes except the specified one"""
+        other_ips = []
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+
+            if resp.status_code == 200:
+                nodes_data = resp.json().get("data", [])
+                self.logger.debug(f"[HA] Found {len(nodes_data)} nodes in cluster")
+
+                for node in nodes_data:
+                    node_name = node.get("node", "")
+                    self.logger.debug(f"[HA] Checking node: {node_name} (exclude: {exclude_node})")
+
+                    # Case-insensitive comparison
+                    if node_name and node_name.lower() != exclude_node.lower():
+                        # Use existing _ha_get_node_ip function
+                        node_ip = self._ha_get_node_ip(node_name)
+
+                        if node_ip:
+                            other_ips.append(node_ip)
+                            self.logger.info(f"[HA] Found other node: {node_name} -> {node_ip}")
+                        else:
+                            self.logger.warning(f"[HA] Could not find IP for node: {node_name}")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error getting other node IPs: {e}")
+
+        return other_ips
+
+    def _ha_install_self_fence_on_all_nodes(self) -> dict:
+        """install self-fence agent on all cluster nodes, returns {node: success} dict"""
+        results = {}
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+
+            if resp.status_code != 200:
+                self.logger.error("[HA] Cannot get node list from cluster")
+                return results
+
+            nodes = resp.json().get("data", [])
+            self.logger.info(f"[HA] Installing self-fence agent on {len(nodes)} nodes...")
+
+            for node in nodes:
+                node_name = node.get("node", "")
+                if not node_name:
+                    continue
+
+                # Get node IP
+                node_ip = self._ha_get_node_ip(node_name)
+                if not node_ip:
+                    self.logger.warning(f"[HA] Cannot determine IP for node {node_name}")
+                    results[node_name] = False
+                    continue
+
+                # Install agent
+                success = self._ha_install_self_fence_agent(node_name, node_ip)
+                results[node_name] = success
+
+            success_count = sum(1 for v in results.values() if v)
+            self.logger.info(f"[HA] Self-fence agent installation complete: {success_count}/{len(results)}")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error installing self-fence agents: {e}")
+
+        return results
+
+    def _ha_uninstall_self_fence_on_all_nodes(self) -> dict:
+        """uninstall self-fence agent from all cluster nodes, returns {node: success} dict"""
+        results = {}
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+
+            if resp.status_code != 200:
+                self.logger.error("[HA] Cannot get node list from cluster")
+                return results
+
+            nodes = resp.json().get("data", [])
+            self.logger.info(f"[HA] Uninstalling self-fence agent from {len(nodes)} nodes...")
+
+            for node in nodes:
+                node_name = node.get("node", "")
+                if not node_name:
+                    continue
+
+                # Get node IP
+                node_ip = self._ha_get_node_ip(node_name)
+                if not node_ip:
+                    self.logger.warning(f"[HA] Cannot determine IP for node {node_name}")
+                    results[node_name] = False
+                    continue
+
+                # Uninstall agent
+                success = self._ha_uninstall_self_fence_agent(node_name, node_ip)
+                results[node_name] = success
+
+            success_count = sum(1 for v in results.values() if v)
+            self.logger.info(f"[HA] Self-fence agent uninstallation complete: {success_count}/{len(results)}")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error uninstalling self-fence agents: {e}")
+
+        return results
+
+    def _ha_uninstall_self_fence_agent(self, node_name: str, node_ip: str) -> bool:
+        """uninstall self-fence agent from a single node via SSH"""
+        try:
+            self.logger.info(f"[HA] Uninstalling self-fence agent from {node_name}")
+
+            # SSH credentials - try multiple sources (same as install)
+            ssh_user = getattr(self.config, "ssh_user", None) or "root"
+            ssh_key = getattr(self.config, "ssh_key_path", None) or getattr(self.config, "ssh_key", None)
+            ssh_password = getattr(self.config, "ssh_password", None) or self.config.pass_
+
+            uninstall_cmd = """
+systemctl stop ProxmoxVEx-agent.service 2>/dev/null || true
+systemctl disable ProxmoxVEx-agent.service 2>/dev/null || true
+rm -f /etc/systemd/system/ProxmoxVEx-agent.service
+rm -f /usr/local/bin/ProxmoxVEx-agent.sh
+systemctl daemon-reload
+echo "AGENT_UNINSTALLED"
+"""
+
+            # Execute uninstallation - try different methods
+            result = None
+
+            if result is None and ssh_key:
+                result = self._ssh_run_command_with_key_output(node_ip, ssh_user, uninstall_cmd, ssh_key)
+            if result is None and ssh_password:
+                result = self._ssh_run_command_with_password_output(node_ip, ssh_user, uninstall_cmd, ssh_password)
+            if result is None:
+                result = self._ssh_run_command_output(node_ip, ssh_user, uninstall_cmd)
+
+            if result and "AGENT_UNINSTALLED" in result:
+                self.logger.info(f"[HA] ✓ Self-fence agent uninstalled from {node_name}")
+                return True
+            else:
+                self.logger.error(f"[HA] ✗ Failed to uninstall agent from {node_name}: {result}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error uninstalling self-fence agent from {node_name}: {e}")
+            return False
+
+    def _ha_stop_self_fence_agents(self):
+        """Stop (but don't uninstall) self-fence agents on all nodes
+
+        Used when HA is disabled to prevent agents from running without manager
+        """
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+
+            if resp.status_code != 200:
+                return
+
+            for node in resp.json().get("data", []):
+                node_name = node.get("node", "")
+                node_ip = self._ha_get_node_ip(node_name) if node_name else None
+
+                if node_ip:
+                    ssh_user = getattr(self.config, "ssh_user", None) or "root"
+                    ssh_key = getattr(self.config, "ssh_key_path", None) or getattr(self.config, "ssh_key", None)
+                    ssh_password = getattr(self.config, "ssh_password", None) or self.config.pass_
+
+                    stop_cmd = "systemctl stop ProxmoxVEx-agent.service 2>/dev/null || true"
+
+                    result = None
+                    if ssh_key:
+                        result = self._ssh_run_command_with_key_output(node_ip, ssh_user, stop_cmd, ssh_key)
+                    if result is None and ssh_password:
+                        result = self._ssh_run_command_with_password_output(node_ip, ssh_user, stop_cmd, ssh_password)
+                    if result is None:
+                        self._ssh_run_command_output(node_ip, ssh_user, stop_cmd)
+
+                    self.logger.info(f"[HA] Stopped self-fence agent on {node_name}")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error stopping self-fence agents: {e}")
+
+    def _ha_detect_fence_strategy(self) -> str:
+        """Pick the agent fence-strategy by SSH-querying corosync's view.
+
+        Returns:
+          'quorum' — 3+ nodes OR qdevice configured. Quorum-aware fencing is
+                     safe: corosync's vote majority + agent's quorum-gate
+                     reliably distinguish transient blips from real partitions.
+          'wait'   — Exactly 2 nodes AND no qdevice. Corosync loses quorum on
+                     every single-node reboot, so an aggressive fence would
+                     tear down the whole cluster on planned maintenance.
+                     Agent logs but does NOT auto-fence; admin must either
+                     add a qdevice or accept manual intervention on split.
+
+        Defaults to 'quorum' when detection fails — keeps the historical
+        behaviour for users who already had self-fence working, rather than
+        silently switching them into a more permissive mode without intent.
+
+        2026-06-03 (followup, admin-visibility): result is cached on
+        `self.ha_config['fence_strategy']` (dict with strategy / reason /
+        expected_votes / has_qdevice / detected_at). UI's get_ha_status
+        poll reads from there so we don't re-SSH on every dashboard refresh.
+        Wait-mode also fires an audit-event so admins see it in the audit
+        log / SIEM forward.
+        """
+        decision: Dict[str, Any] = {
+            "strategy": "quorum",
+            "reason": "detection-default",
+            "expected_votes": None,
+            "has_qdevice": None,
+        }
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+            if resp.status_code != 200:
+                self._ha_persist_fence_strategy(decision, "detection-skipped: list-nodes failed")
+                return "quorum"
+
+            ssh_user = getattr(self.config, "ssh_user", None) or "root"
+            ssh_key = getattr(self.config, "ssh_key_path", None) or getattr(self.config, "ssh_key", None)
+            ssh_password = getattr(self.config, "ssh_password", None) or self.config.pass_
+
+            import re as _re
+
+            cmd = "pvecm status 2>/dev/null"
+            for node in resp.json().get("data", []):
+                node_name = node.get("node", "")
+                node_ip = self._ha_get_node_ip(node_name) if node_name else None
+                if not node_ip:
+                    continue
+
+                out = None
+                if ssh_key:
+                    out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cmd, ssh_key)
+                if out is None and ssh_password:
+                    out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, ssh_password)
+                if out is None:
+                    out = self._ssh_run_command_output(node_ip, ssh_user, cmd)
+                if not out or "Expected votes" not in out:
+                    continue
+
+                exp_m = _re.search(r"^Expected votes:\s+(\d+)", out, _re.MULTILINE)
+                expected = int(exp_m.group(1)) if exp_m else 0
+                flags_m = _re.search(r"^Flags:\s+(.+)$", out, _re.MULTILINE)
+                flags = flags_m.group(1) if flags_m else ""
+                has_qdevice = "Qdevice" in flags
+
+                decision["expected_votes"] = expected
+                decision["has_qdevice"] = has_qdevice
+
+                if expected >= 3 or has_qdevice:
+                    decision["strategy"] = "quorum"
+                    decision["reason"] = (
+                        f"3+ nodes ({expected} expected votes) — corosync quorum is meaningful"
+                        if expected >= 3
+                        else "2 nodes with qdevice — quorum survives a single-node reboot"
+                    )
+                    self.logger.info(f"[HA] fence_strategy=quorum (expected_votes={expected}, qdevice={has_qdevice})")
+                    self._ha_persist_fence_strategy(decision, "detected")
+                    return "quorum"
+                else:
+                    decision["strategy"] = "wait"
+                    decision["reason"] = (
+                        f"2-node cluster (expected_votes={expected}) WITHOUT qdevice — "
+                        "corosync loses quorum on every single-node reboot in this topology, "
+                        "so auto-fencing would take the whole cluster down on planned "
+                        "maintenance. Add a qdevice to upgrade to quorum-mode."
+                    )
+                    self.logger.warning(
+                        f"[HA] 2-node WITHOUT qdevice detected (expected_votes={expected}) — "
+                        f"fence_strategy=wait. The agent will NOT auto-stop VMs on isolation. "
+                        f"Add a qdevice for safe automatic fencing."
+                    )
+                    self._ha_persist_fence_strategy(decision, "detected")
+                    return "wait"
+            self._ha_persist_fence_strategy(decision, "detection-skipped: no node returned pvecm output")
+            return "quorum"
+        except Exception as e:
+            self.logger.warning(f"[HA] fence-strategy detection failed: {e} — defaulting to 'quorum'")
+            self._ha_persist_fence_strategy(decision, f"detection-error: {str(e)[:120]}")
+            return "quorum"
+
+    def _ha_persist_fence_strategy(self, decision: dict, reason: str) -> None:
+        """Cache the strategy decision on self.ha_config so the UI's
+        get_ha_status() poll can render it without re-SSHing. Emits an
+        audit event in wait-mode so the signal propagates to the audit
+        log + any configured SIEM/email forwarders."""
+        from datetime import datetime as _dt
+
+        decision = dict(decision)
+        decision["detected_at"] = _dt.utcnow().isoformat() + "Z"
+        decision["detection_reason"] = reason
+        self.ha_config["fence_strategy"] = decision
+
+        # Wait-mode is the one the admin really needs to see — fire an
+        # audit event so it appears in the audit log feed + reaches any
+        # configured SIEM/email forwarder. Quorum-mode is the default
+        # so we skip the noise.
+        if decision["strategy"] == "wait":
+            try:
+                from ProxmoxVEx.utils.audit import log_audit
+
+                log_audit(
+                    "system",
+                    "ha.fence_strategy_wait",
+                    f"Cluster {self.config.name}: agent installed in WAIT-mode "
+                    f"({decision['reason'][:240]}). Auto-fencing disabled — "
+                    f"add a qdevice for safe automatic fencing.",
+                    cluster=self.config.name,
+                )
+            except Exception:
+                # Audit logging is best-effort — the warning log line
+                # above is the load-bearing surface.
+                pass
+
+    def _ha_cleanup_storage_heartbeat(self) -> dict:
+        """Wipe the `.ProxmoxVEx` heartbeat directory on the shared storage path
+        used by the node-agent's poison-pill mechanism.
+
+        2026-06-03 - companion to the proper HA-disable teardown. Without
+        this, stale `poison_<node>` / `heartbeat_<node>` files from the
+        previous enable-cycle would survive into the next install, and the
+        first poll of the freshly-installed node-agent would read a leftover
+        poison and stop every VM on the node. Best-effort: returns a dict
+        describing what we cleaned + what we couldn't reach. Never raises.
+        """
+        storage_path = (self.ha_config or {}).get("storage_heartbeat_path") or ""
+        result = {"attempted": False, "cleaned": False, "path": storage_path, "error": None}
+        if not storage_path:
+            return result
+        result["attempted"] = True
+
+        # Operate via the same SSH path the agent installer uses. We pick the
+        # first reachable cluster node and rm -rf the dir from there — the
+        # storage is shared so any node sees the same tree.
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+            if resp.status_code != 200:
+                result["error"] = f"list-nodes HTTP {resp.status_code}"
+                return result
+
+            ssh_user = getattr(self.config, "ssh_user", None) or "root"
+            ssh_key = getattr(self.config, "ssh_key_path", None) or getattr(self.config, "ssh_key", None)
+            ssh_password = getattr(self.config, "ssh_password", None) or self.config.pass_
+
+            # Defense-in-depth: refuse to rm -rf anything that doesn't look
+            # like a heartbeat dir. Path must end in `.ProxmoxVEx` exactly.
+            target = os.path.join(storage_path, ".ProxmoxVEx").rstrip("/")
+            if not target.endswith("/.ProxmoxVEx"):
+                result["error"] = "safety-check: refusing to rm path that does not end in /.ProxmoxVEx"
+                return result
+
+            cleanup_cmd = (
+                f"if [ -d {shlex.quote(target)} ]; then "
+                f"  rm -rf {shlex.quote(target)} && echo HEARTBEAT_DIR_CLEANED; "
+                f"else echo HEARTBEAT_DIR_ABSENT; fi"
+            )
+
+            for node in resp.json().get("data", []):
+                node_name = node.get("node", "")
+                node_ip = self._ha_get_node_ip(node_name) if node_name else None
+                if not node_ip:
+                    continue
+
+                out = None
+                if ssh_key:
+                    out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cleanup_cmd, ssh_key)
+                if out is None and ssh_password:
+                    out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cleanup_cmd, ssh_password)
+                if out is None:
+                    out = self._ssh_run_command_output(node_ip, ssh_user, cleanup_cmd)
+
+                if out and ("HEARTBEAT_DIR_CLEANED" in out or "HEARTBEAT_DIR_ABSENT" in out):
+                    result["cleaned"] = True
+                    self.logger.info(f"[HA] storage heartbeat dir cleanup via {node_name}: ok")
+                    return result
+                else:
+                    self.logger.debug(f"[HA] storage heartbeat cleanup via {node_name} no-answer, trying next node")
+
+            result["error"] = "no node could reach the storage path to clean it"
+            return result
+        except Exception as e:
+            result["error"] = str(e)[:200]
+            return result
+
+    def _ha_start_self_fence_agents(self):
+        """Start self-fence agents on all nodes
+
+        Used when HA is enabled and agents were previously installed
+        """
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+
+            if resp.status_code != 200:
+                return
+
+            for node in resp.json().get("data", []):
+                node_name = node.get("node", "")
+                node_ip = self._ha_get_node_ip(node_name) if node_name else None
+
+                if node_ip:
+                    ssh_user = getattr(self.config, "ssh_user", None) or "root"
+                    ssh_key = getattr(self.config, "ssh_key_path", None) or getattr(self.config, "ssh_key", None)
+                    ssh_password = getattr(self.config, "ssh_password", None) or self.config.pass_
+
+                    start_cmd = "systemctl start ProxmoxVEx-agent.service 2>/dev/null || true"
+
+                    result = None
+                    if ssh_key:
+                        result = self._ssh_run_command_with_key_output(node_ip, ssh_user, start_cmd, ssh_key)
+                    if result is None and ssh_password:
+                        result = self._ssh_run_command_with_password_output(node_ip, ssh_user, start_cmd, ssh_password)
+                    if result is None:
+                        self._ssh_run_command_output(node_ip, ssh_user, start_cmd)
+
+                    self.logger.info(f"[HA] Started self-fence agent on {node_name}")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error starting self-fence agents: {e}")
+
+    def _ha_discover_shared_storages(self, force_refresh: bool = False) -> list:
+        """Automatically discover all shared storages in the cluster
+
+        Queries Proxmox API for storages and filters for:
+        - shared: 1 (accessible from all nodes)
+        - type: nfs, cephfs, glusterfs (filesystem-based)
+
+        Also detects block-based storages (LVM, iSCSI, RBD) to warn user.
+
+        Results are cached to avoid repeated API calls.
+
+        Returns list of dicts with storage info:
+        [{'name': 'cephfs', 'type': 'cephfs', 'path': '/mnt/pve/cephfs', 'shared': True, 'is_filesystem': True}, ...]
+        """
+        # Return cached results if available and not forcing refresh
+        if not force_refresh and hasattr(self, "_cached_shared_storages") and self._cached_shared_storages:
+            return self._cached_shared_storages
+
+        storages = []
+        block_storages = []  # Track block-based storages for warning
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/storage"
+            resp = self._create_session().get(url, timeout=10)
+
+            if resp.status_code != 200:
+                self.logger.warning("[HA] Cannot query storages from Proxmox API")
+                return storages
+
+            for storage in resp.json().get("data", []):
+                # Only interested in shared storages
+                if not storage.get("shared"):
+                    continue
+
+                storage_type = storage.get("type", "")
+                storage_name = storage.get("storage", "")
+
+                # Determine the mount path based on storage type
+                mount_path = None
+
+                if storage_type == "nfs":
+                    # NFS: path is directly provided or mounted at /mnt/pve/<name>
+                    mount_path = storage.get("path") or f"/mnt/pve/{storage_name}"
+
+                elif storage_type == "cephfs":
+                    # CephFS: always mounted at /mnt/pve/<name>
+                    mount_path = f"/mnt/pve/{storage_name}"
+
+                elif storage_type == "glusterfs":
+                    # GlusterFS: mounted at /mnt/pve/<name>
+                    mount_path = f"/mnt/pve/{storage_name}"
+
+                elif storage_type == "dir" and storage.get("shared"):
+                    # Shared directory (might be NFS mounted elsewhere)
+                    mount_path = storage.get("path")
+
+                elif storage_type == "pbs":
+                    # Proxmox Backup Server - not a filesystem, skip
+                    continue
+
+                elif storage_type in ["rbd", "iscsi", "zfspool", "lvm", "lvmthin", "starlvm"]:
+                    # Block-based storage - track for warning but can't use for heartbeats
+                    # (starlvm gives VMs snapshots + live-migration, but heartbeat FILES still need a fs)
+                    block_storages.append({
+                        "name": storage_name,
+                        "type": storage_type,
+                        "shared": True,
+                        "is_filesystem": False,
+                    })
+                    self.logger.debug(
+                        f"[HA] Found shared BLOCK storage (not usable for heartbeats): {storage_name} ({storage_type})"
+                    )
+                    continue
+
+                if mount_path:
+                    storages.append({
+                        "name": storage_name,
+                        "type": storage_type,
+                        "path": mount_path,
+                        "shared": True,
+                        "is_filesystem": True,
+                        "content": storage.get("content", ""),
+                        "enabled": storage.get("enabled", True) if storage.get("disable") != 1 else False,
+                    })
+                    self.logger.debug(
+                        f"[HA] Found shared filesystem storage: {storage_name} ({storage_type}) at {mount_path}"
+                    )
+
+            self.logger.info(
+                f"[HA] Discovered {len(storages)} filesystem storages, {len(block_storages)} block storages"
+            )
+
+            # Warn if only block storage available
+            if not storages and block_storages:
+                self.logger.warning("[HA] ════════════════════════════════════════════════════════")
+                self.logger.warning("[HA] ⚠️ Only BLOCK storage found (LVM/iSCSI/RBD)!")
+                self.logger.warning("[HA] ⚠️ Block storage cannot store heartbeat files.")
+                self.logger.warning("[HA] ⚠️ Add a small NFS share for full protection.")
+                self.logger.warning("[HA] ════════════════════════════════════════════════════════")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error discovering shared storages: {e}")
+
+        # Cache results
+        self._cached_shared_storages = storages
+        self._cached_block_storages = block_storages
+        return storages
+
+    def _ha_get_best_shared_storage_path(self) -> str:
+        """Automatically select the best shared storage for heartbeats
+
+        Priority:
+        1. CephFS (built-in, fast, reliable)
+        2. GlusterFS (distributed)
+        3. NFS (common, well-supported)
+        4. Any other shared filesystem
+
+        Returns the mount path or empty string if none found
+        """
+        storages = self._ha_discover_shared_storages()
+
+        if not storages:
+            self.logger.warning("[HA] No shared filesystem storages found!")
+            return ""
+
+        # Sort by preference
+        type_priority = {"cephfs": 1, "glusterfs": 2, "nfs": 3, "dir": 4}
+        storages.sort(key=lambda s: type_priority.get(s["type"], 99))
+
+        best = storages[0]
+        self.logger.info(f"[HA] Selected best shared storage: {best['name']} ({best['type']}) at {best['path']}")
+
+        return best["path"]
+
+    def _ha_auto_setup_split_brain_protection(self) -> bool:
+        """Fully automatic split-brain protection setup
+
+        1. Discovers shared storages
+        2. Selects the best one
+        3. Installs node agents
+        4. Enables storage heartbeat
+
+        Returns True if setup successful
+        """
+        self.logger.info("[HA] ═══════════════════════════════════════════════════════")
+        self.logger.info("[HA] AUTOMATIC SPLIT-BRAIN PROTECTION SETUP")
+        self.logger.info("[HA] ═══════════════════════════════════════════════════════")
+
+        # Step 1: Find best shared storage
+        storage_path = self._ha_get_best_shared_storage_path()
+
+        if not storage_path:
+            self.logger.warning("[HA] No shared storage found - falling back to SSH-only mode")
+            self.logger.warning("[HA] ⚠️ This is NOT safe for dual-network setups!")
+            return False
+
+        # Step 2: Configure storage heartbeat
+        self.ha_config["storage_heartbeat_enabled"] = True
+        self.ha_config["storage_heartbeat_path"] = storage_path
+        self.ha_config["dual_network_mode"] = True
+        self.ha_config["poison_pill_enabled"] = True
+
+        # Step 3: Install agents on all nodes
+        self.logger.info(f"[HA] Installing node agents with storage path: {storage_path}")
+        results = self._ha_install_agents_on_all_nodes()
+
+        success_count = sum(1 for v in results.values() if v)
+        total_count = len(results)
+
+        if success_count == total_count:
+            self.logger.info(f"[HA] ✓ All {total_count} node agents installed successfully!")
+            return True
+        elif success_count > 0:
+            self.logger.warning(f"[HA] ⚠️ {success_count}/{total_count} node agents installed")
+            return True
+        else:
+            self.logger.error("[HA] ✗ Failed to install any node agents!")
+            return False
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # AUTOMATIC NODE AGENT INSTALLATION
+    #
+    # For dual-network setups where server network and storage network are separate.
+    # The agent runs on each node and communicates via the STORAGE network.
+    # This survives server network failures!
+    #
+    # The agent is automatically installed via SSH when dual_network_mode is enabled.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # Minimal node agent script - embedded as string for auto-deployment
+    _NODE_AGENT_SCRIPT = """#!/bin/bash
+# ProxmoxVEx Node Agent - Auto-installed for Dual-Network Split-Brain Protection
+# This agent communicates via STORAGE network, not server network!
+
+STORAGE_PATH="__STORAGE_PATH__"
+# 2026-06-03: see _SELF_FENCE_AGENT_SCRIPT for the rationale - same
+# strategy choice gates the poison-pill response so 2-node-no-qdevice
+# clusters don't get torn down on every false-positive recovery trigger.
+FENCE_STRATEGY="__FENCE_STRATEGY__"
+HEARTBEAT_INTERVAL=5
+NODE_NAME=$(hostname)
+ProxmoxVEx_DIR="${STORAGE_PATH}/.ProxmoxVEx"
+HEARTBEAT_FILE="${ProxmoxVEx_DIR}/heartbeat_node_${NODE_NAME}"
+POISON_FILE="${ProxmoxVEx_DIR}/poison_${NODE_NAME}"
+POISON_ACK_FILE="${ProxmoxVEx_DIR}/poison_ack_${NODE_NAME}"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> /var/log/ProxmoxVEx-agent.log; }
+
+# 2026-06-03: same quorum-aware gate as the self-fence agent. ProxmoxVEx's
+# server-side recovery worker can drop a poison pill in response to a
+# transient API unreachability (e.g. a peer node rebooting). If we're still
+# part of the corosync majority, that pill is a false positive and stopping
+# our VMs would shred the cluster. We refuse the pill in that case and the
+# server can re-evaluate on its next pass.
+is_quorate() {
+    command -v pvecm >/dev/null 2>&1 || return 1
+    pvecm status 2>/dev/null | grep -qE "^Quorate:[[:space:]]+Yes"
+}
+
+write_heartbeat() {
+    mkdir -p "$ProxmoxVEx_DIR" 2>/dev/null
+    local vms=$(qm list 2>/dev/null | grep running | awk '{print $1}' | tr '\\n' ',')
+    local cts=$(pct list 2>/dev/null | grep running | awk '{print $1}' | tr '\\n' ',')
+    echo "{\\"timestamp\\":\\"$(date -Iseconds)\\",\\"node\\":\\"$NODE_NAME\\",\\"vms\\":\\"$vms\\",\\"cts\\":\\"$cts\\"}" > "$HEARTBEAT_FILE"
+}
+
+check_poison() {
+    if [ -f "$POISON_FILE" ]; then
+        if is_quorate; then
+            log "POISON PILL detected but pvecm reports Quorate: Yes — REFUSING to stop VMs"
+            log "(server-side recovery thinks we are partitioned, but corosync sees us in the majority — this is a false positive)"
+            echo "{\\"timestamp\\":\\"$(date -Iseconds)\\",\\"node\\":\\"$NODE_NAME\\",\\"poison_refused\\":\\"quorate\\"}" > "$POISON_ACK_FILE"
+            rm -f "$POISON_FILE"
+            return
+        fi
+        if [ "$FENCE_STRATEGY" = "wait" ]; then
+            log "POISON PILL detected but FENCE_STRATEGY=wait (2-node cluster, no qdevice)"
+            log "REFUSING to stop VMs — admin must add a qdevice to enable safe automatic fencing"
+            echo "{\\"timestamp\\":\\"$(date -Iseconds)\\",\\"node\\":\\"$NODE_NAME\\",\\"poison_refused\\":\\"wait_strategy\\"}" > "$POISON_ACK_FILE"
+            rm -f "$POISON_FILE"
+            return
+        fi
+        log "POISON PILL DETECTED! Stopping all VMs..."
+        for vmid in $(qm list 2>/dev/null | grep running | awk '{print $1}'); do
+            log "Stopping VM $vmid"
+            qm stop $vmid --timeout 30 2>/dev/null &
+        done
+        for ctid in $(pct list 2>/dev/null | grep running | awk '{print $1}'); do
+            log "Stopping CT $ctid"
+            pct stop $ctid --timeout 30 2>/dev/null &
+        done
+        wait
+        echo "{\\"timestamp\\":\\"$(date -Iseconds)\\",\\"node\\":\\"$NODE_NAME\\",\\"vms_stopped\\":true}" > "$POISON_ACK_FILE"
+        rm -f "$POISON_FILE"
+        log "All VMs stopped, poison acknowledged"
+    fi
+}
+
+log "ProxmoxVEx Node Agent starting (storage: $STORAGE_PATH)"
+while true; do
+    write_heartbeat
+    check_poison
+    sleep $HEARTBEAT_INTERVAL
+done
+"""
+
+    _NODE_AGENT_SERVICE = """[Unit]
+Description=ProxmoxVEx Node Agent (Dual-Network Split-Brain Protection)
+After=network.target pve-cluster.service
+Wants=pve-cluster.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ProxmoxVEx-agent.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    def _ha_install_node_agent(self, node: str) -> bool:
+        """Auto-install the node agent on a Proxmox node via SSH
+
+        This is called automatically when dual_network_mode is enabled.
+        The agent writes heartbeats to shared storage and responds to poison pills.
+        """
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        if not storage_path:
+            self.logger.error("[HA] Cannot install agent: storage_heartbeat_path not configured!")
+            return False
+
+        try:
+            node_ip = self._ha_get_node_ip(node)
+            if not node_ip:
+                self.logger.error(f"[HA] Cannot get IP for node {node}")
+                return False
+
+            api_user = self.config.user
+            ssh_user = (api_user or "root").split("@")[0]  # PR #62 (ry-ops): null-safe
+            ssh_password = self.config.pass_
+            ssh_key = getattr(self.config, "ssh_key", "")
+
+            self.logger.info(f"[HA] 🔧 Installing node agent on {node} ({node_ip})...")
+
+            # Prepare script with actual storage path
+            agent_script = self._NODE_AGENT_SCRIPT.replace("__STORAGE_PATH__", storage_path)
+            # 2026-06-03 - same fence-strategy as the self-fence agent.
+            agent_script = agent_script.replace("__FENCE_STRATEGY__", self._ha_detect_fence_strategy())
+
+            # Create the script file on the node
+            # Use base64 to avoid escaping issues
+            import base64
+
+            script_b64 = base64.b64encode(agent_script.encode()).decode()
+            service_b64 = base64.b64encode(self._NODE_AGENT_SERVICE.encode()).decode()
+
+            install_cmd = f'''
+echo "{script_b64}" | base64 -d > /usr/local/bin/ProxmoxVEx-agent.sh &&
+chmod +x /usr/local/bin/ProxmoxVEx-agent.sh &&
+echo "{service_b64}" | base64 -d > /etc/systemd/system/ProxmoxVEx-agent.service &&
+systemctl daemon-reload &&
+systemctl enable ProxmoxVEx-agent &&
+systemctl restart ProxmoxVEx-agent &&
+echo "AGENT_INSTALLED_OK"
+'''
+
+            success = False
+            if ssh_key:
+                output = self._ssh_run_command_with_key_output(node_ip, ssh_user, install_cmd, ssh_key)
+                success = output is not None and "AGENT_INSTALLED_OK" in output
+
+            if not success:
+                output = self._ssh_run_command_output(node_ip, ssh_user, install_cmd)
+                success = output is not None and "AGENT_INSTALLED_OK" in output
+
+            if not success and ssh_password:
+                output = self._ssh_run_command_with_password_output(node_ip, ssh_user, install_cmd, ssh_password)
+                success = output is not None and "AGENT_INSTALLED_OK" in output
+
+            if success:
+                self.logger.info(f"[HA] ✓ Node agent installed successfully on {node}")
+                self.ha_config["node_agent_installed"][node] = True
+                return True
+            else:
+                self.logger.error(f"[HA] ✗ Failed to install node agent on {node}")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error installing node agent on {node}: {e}")
+            return False
+
+    def _ha_install_agents_on_all_nodes(self) -> dict:
+        """Install node agents on all nodes in the cluster
+
+        Returns dict: {node_name: success_bool}
+        """
+        results = {}
+
+        # Get all nodes
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            resp = self._create_session().get(url, timeout=10)
+
+            if resp.status_code != 200:
+                self.logger.error("[HA] Cannot get node list for agent installation")
+                return results
+
+            nodes = resp.json().get("data", [])
+
+            self.logger.info("[HA] ═══════════════════════════════════════════════════════")
+            self.logger.info(f"[HA] INSTALLING NODE AGENTS ON {len(nodes)} NODES")
+            self.logger.info("[HA] ═══════════════════════════════════════════════════════")
+
+            for node in nodes:
+                node_name = node.get("node")
+                success = self._ha_install_node_agent(node_name)
+                results[node_name] = success
+
+            success_count = sum(1 for v in results.values() if v)
+            self.logger.info(f"[HA] Agent installation complete: {success_count}/{len(nodes)} successful")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error during agent installation: {e}")
+
+        return results
+
+    def _ha_check_node_agent_heartbeat(self, node: str) -> dict:
+        """check if node agent is writing heartbeats to storage (works even if server network is down)"""
+        result: Dict[str, Any] = {"alive": False, "age_seconds": None, "running_vms": [], "running_cts": []}
+
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        if not storage_path:
+            return result
+
+        heartbeat_file = os.path.join(storage_path, ".ProxmoxVEx", f"heartbeat_node_{node}")
+        timeout = self.ha_config.get("storage_heartbeat_timeout", 30)
+
+        try:
+            if os.path.exists(heartbeat_file):
+                mtime = datetime.fromtimestamp(os.path.getmtime(heartbeat_file))
+                age = (datetime.now() - mtime).total_seconds()
+                result["age_seconds"] = age
+                result["alive"] = age < timeout
+
+                # Read heartbeat content with validation
+                try:
+                    # (CodeAnt #507) - confine the read to the cluster-private .ProxmoxVEx/
+                    # heartbeat dir. heartbeat_file is built server-side from node + storage_path, but
+                    # if a future refactor lets a node-name expression slip in, realpath/commonpath
+                    # forces any traversal symlink/.. attempt back inside the expected base.
+                    base_real = os.path.realpath(os.path.join(storage_path, ".ProxmoxVEx"))
+                    target_real = os.path.realpath(heartbeat_file)
+                    if os.path.commonpath([base_real, target_real]) != base_real:
+                        raise Exception("heartbeat path escaped base directory")
+                    with open(target_real) as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict):
+                        self.logger.warning(
+                            f"[HA] Invalid heartbeat format for {node}: expected dict, got {type(data).__name__}"
+                        )
+                    else:
+                        if data.get("vms"):
+                            result["running_vms"] = [v.strip() for v in data["vms"].split(",") if v.strip()]
+                        if data.get("cts"):
+                            result["running_cts"] = [c.strip() for c in data["cts"].split(",") if c.strip()]
+                except (json.JSONDecodeError, ValueError) as e:
+                    self.logger.warning(f"[HA] Corrupt heartbeat file for {node}: {e}")
+
+                self.logger.debug(f"[HA] Node {node} storage heartbeat: age={age:.1f}s, alive={result['alive']}")
+            else:
+                self.logger.debug(f"[HA] No storage heartbeat file for {node}")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error reading storage heartbeat for {node}: {e}")
+
+        return result
+
+    def _ssh_run_command_output(
+        self, host: str, user: str, command: str, timeout: int = 30, port: int = 22
+    ) -> str | None:
+        """Run SSH command and return output - HA PRIORITY (no rate limiting)
+
+        HA status checks bypass semaphore for immediate execution
+        """
+        # 2026-04-24 - auto-sudo for non-root SSH users (ProxmoxVEx@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != "root":
+            command = _wrap_with_sudo(command)
+        if host and host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        _ssh_track_connection("ha", +1)
+
+        try:
+            ct = self.ha_config.get("ssh_connect_timeout", 10)
+            ssh_cmd = [
+                "ssh",
+                "-o",
+                f"ConnectTimeout={ct}",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "BatchMode=yes",
+            ]
+            if port != 22:
+                ssh_cmd += ["-p", f"{port}"]
+            ssh_cmd += [f"{user}@{host}", command]
+            result = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if result.returncode == 0:
+                return result.stdout
+            self.logger.debug(f"[SSH] Command failed on {host}: {_ssh_stderr_excerpt(result.stderr)}")
+            return None
+        except subprocess.TimeoutExpired:
+            self.logger.debug(f"[SSH] Command timed out on {host}")
+            return None
+        except Exception as e:
+            self.logger.debug(f"[SSH] Exception on {host}: {e}")
+            return None
+        finally:
+            _ssh_track_connection("ha", -1)
+
+    def _ssh_run_command_with_key_output(
+        self, host: str, user: str, command: str, key: str, timeout: int = 30, port: int = 22
+    ) -> str | None:
+        """Run SSH command with key and return output - HA PRIORITY (no rate limiting)
+
+        HA operations bypass semaphore
+        """
+        # 2026-04-24 - auto-sudo for non-root SSH users (ProxmoxVEx@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != "root":
+            command = _wrap_with_sudo(command)
+        if host and host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        _ssh_track_connection("ha", +1)
+
+        try:
+            import tempfile
+
+            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".key") as f:
+                f.write(key)
+                key_file = f.name
+            os.chmod(key_file, 0o600)
+
+            ct = self.ha_config.get("ssh_connect_timeout", 10)
+            try:
+                ssh_cmd = [
+                    "ssh",
+                    "-o",
+                    f"ConnectTimeout={ct}",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-i",
+                    key_file,
+                ]
+                if port != 22:
+                    ssh_cmd += ["-p", f"{port}"]
+                ssh_cmd += [f"{user}@{host}", command]
+                result = subprocess.run(
+                    ssh_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                if result.returncode == 0:
+                    return result.stdout
+                self.logger.debug(f"[SSH] Key auth failed on {host}: {_ssh_stderr_excerpt(result.stderr)}")
+                return None
+            finally:
+                os.unlink(key_file)
+        except subprocess.TimeoutExpired:
+            self.logger.debug(f"[SSH] Key command timed out on {host}")
+            return None
+        except Exception as e:
+            self.logger.debug(f"[SSH] Key exception on {host}: {e}")
+            return None
+        finally:
+            _ssh_track_connection("ha", -1)
+
+    def _ssh_run_command_with_password_output(
+        self, host: str, user: str, command: str, password: str, timeout: int = 30, port: int = 22
+    ) -> str | None:
+        """Run SSH command with password and return output - HA PRIORITY (no rate limiting)
+
+        HA operations bypass semaphore
+        """
+        # 2026-04-24 - auto-sudo for non-root SSH users (ProxmoxVEx@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != "root":
+            command = _wrap_with_sudo(command)
+        if host and host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        _ssh_track_connection("ha", +1)
+
+        try:
+            env = os.environ.copy()
+            env["SSHPASS"] = password
+
+            ct = self.ha_config.get("ssh_connect_timeout", 10)
+            ssh_cmd = [
+                "sshpass",
+                "-e",
+                "ssh",
+                "-o",
+                f"ConnectTimeout={ct}",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "PreferredAuthentications=password,keyboard-interactive",
+            ]
+            if port != 22:
+                ssh_cmd += ["-p", f"{port}"]
+            ssh_cmd += [f"{user}@{host}", command]
+            result = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+            if result.returncode == 0:
+                return result.stdout
+            self.logger.debug(f"[SSH] Password auth failed on {host}: {_ssh_stderr_excerpt(result.stderr)}")
+            return None
+        except FileNotFoundError:
+            self.logger.debug("[SSH] sshpass not installed - cannot use password auth")
+            return None
+        except subprocess.TimeoutExpired:
+            self.logger.debug(f"[SSH] Password command timed out on {host}")
+            return None
+        except Exception as e:
+            self.logger.debug(f"[SSH] Password exception on {host}: {e}")
+            return None
+        finally:
+            _ssh_track_connection("ha", -1)
+
+    # Legacy storage-based functions kept for advanced users who want extra safety
+    def _ha_storage_heartbeat_init(self):
+        """Initialize storage-based heartbeat system"""
+        if not self.ha_config.get("storage_heartbeat_enabled"):
+            return
+
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        if not storage_path:
+            self.logger.warning("[HA] Storage heartbeat enabled but no path configured!")
+            return
+
+        # Create .ProxmoxVEx directory on shared storage
+        heartbeat_dir = os.path.join(storage_path, ".ProxmoxVEx")
+        try:
+            os.makedirs(heartbeat_dir, exist_ok=True)
+            self.logger.info(f"[HA] Storage heartbeat directory: {heartbeat_dir}")
+        except Exception as e:
+            self.logger.error(f"[HA] Cannot create heartbeat directory: {e}")
+            return
+
+        # Start heartbeat writer thread
+        self.ha_heartbeat_stop.clear()
+        self.ha_heartbeat_thread = threading.Thread(
+            target=self._ha_storage_heartbeat_writer, daemon=True, name=f"HA-Heartbeat-{self.config.name}"
+        )
+        self.ha_heartbeat_thread.start()
+        self.logger.info("[HA] Storage heartbeat writer started")
+
+    def _ha_storage_heartbeat_writer(self):
+        """Background thread that writes heartbeats to shared storage"""
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        interval = self.ha_config.get("storage_heartbeat_interval", 5)
+
+        heartbeat_dir = os.path.join(storage_path, ".ProxmoxVEx")
+
+        while not self.ha_heartbeat_stop.is_set():
+            try:
+                # Write heartbeat for this ProxmoxVEx instance
+                heartbeat_file = os.path.join(heartbeat_dir, f"heartbeat_ProxmoxVEx_{self.id}")
+                heartbeat_data = {
+                    "timestamp": datetime.now().isoformat(),
+                    "cluster_id": self.id,
+                    "cluster_name": self.config.name,
+                    "connected_to": self.current_host,
+                    "ha_enabled": self.config.ha_enabled,
+                    "nodes_status": {k: v.get("status") for k, v in self.ha_node_status.items()},
+                }
+
+                with open(heartbeat_file, "w") as f:
+                    import json
+
+                    json.dump(heartbeat_data, f)
+
+                self.ha_last_heartbeat_write = datetime.now()
+
+                # Also check for poison pills targeting our nodes
+                self._ha_check_poison_pills()
+
+            except Exception as e:
+                self.logger.error(f"[HA] Heartbeat write error: {e}")
+
+            self.ha_heartbeat_stop.wait(interval)
+
+    def _ha_check_storage_heartbeat(self, node: str) -> dict:
+        """check storage heartbeat of another node, returns {alive, last_seen, age_seconds}"""
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        timeout = self.ha_config.get("storage_heartbeat_timeout", 30)
+
+        if not storage_path:
+            return {"alive": None, "last_seen": None, "age_seconds": None, "error": "No storage path configured"}
+
+        heartbeat_dir = os.path.join(storage_path, ".ProxmoxVEx")
+
+        # Look for heartbeat files from Proxmox nodes (written by pvestatd or our agent)
+        # Also look for VM status files
+        result: Dict[str, Any] = {"alive": None, "last_seen": None, "age_seconds": None}
+
+        try:
+            # Check node-specific heartbeat (if we install an agent on nodes)
+            node_heartbeat = os.path.join(heartbeat_dir, f"heartbeat_node_{node}")
+            if os.path.exists(node_heartbeat):
+                mtime = datetime.fromtimestamp(os.path.getmtime(node_heartbeat))
+                age = (datetime.now() - mtime).total_seconds()
+                result["last_seen"] = mtime
+                result["age_seconds"] = age
+                result["alive"] = age < timeout
+
+                self.logger.debug(f"[HA] Node {node} heartbeat age: {age:.1f}s (timeout: {timeout}s)")
+                return result
+
+            # Fallback: Check if node has written to shared storage recently
+            # This works with NFS/Ceph where we can see file mtimes
+            node_status_file = os.path.join(heartbeat_dir, f"status_{node}")
+            if os.path.exists(node_status_file):
+                mtime = datetime.fromtimestamp(os.path.getmtime(node_status_file))
+                age = (datetime.now() - mtime).total_seconds()
+                result["last_seen"] = mtime
+                result["age_seconds"] = age
+                result["alive"] = age < timeout
+                return result
+
+            # No heartbeat found - node hasn't registered yet or is dead
+            result["error"] = "No heartbeat file found"
+            result["alive"] = False
+
+        except Exception as e:
+            result["error"] = str(e)
+            self.logger.error(f"[HA] Error checking storage heartbeat for {node}: {e}")
+
+        return result
+
+    def _ha_write_poison_pill(self, target_node: str, reason: str) -> bool:
+        """write poison pill to shared storage, telling target node to stop VMs"""
+        if not self.ha_config.get("poison_pill_enabled", True):
+            return False
+
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        if not storage_path:
+            return False
+
+        heartbeat_dir = os.path.join(storage_path, ".ProxmoxVEx")
+        poison_file = os.path.join(heartbeat_dir, f"poison_{target_node}")
+
+        try:
+            poison_data = {
+                "timestamp": datetime.now().isoformat(),
+                "target_node": target_node,
+                "reason": reason,
+                "issued_by": f"ProxmoxVEx_{self.id}",
+                "action_required": "STOP_ALL_VMS",
+                "recovery_will_start_after": (datetime.now() + timedelta(seconds=60)).isoformat(),
+            }
+
+            # (CodeAnt #507) - confine write to heartbeat_dir.
+            base_real = os.path.realpath(heartbeat_dir)
+            target_real = os.path.realpath(poison_file)
+            if os.path.commonpath([base_real, target_real]) != base_real:
+                raise Exception("poison pill path escaped base directory")
+            with open(target_real, "w") as f:
+                import json
+
+                json.dump(poison_data, f)
+
+            self.logger.warning(f"[HA] ☠️ POISON PILL written for {target_node}: {reason}")
+            self.logger.info(f"[HA] If {target_node} is alive and can see storage, it MUST stop its VMs")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"[HA] Failed to write poison pill: {e}")
+            return False
+
+    def _ha_check_poison_pills(self):
+        """Check if there are poison pills targeting nodes in our cluster
+
+        This is called regularly by the heartbeat thread.
+        If we find a poison pill for a node we're connected to, we need to act!
+        """
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        if not storage_path:
+            return
+
+        heartbeat_dir = os.path.join(storage_path, ".ProxmoxVEx")
+
+        try:
+            # Check for poison pills for any node in our cluster
+            for node_name in list(self.ha_node_status.keys()):
+                poison_file = os.path.join(heartbeat_dir, f"poison_{node_name}")
+
+                if os.path.exists(poison_file):
+                    with open(poison_file) as f:
+                        import json
+
+                        poison_data = json.load(f)
+
+                    # Check if poison pill is recent (< 5 minutes old)
+                    poison_time = datetime.fromisoformat(poison_data["timestamp"])
+                    age = (datetime.now() - poison_time).total_seconds()
+
+                    if age < 300:  # 5 minutes
+                        self.logger.critical(f"[HA] ☠️ POISON PILL DETECTED for {node_name}!")
+                        self.logger.critical(f"[HA] Reason: {poison_data.get('reason')}")
+                        self.logger.critical(f"[HA] Issued by: {poison_data.get('issued_by')}")
+
+                        # If we're connected to this node, we should NOT start VMs on it
+                        if self.current_host and node_name in self.current_host:
+                            self.logger.critical("[HA] We are connected to poisoned node! Switching connection...")
+                            # Don't start new VMs, let the other ProxmoxVEx instance handle recovery
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error checking poison pills: {e}")
+
+    def _ha_wait_for_poison_ack(self, target_node: str, timeout: int = 60) -> bool:
+        """wait for target node to ack the poison pill (or timeout)"""
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        if not storage_path:
+            return True  # Can't check, proceed
+
+        heartbeat_dir = os.path.join(storage_path, ".ProxmoxVEx")
+        ack_file = os.path.join(heartbeat_dir, f"poison_ack_{target_node}")
+
+        self.logger.info(f"[HA] Waiting up to {timeout}s for poison acknowledgment from {target_node}...")
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                if os.path.exists(ack_file):
+                    # (CodeAnt #507) - confine ack read to heartbeat_dir.
+                    base_real = os.path.realpath(heartbeat_dir)
+                    target_real = os.path.realpath(ack_file)
+                    if os.path.commonpath([base_real, target_real]) != base_real:
+                        raise Exception("ack path escaped base directory")
+                    with open(target_real) as f:
+                        ack_data = json.load(f)
+
+                    if ack_data.get("vms_stopped"):
+                        self.logger.info(f"[HA] ✓ Received poison acknowledgment from {target_node}")
+                        self.logger.info(f"[HA]   VMs stopped: {ack_data.get('stopped_vms', [])}")
+
+                        # Clean up poison files individually
+                        poison_file = os.path.join(heartbeat_dir, f"poison_{target_node}")
+                        for fpath in [poison_file, ack_file]:
+                            try:
+                                if os.path.exists(fpath):
+                                    os.remove(fpath)
+                            except OSError as e:
+                                self.logger.warning(f"[HA] Could not remove {fpath}: {e}")
+
+                        return True
+
+                # Check if node heartbeat is still active (node is alive but ignoring poison)
+                heartbeat = self._ha_check_storage_heartbeat(target_node)
+                if heartbeat.get("alive") and heartbeat.get("age_seconds", 999) < 10:
+                    self.logger.warning(f"[HA] ⚠ Node {target_node} is STILL ALIVE and writing heartbeats!")
+                    self.logger.warning("[HA] This could indicate split-brain risk!")
+
+            except Exception as e:
+                self.logger.error(f"[HA] Error checking poison ack: {e}")
+
+            time.sleep(2)
+
+        self.logger.warning(f"[HA] ⚠ Poison acknowledgment timeout for {target_node}")
+
+        # Final check: is the node still writing heartbeats?
+        heartbeat = self._ha_check_storage_heartbeat(target_node)
+        if heartbeat.get("alive"):
+            self.logger.error(f"[HA] ✗ DANGER: Node {target_node} heartbeat still active after poison!")
+            self.logger.error("[HA] ✗ ABORTING RECOVERY to prevent split-brain!")
+            return False
+
+        self.logger.info(f"[HA] Node {target_node} heartbeat is stale - safe to proceed")
+        return True
+
+    def _ha_acquire_recovery_lock(self, failed_node: str) -> bool:
+        """Try to acquire a distributed lock for recovery
+
+        Only one ProxmoxVEx instance should perform recovery at a time.
+        This prevents multiple recovery attempts from different sources.
+        """
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        if not storage_path:
+            return True  # No storage path, can't lock
+
+        heartbeat_dir = os.path.join(storage_path, ".ProxmoxVEx")
+        lock_file = os.path.join(heartbeat_dir, f"recovery_lock_{failed_node}")
+
+        try:
+            # Check if lock exists and is recent
+            if os.path.exists(lock_file):
+                mtime = datetime.fromtimestamp(os.path.getmtime(lock_file))
+                age = (datetime.now() - mtime).total_seconds()
+
+                if age < 300:  # Lock valid for 5 minutes
+                    # (CodeAnt #507) - confine lock read to heartbeat_dir.
+                    base_real = os.path.realpath(heartbeat_dir)
+                    target_real = os.path.realpath(lock_file)
+                    if os.path.commonpath([base_real, target_real]) != base_real:
+                        raise Exception("lock path escaped base directory")
+                    with open(target_real) as f:
+                        import json
+
+                        lock_data = json.load(f)
+
+                    if lock_data.get("holder") != f"ProxmoxVEx_{self.id}":
+                        self.logger.warning(f"[HA] Recovery lock held by {lock_data.get('holder')}")
+                        return False
+
+            # Acquire lock
+            lock_data = {
+                "timestamp": datetime.now().isoformat(),
+                "holder": f"ProxmoxVEx_{self.id}",
+                "target_node": failed_node,
+                "cluster": self.config.name,
+            }
+
+            # (CodeAnt #507) - same gate on the write.
+            base_real = os.path.realpath(heartbeat_dir)
+            target_real = os.path.realpath(lock_file)
+            if os.path.commonpath([base_real, target_real]) != base_real:
+                raise Exception("lock path escaped base directory")
+            with open(target_real, "w") as f:
+                import json
+
+                json.dump(lock_data, f)
+
+            self.logger.info(f"[HA] ✓ Acquired recovery lock for {failed_node}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error acquiring recovery lock: {e}")
+            return False
+
+    def _ha_release_recovery_lock(self, failed_node: str):
+        """Release the recovery lock"""
+        storage_path = self.ha_config.get("storage_heartbeat_path")
+        if not storage_path:
+            return
+
+        heartbeat_dir = os.path.join(storage_path, ".ProxmoxVEx")
+        lock_file = os.path.join(heartbeat_dir, f"recovery_lock_{failed_node}")
+
+        try:
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+                self.logger.info(f"[HA] Released recovery lock for {failed_node}")
+        except Exception as e:
+            self.logger.error(f"[HA] Error releasing recovery lock: {e}")
+
+    def _ha_try_force_quorum(self, target_node: str) -> bool:
+        """Force quorum on the surviving node in a 2-node cluster
+
+        This runs: pvecm expected 1
+        Which tells corosync to accept 1 node as quorum.
+
+        Uses the cluster's existing credentials (same as Proxmox API login).
+        """
+        self.logger.warning("[HA] ════════════════════════════════════════════════════════")
+        self.logger.warning(f"[HA] FORCING QUORUM ON {target_node}")
+        self.logger.warning("[HA] ════════════════════════════════════════════════════════")
+
+        try:
+            # Get target node IP
+            node_ip = self._ha_get_node_ip(target_node)
+
+            if not node_ip:
+                self.logger.error(f"[HA] Cannot determine IP for {target_node}")
+                return False
+
+            self.logger.info(f"[HA] Target node IP: {node_ip}")
+
+            # Use cluster credentials - same as Proxmox API login
+            # User format is usually "root@pam" - extract just the username
+            api_user = self.config.user  # e.g. "root@pam"
+            ssh_user = (api_user or "root").split("@")[0]  # PR #62 (ry-ops): null-safe
+            ssh_password = self.config.pass_
+            ssh_key = getattr(self.config, "ssh_key", "")  # SSH private key from cluster config
+
+            self.logger.info(f"[HA] Using cluster credentials (user: {ssh_user})")
+
+            # Method 1: Try SSH with configured key first (most secure)
+            if ssh_key:
+                self.logger.info("[HA] Trying SSH with configured key...")
+                if self._ssh_run_command_with_key(node_ip, ssh_user, "pvecm expected 1", ssh_key):
+                    return True
+
+            # Method 2: Try passwordless SSH (if system keys are set up)
+            if self._ssh_run_command(node_ip, ssh_user, "pvecm expected 1"):
+                return True
+
+            # Method 3: Try SSH with password (using sshpass - secure env var method)
+            if ssh_password and self._ssh_run_command_with_password(
+                node_ip, ssh_user, "pvecm expected 1", ssh_password
+            ):
+                return True
+
+            self.logger.error("[HA] Could not force quorum via SSH")
+            self.logger.error(f"[HA] Manual fix: SSH to {target_node} and run: pvecm expected 1")
+            self.logger.error("[HA] Tip: Configure SSH key in cluster settings for secure automatic SSH")
+            return False
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error forcing quorum: {e}")
+            return False
+
+    def _ha_check_restore_quorum(self):
+        """Check if all nodes are online and restore quorum to normal
+
+        When a failed node comes back online in a 2-node cluster,
+        we need to restore the expected votes from 1 back to 2.
+
+        This runs: pvecm expected N (where N = number of nodes)
+        """
+        try:
+            # Check if two_node_mode is enabled
+            two_node_mode = self.ha_config.get("two_node_mode", False)
+            force_quorum = self.ha_config.get("force_quorum_on_failure", False)
+
+            if not (two_node_mode or force_quorum):
+                # Not in special quorum mode, nothing to restore
+                return
+
+            # Count total and online nodes
+            total_nodes = len(self.ha_node_status)
+            online_nodes = sum(1 for n, s in self.ha_node_status.items() if s.get("status") == "online")
+
+            if total_nodes < 2:
+                return
+
+            # Only restore if ALL nodes are online
+            if online_nodes < total_nodes:
+                self.logger.info(
+                    f"[HA] {online_nodes}/{total_nodes} nodes online - waiting for all nodes before restoring quorum"
+                )
+                return
+
+            self.logger.info("[HA] ════════════════════════════════════════════════════════")
+            self.logger.info(f"[HA] ALL NODES ONLINE - RESTORING QUORUM TO {total_nodes}")
+            self.logger.info("[HA] ════════════════════════════════════════════════════════")
+
+            # Pick any online node to run the command
+            target_node = None
+            for node_name, status in self.ha_node_status.items():
+                if status.get("status") == "online":
+                    target_node = node_name
+                    break
+
+            if not target_node:
+                self.logger.error("[HA] No online node found to restore quorum")
+                return
+
+            # Get target node IP
+            node_ip = self._ha_get_node_ip(target_node)
+
+            if not node_ip:
+                self.logger.error(f"[HA] Cannot determine IP for {target_node}")
+                return
+
+            # Use cluster credentials
+            api_user = self.config.user
+            ssh_user = (api_user or "root").split("@")[0]  # PR #62 (ry-ops): null-safe
+            ssh_password = self.config.pass_
+            ssh_key = getattr(self.config, "ssh_key", "")  # SSH key from cluster config
+
+            restore_cmd = f"pvecm expected {total_nodes}"
+
+            self.logger.info(f"[HA] Running '{restore_cmd}' on {target_node} ({node_ip})")
+
+            # Method 1: Try SSH with configured key first (most secure)
+            if ssh_key and self._ssh_run_command_with_key(node_ip, ssh_user, restore_cmd, ssh_key):
+                self.logger.info(f"[HA] ✓ Quorum restored to {total_nodes} nodes")
+                broadcast_sse(
+                    "ha_status",
+                    {
+                        "event": "quorum_restored",
+                        "message": f"Quorum restored to {total_nodes} nodes",
+                        "expected_votes": total_nodes,
+                        "cluster_id": self.id,
+                    },
+                    self.id,
+                )
+                return
+
+            # Method 2: Try passwordless SSH
+            if self._ssh_run_command(node_ip, ssh_user, restore_cmd):
+                self.logger.info(f"[HA] ✓ Quorum restored to {total_nodes} nodes")
+                broadcast_sse(
+                    "ha_status",
+                    {
+                        "event": "quorum_restored",
+                        "message": f"Quorum restored to {total_nodes} nodes",
+                        "expected_votes": total_nodes,
+                        "cluster_id": self.id,
+                    },
+                    self.id,
+                )
+                return
+
+            # Method 3: Try SSH with password
+            if ssh_password and self._ssh_run_command_with_password(node_ip, ssh_user, restore_cmd, ssh_password):
+                self.logger.info(f"[HA] ✓ Quorum restored to {total_nodes} nodes")
+                broadcast_sse(
+                    "ha_status",
+                    {
+                        "event": "quorum_restored",
+                        "message": f"Quorum restored to {total_nodes} nodes",
+                        "expected_votes": total_nodes,
+                        "cluster_id": self.id,
+                    },
+                    self.id,
+                )
+                return
+
+            self.logger.warning("[HA] Could not auto-restore quorum")
+            self.logger.warning(f"[HA] Manual fix: SSH to any node and run: {restore_cmd}")
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error restoring quorum: {e}")
+
+    def _ha_get_node_ip(self, node_name: str) -> Optional[str]:
+        """Get primary MANAGEMENT IP for a node.
+
+        Uses _get_node_ip which does proper VLAN-aware discovery
+        with reachability probing. This ensures we get the management IP (same VLAN
+        as ProxmoxVEx), NOT the Corosync or storage VLAN IP.
+
+        For split-brain detection that needs ALL IPs, use _ha_get_all_node_ips().
+        """
+        # First: try the improved VLAN-aware discovery with probe
+        mgmt_ip = self._get_node_ip(node_name)
+        if mgmt_ip:
+            return mgmt_ip
+
+        # Fallback: get all IPs and pick first reachable
+        ips = self._ha_get_all_node_ips(node_name)
+        if ips:
+            import socket
+
+            for ip in ips:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(2)
+                    result = s.connect_ex((ip, 8006))
+                    s.close()
+                    if result == 0:
+                        self.logger.info(f"[HA] {node_name} -> {ip} (fallback, reachable)")
+                        return ip
+                except Exception:
+                    continue
+            # Last resort: return first IP (might not be reachable)
+            self.logger.warning(f"[HA] {node_name}: no reachable IP found, using {ips[0]}")
+            return ips[0]
+        return None
+
+    def _ha_get_all_node_ips(self, node_name: str) -> List[str]:
+        """Get ALL IP addresses for a node (all networks!).
+
+        This is CRITICAL for split-brain prevention in multi-network setups.
+        If ANY network can reach the node, it's still alive!
+
+        Management IPs are listed FIRST (most likely to be reachable from ProxmoxVEx).
+        """
+        ips = []
+        mgmt_ips = []  # Management IPs go first
+        other_ips = []  # Corosync/storage IPs go after
+
+        # Check manual override first
+        node_ips = self.ha_config.get("node_ips", {})
+        if node_name in node_ips:
+            manual_ip = node_ips[node_name]
+            if isinstance(manual_ip, list):
+                mgmt_ips.extend(manual_ip)
+            else:
+                mgmt_ips.append(manual_ip)
+
+        # Get management IP via _get_node_ip (VLAN-aware)
+        try:
+            best_ip = self._get_node_ip(node_name)
+            if best_ip and best_ip not in mgmt_ips:
+                mgmt_ips.insert(0, best_ip)
+        except Exception:
+            pass
+
+        # Try to get from cluster status (Corosync ring addresses)
+        # NOTE: These are often on a DIFFERENT VLAN (Corosync network), so put in other_ips
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
+            resp = self._create_session().get(url, timeout=10)
+            if resp.status_code == 200:
+                for item in resp.json().get("data", []):
+                    if item.get("type") == "node" and item.get("name", "").lower() == node_name.lower():
+                        coro_ip = item.get("ip")
+                        if coro_ip and coro_ip not in mgmt_ips and coro_ip not in other_ips:
+                            other_ips.append(coro_ip)
+                            self.logger.debug(
+                                f"[HA] Found corosync IP {coro_ip} for {node_name} (may not be reachable from ProxmoxVEx)"
+                            )
+        except Exception as e:
+            self.logger.debug(f"[HA] Could not get cluster status for {node_name}: {e}")
+
+        # Try to get all network interfaces from node config
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name.lower()}/network"
+            resp = self._create_session().get(url, timeout=10)
+            if resp.status_code == 200:
+                for iface_data in resp.json().get("data", []):
+                    addr = iface_data.get("address") or ""
+                    if not addr:
+                        cidr = iface_data.get("cidr", "")
+                        if cidr:
+                            addr = cidr.split("/")[0]
+                    if addr and addr not in mgmt_ips and addr not in other_ips:
+                        other_ips.append(addr)
+        except Exception as e:
+            self.logger.debug(f"[HA] Could not get network info for {node_name}: {e}")
+
+        # Combine: management IPs first, then other IPs
+        ips = []
+        for ip in mgmt_ips:
+            if ip and ip not in ips:
+                ips.append(ip)
+        for ip in other_ips:
+            if ip and ip not in ips:
+                ips.append(ip)
+
+        # Try DNS resolution as fallback
+        if not ips:
+            try:
+                import socket
+
+                ip = socket.gethostbyname(node_name)
+                if ip:
+                    ips.append(ip)
+            except Exception:
+                pass
+
+            try:
+                import socket
+
+                for suffix in [".local", ".lan", ".cluster"]:
+                    try:
+                        ip = socket.gethostbyname(f"{node_name}{suffix}")
+                        if ip and ip not in ips:
+                            ips.append(ip)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        self.logger.debug(f"[HA] Node {node_name} IPs: {ips} (mgmt_first={mgmt_ips})")
+        return ips
+
+    def _ha_check_vm_locks_on_storage(self, node_name: str, vmids: List[int] = None) -> dict:
+        """check if VMs still have active storage locks (catches iSCSI-up-but-server-down scenario)"""
+        result: Dict[str, Any] = {"has_active_locks": False, "locked_vms": [], "lock_age": None}
+
+        try:
+            host = self.host
+
+            # Get VMs on the node
+            if vmids is None:
+                vms_on_node = self._ha_get_vms_on_node(node_name)
+                vmids = []
+                for vm in vms_on_node:
+                    vmid = vm.get("vmid")
+                    if vmid is not None:
+                        vmids.append(int(vmid))
+
+            for vmid in vmids:
+                # Check if VM config has a lock
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name}/qemu/{vmid}/config"
+                try:
+                    resp = self._create_session().get(url, timeout=5)
+                    if resp.status_code == 200:
+                        config = resp.json().get("data", {})
+                        if config.get("lock"):
+                            result["locked_vms"].append(vmid)
+                            self.logger.warning(f"[HA] VM {vmid} has active lock: {config.get('lock')}")
+                except Exception:
+                    pass
+
+            result["has_active_locks"] = len(result["locked_vms"]) > 0
+
+            # Also check pmxcfs for recent activity from the node
+            # The .members file in /etc/pve shows active nodes
+            try:
+                # This works because pmxcfs is a cluster filesystem
+                # If we can read it, we can see all nodes' activity
+                url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
+                resp = self._create_session().get(url, timeout=5)
+                if resp.status_code == 200:
+                    for item in resp.json().get("data", []):
+                        if item.get("type") == "node" and item.get("name") == node_name and item.get("online") == 1:
+                            # Check if node is still in quorum
+                            self.logger.warning(
+                                f"[HA] ⚠️ Node {node_name} is still showing as ONLINE in cluster status!"
+                            )
+                            result["has_active_locks"] = True
+            except Exception:
+                pass
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error checking VM locks: {e}")
+
+        return result
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SCSI-3 PERSISTENT RESERVATIONS - TRUE STORAGE-LEVEL FENCING
+    #
+    # This is the MOST RELIABLE method for dual-network setups!
+    # The storage itself prevents split-brain by:
+    # 1. Each node registers a "key" with the storage
+    # 2. When fencing, we send a PREEMPT command to remove the dead node's key
+    # 3. The storage then REFUSES all I/O from the dead node
+    # 4. Even if the node is alive, it cannot corrupt data!
+    #
+    # Requires: sg3_utils package on ProxmoxVEx server and nodes
+    # Works with: iSCSI, FC, SAS (any SCSI device)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _ha_scsi_fence_node(self, failed_node: str, vm_disks: List[str] = None) -> bool:
+        """SCSI-3 persistent reservations fencing - blocks node from writing to disks"""
+        if not self.ha_config.get("scsi_reservation_enabled", False):
+            return False
+
+        self.logger.info("[HA] ═══════════════════════════════════════════════════════")
+        self.logger.info(f"[HA] SCSI-3 PERSISTENT RESERVATION FENCING for {failed_node}")
+        self.logger.info("[HA] ═══════════════════════════════════════════════════════")
+
+        try:
+            # Get the surviving node
+            surviving_node = None
+            for node in self.ha_node_status:
+                if node != failed_node and self.ha_node_status[node].get("status") == "online":
+                    surviving_node = node
+                    break
+
+            if not surviving_node:
+                self.logger.error("[HA] No surviving node found for SCSI fencing")
+                return False
+
+            # Get SSH credentials
+            api_user = self.config.user
+            ssh_user = (api_user or "root").split("@")[0]  # PR #62 (ry-ops): null-safe
+            ssh_password = self.config.pass_
+
+            surviving_ip = self._ha_get_node_ip(surviving_node)
+            if not surviving_ip:
+                return False
+
+            # Get the failed node's SCSI registration key
+            # Convention: key is based on node name hash or configured
+            failed_key = self.ha_config.get("scsi_keys", {}).get(failed_node)
+            if not failed_key:
+                # Generate key from node name (first 8 chars hex)
+                failed_key = format(hash(failed_node) & 0xFFFFFFFFFFFFFFFF, "016x")[:16]
+
+            self.logger.info(f"[HA] Failed node SCSI key: {failed_key}")
+
+            # Get disks to fence
+            if not vm_disks:
+                vm_disks = self._ha_get_shared_disks_for_node(failed_node)
+
+            if not vm_disks:
+                self.logger.warning("[HA] No shared disks found to fence")
+                return False
+
+            fenced_disks = []
+
+            for disk in vm_disks:
+                self.logger.info(f"[HA] Fencing disk: {disk}")
+
+                # Command to preempt the failed node's registration
+                # sg_persist --out --preempt --param-sark=<failed_key> --prout-type=5 <device>
+                fence_cmd = f"sg_persist --out --preempt --param-sark={failed_key} --prout-type=5 {disk} 2>&1"
+
+                # Run on surviving node
+                success = self._ssh_run_command_with_password(surviving_ip, ssh_user, fence_cmd, ssh_password)
+
+                if success:
+                    fenced_disks.append(disk)
+                    self.logger.info(f"[HA] ✓ Disk {disk} fenced successfully")
+                else:
+                    self.logger.error(f"[HA] ✗ Failed to fence disk {disk}")
+
+            if fenced_disks:
+                self.logger.info(f"[HA] ✓ SCSI fencing complete: {len(fenced_disks)} disks fenced")
+                return True
+            else:
+                self.logger.error("[HA] ✗ SCSI fencing failed - no disks could be fenced")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"[HA] SCSI fencing error: {e}")
+            return False
+
+    def _ha_get_shared_disks_for_node(self, node_name: str) -> List[str]:
+        """Get list of shared storage disks used by VMs on a node"""
+        disks = []
+
+        try:
+            # Get VMs on the node
+            vms = self._ha_get_vms_on_node(node_name)
+
+            for vm in vms:
+                vmid = vm.get("vmid")
+
+                # Get VM config to find disk paths
+                host = self.host
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name}/qemu/{vmid}/config"
+
+                resp = self._create_session().get(url, timeout=5)
+                if resp.status_code == 200:
+                    config = resp.json().get("data", {})
+
+                    # Look for disk entries (scsi0, virtio0, etc.)
+                    for key, value in config.items():
+                        if (
+                            any(key.startswith(prefix) for prefix in ["scsi", "virtio", "ide", "sata"])
+                            and isinstance(value, str)
+                            and "/" in value
+                            and (disk_path := value.split(",")[0]) not in disks
+                        ):
+                            disks.append(disk_path)
+        except Exception as e:
+            self.logger.error(f"[HA] Error getting shared disks: {e}")
+
+        return disks
+
+    def _ssh_run_command(self, host: str, user: str, command: str, key_file: str = None) -> bool:
+        """Run SSH command on remote host - HA PRIORITY (no rate limiting)
+
+        HA operations bypass the semaphore because:
+        1. They are critical (fencing must happen immediately)
+        2. They are short (< 5 seconds typically)
+        3. They are rare (only during actual failures)
+        """
+        # 2026-04-24 - auto-sudo for non-root SSH users (ProxmoxVEx@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != "root":
+            command = _wrap_with_sudo(command)
+        if host and host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        _ssh_track_connection("ha", +1)
+
+        try:
+            ct = self.ha_config.get("ssh_connect_timeout", 10)
+            ssh_cmd = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", f"ConnectTimeout={ct}", "-o", "BatchMode=yes"]
+            if key_file:
+                ssh_cmd.extend(["-i", key_file])
+            ssh_cmd.append(f"{user}@{host}")
+            ssh_cmd.append(command)
+
+            self.logger.info(f"[HA] Running: ssh {user}@{host} '{command}'")
+
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
+
+            if result.returncode == 0:
+                self.logger.info(f"[HA] ✓ Command successful: {result.stdout.strip()}")
+                return True
+            else:
+                self.logger.error(f"[HA] ✗ Command failed: {result.stderr.strip()}")
+                return False
+        except subprocess.TimeoutExpired:
+            self.logger.error("[HA] SSH command timed out")
+            return False
+        except FileNotFoundError:
+            self.logger.error("[HA] SSH not found")
+            return False
+        finally:
+            _ssh_track_connection("ha", -1)
+
+    def _ssh_run_command_with_key(self, host: str, user: str, command: str, key_content: str) -> bool:
+        """Run SSH command using a private key from cluster config
+
+        Security fix - writes key to temp file with strict permissions,
+        uses it for SSH, then immediately deletes it.
+        """
+        # 2026-04-24 - auto-sudo for non-root SSH users (ProxmoxVEx@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != "root":
+            command = _wrap_with_sudo(command)
+        import tempfile
+
+        if host and host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+
+        if not key_content or not key_content.strip():
+            return False
+
+        key_fd = None
+        key_path = None
+
+        try:
+            # Write key to temp file with secure permissions (0600)
+            key_fd, key_path = tempfile.mkstemp(prefix="ProxmoxVEx_ssh_", suffix=".key")
+            os.chmod(key_path, 0o600)
+
+            with os.fdopen(key_fd, "w") as f:
+                # Ensure key has proper newlines
+                key_data = key_content.strip()
+                if not key_data.endswith("\n"):
+                    key_data += "\n"
+                f.write(key_data)
+            key_fd = None  # fd is now closed
+
+            self.logger.info("[HA] Trying SSH with configured key...")
+
+            # Run SSH with the key file
+            result = self._ssh_run_command(host, user, command, key_file=key_path)
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"[HA] SSH with key failed: {e}")
+            return False
+        finally:
+            # Always clean up the temp key file
+            if key_fd is not None:
+                with contextlib.suppress(Exception):
+                    os.close(key_fd)
+            if key_path and os.path.exists(key_path):
+                with contextlib.suppress(Exception):
+                    os.remove(key_path)
+
+    def _ssh_run_command_with_password(self, host: str, user: str, command: str, password: str) -> bool:
+        """Run SSH command with password using sshpass - HA PRIORITY (no rate limiting)
+
+        Security fix - use SSHPASS environment variable instead of
+        command line argument. Command line args are visible in 'ps aux'!
+
+        HA operations bypass semaphore for immediate execution
+        """
+        # 2026-04-24 - auto-sudo for non-root SSH users (ProxmoxVEx@pam etc).
+        # Wrap multi-line/shell-redirect commands through base64 → `sudo bash`.
+        if user and user != "root":
+            command = _wrap_with_sudo(command)
+        if host and host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        _ssh_track_connection("ha", +1)
+
+        try:
+            # Check if sshpass is available
+            which_result = subprocess.run(["which", "sshpass"], capture_output=True)
+            if which_result.returncode != 0:
+                self.logger.warning("[HA] sshpass not installed, trying without password...")
+                _ssh_track_connection("ha", -1)  # Will be tracked by _ssh_run_command
+                return self._ssh_run_command(host, user, command)
+
+            ct = self.ha_config.get("ssh_connect_timeout", 10)
+            ssh_cmd = [
+                "sshpass",
+                "-e",
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                f"ConnectTimeout={ct}",
+                f"{user}@{host}",
+                command,
+            ]
+
+            env = os.environ.copy()
+            env["SSHPASS"] = password
+
+            self.logger.info(f"[HA] Running: sshpass ssh {user}@{host} '{command}'")
+
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30, env=env)
+
+            if result.returncode == 0:
+                self.logger.info(f"[HA] ✓ Command successful: {result.stdout.strip()}")
+                return True
+            else:
+                self.logger.error(f"[HA] ✗ Command failed: {result.stderr.strip()}")
+                return False
+        except Exception as e:
+            self.logger.error(f"[HA] SSH with password failed: {e}")
+            return False
+        finally:
+            _ssh_track_connection("ha", -1)
+
+    def _ha_clear_vm_lock(self, vmid: int, vm_type: str, target_node: str, original_node: str) -> bool:
+        """Clear VM/CT lock via Proxmox API. Returns True on success, False on failure."""
+        host = self.host
+
+        try:
+            if vm_type == "qemu":
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/qemu/{vmid}/config"
+            else:
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{target_node}/lxc/{vmid}/config"
+
+            config_response = self._create_session().get(config_url, timeout=10)
+            if config_response.status_code == 200:
+                config = config_response.json().get("data", {})
+                if "lock" in config:
+                    self.logger.info(f"[HA] {vm_type}/{vmid} has lock '{config['lock']}', clearing...")
+                    unlock_response = self._create_session().put(config_url, data={"delete": "lock"}, timeout=15)
+                    if unlock_response.status_code == 200:
+                        self.logger.info(f"[HA] ✓ Cleared lock on {vm_type}/{vmid}")
+                        return True
+                    else:
+                        self.logger.warning(f"[HA] Could not clear lock via API: {unlock_response.text}")
+                        return False
+                else:
+                    return True  # No lock present = success
+            else:
+                self.logger.warning(
+                    f"[HA] Could not read config for {vm_type}/{vmid}: HTTP {config_response.status_code}"
+                )
+                return False
+
+        except Exception as e:
+            self.logger.warning(f"[HA] Error clearing VM lock: {e}")
+            return False
+
+    def _ha_move_vm_config(self, vmid: int, vm_type: str, source_node: str, target_node: str) -> bool:
+        """Move VM config file from source node to target node
+
+        In Proxmox, VM configs are stored per-node at:
+        - QEMU: /etc/pve/nodes/<node>/qemu-server/<vmid>.conf
+        - LXC:  /etc/pve/nodes/<node>/lxc/<vmid>.conf
+
+        For HA failover, we need to move the config to the new node.
+        This is done via SSH since there's no API for this.
+        """
+        try:
+            # Determine config paths
+            if vm_type == "qemu":
+                source_path = f"/etc/pve/nodes/{source_node}/qemu-server/{vmid}.conf"
+                target_path = f"/etc/pve/nodes/{target_node}/qemu-server/{vmid}.conf"
+            else:
+                source_path = f"/etc/pve/nodes/{source_node}/lxc/{vmid}.conf"
+                target_path = f"/etc/pve/nodes/{target_node}/lxc/{vmid}.conf"
+
+            self.logger.info(f"[HA] Moving VM {vmid} config: {source_path} -> {target_path}")
+
+            # Get target node IP
+            target_ip = self._ha_get_node_ip(target_node)
+            if not target_ip:
+                target_ip = self.host
+
+            # Use cluster credentials for SSH
+            api_user = self.config.user
+            ssh_user = (api_user or "root").split("@")[0]  # PR #62 (ry-ops): null-safe
+            ssh_password = self.config.pass_
+
+            # Build the move command - use mv to atomically move the config
+            # The /etc/pve filesystem (pmxcfs) is cluster-aware
+            move_cmd = f"mv {source_path} {target_path}"
+
+            # Try passwordless SSH first
+            if self._ssh_run_command(target_ip, ssh_user, move_cmd):
+                return True
+
+            # Try with password
+            if ssh_password and self._ssh_run_command_with_password(target_ip, ssh_user, move_cmd, ssh_password):
+                return True
+
+            # Alternative: Try to copy instead of move (in case mv fails due to permissions)
+            copy_cmd = f"cp {source_path} {target_path} && rm {source_path}"
+
+            if self._ssh_run_command(target_ip, ssh_user, copy_cmd):
+                return True
+
+            if ssh_password and self._ssh_run_command_with_password(target_ip, ssh_user, copy_cmd, ssh_password):
+                return True
+
+            self.logger.error("[HA] ✗ Could not move VM config - SSH access required")
+            self.logger.error(f"[HA] Manual fix: mv {source_path} {target_path}")
+            return False
+
+        except Exception as e:
+            self.logger.error(f"[HA] Error moving VM config: {e}")
+            return False
+
+    def get_ha_status(self) -> Dict:
+
+        # First, try to get node count from cluster if ha_node_status is empty
+        # Do this OUTSIDE the lock to avoid deadlocks
+        cluster_online = 0
+        cluster_total = 0
+
+        try:
+            if self.is_connected:
+                host = self.host
+                url = f"https://{host}:{self.api_port}/api2/json/nodes"
+                session = self._create_session()
+                response = session.get(url, timeout=5)
+                if response.status_code == 200:
+                    cluster_nodes = response.json().get("data", [])
+                    cluster_total = len(cluster_nodes)
+                    cluster_online = sum(1 for n in cluster_nodes if n.get("status") == "online")
+        except Exception as e:
+            self.logger.debug(f"[HA] Could not fetch nodes for status: {e}")
+
+        with self.ha_lock:
+            # Count online/offline nodes from ha_node_status if available
+            online_nodes = sum(1 for d in self.ha_node_status.values() if d.get("status") == "online")
+            total_nodes = len(self.ha_node_status)
+
+            # If no nodes tracked yet, use cluster data
+            if total_nodes == 0 and cluster_total > 0:
+                total_nodes = cluster_total
+                online_nodes = cluster_online
+
+            # Determine status
+            if total_nodes == 0:
+                health_status = "unknown"
+            elif online_nodes == total_nodes:
+                health_status = "healthy"
+            elif online_nodes > 0:
+                health_status = "degraded"
+            else:
+                health_status = "critical"
+
+            return {
+                "enabled": self.ha_enabled,
+                "check_interval": self.ha_check_interval,
+                "failure_threshold": self.ha_failure_threshold,
+                "nodes": {
+                    name: {
+                        "status": data["status"],
+                        "last_seen": data["last_seen"].isoformat() if data.get("last_seen") else None,
+                        "consecutive_failures": data.get("consecutive_failures", 0),
+                    }
+                    for name, data in self.ha_node_status.items()
+                },
+                "recovery_in_progress": list(self.ha_recovery_in_progress.keys()),
+                "fallback_hosts": self.config.fallback_hosts,
+                # Split-brain prevention status
+                "split_brain_prevention": {
+                    "quorum_enabled": self.ha_config.get("quorum_enabled", True),
+                    "have_quorum": self.ha_have_quorum,
+                    "last_quorum_check": self.ha_last_quorum_check.isoformat() if self.ha_last_quorum_check else None,
+                    "self_fence_enabled": self.ha_config.get("self_fence_enabled", True),
+                    "watchdog_enabled": self.ha_config.get("watchdog_enabled", False),
+                    "recovery_delay": self.ha_config.get("recovery_delay", 30),
+                    "quorum_hosts": self.ha_config.get("quorum_hosts", []),
+                    "quorum_gateway": self.ha_config.get("quorum_gateway", ""),
+                    "quorum_required_votes": self.ha_config.get("quorum_required_votes", 2),
+                    "verify_network": self.ha_config.get("verify_network_before_recovery", True),
+                    # 2-Node Mode
+                    "two_node_mode": self.ha_config.get("two_node_mode", False),
+                    # Storage-based Split-Brain Protection
+                    "storage_heartbeat_enabled": self.ha_config.get("storage_heartbeat_enabled", False),
+                    "storage_heartbeat_path": self.ha_config.get("storage_heartbeat_path", ""),
+                    "storage_heartbeat_timeout": self.ha_config.get("storage_heartbeat_timeout", 30),
+                    "poison_pill_enabled": self.ha_config.get("poison_pill_enabled", True),
+                    "strict_fencing": self.ha_config.get("strict_fencing", False),
+                    "last_heartbeat_write": self.ha_last_heartbeat_write.isoformat()
+                    if self.ha_last_heartbeat_write
+                    else None,
+                    "ProxmoxVEx_vmid": self.ha_config.get("ProxmoxVEx_vmid", ""),
+                    # 2026-06-03 (admin-visibility) - surfaces the fence
+                    # strategy the agent was installed with so the UI can
+                    # render a clear "this cluster is in wait-mode, add a
+                    # qdevice" banner instead of admins having to grep
+                    # /var/log/ProxmoxVEx-agent.log on each node.
+                    "fence_strategy": self.ha_config.get(
+                        "fence_strategy",
+                        {
+                            "strategy": "unknown",
+                            "reason": "agents not yet installed in this session",
+                            "expected_votes": None,
+                            "has_qdevice": None,
+                            "detected_at": None,
+                            "detection_reason": "never-run",
+                        },
+                    ),
+                    "fence_strategy_warning": (
+                        "2-node cluster without qdevice — auto-fencing is "
+                        "disabled to avoid taking the whole cluster down on "
+                        "planned single-node reboots. Add a qdevice "
+                        "(corosync-qnetd on a third reachable host) to enable "
+                        "quorum-based fencing."
+                        if (self.ha_config.get("fence_strategy") or {}).get("strategy") == "wait"
+                        else None
+                    ),
+                },
+                # Cluster health summary
+                "cluster_health": {
+                    "online_nodes": online_nodes,
+                    "total_nodes": total_nodes,
+                    "is_2_node_cluster": total_nodes == 2,
+                    "status": health_status,
+                },
+                # Auto-discovered shared storages
+                "discovered_storages": getattr(self, "_cached_shared_storages", []),
+                "block_storages": getattr(self, "_cached_block_storages", []),
+                "auto_protection_active": bool(self.ha_config.get("storage_heartbeat_path")),
+                # Self-Fence Protection
+                "self_fence_installed": self.ha_config.get("self_fence_installed", False),
+                "self_fence_nodes": self.ha_config.get("self_fence_nodes", []),
+            }
+
+    def get_tasks(self, limit: int = 50, force: bool = False) -> List[Dict]:
+        """get recent cluster tasks, newest first
+
+        force=True bypasses the short result cache — used by push_immediate_update
+        after a VM action so the just-started task shows up sub-second (N-2)."""
+        # Fail early if we're not connected to avoid hanging
+        if not self.is_connected or not self.session:
+            return []
+
+        # H1 (scale audit): short result cache so the ~1s broadcast loop doesn't
+        # re-fetch + re-resolve users every second. 3s default, PROXMOXVEX_TASKS_TTL=0 off.
+        _tt = getattr(self, "_tasks_ttl", None)
+        if _tt is None:
+            try:
+                _tt = float(os.environ.get("PROXMOXVEX_TASKS_TTL", "3"))
+            except (TypeError, ValueError):
+                _tt = 3.0
+            self._tasks_ttl = _tt
+        _tcache = getattr(self, "_tasks_cache", None)
+        if _tcache is None:
+            _tcache = self._tasks_cache = {}
+        if _tt > 0 and not force:
+            _ent = _tcache.get(limit)
+            if _ent and _ent[1] and (time.monotonic() - _ent[0]) < _tt:
+                return _ent[1]
+
+        tasks = []
+        try:
+            host = self.host
+
+            # Get cluster-wide tasks
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/tasks"
+            response = self._create_session().get(url, timeout=10)
+
+            if response.status_code == 200:
+                cluster_tasks = response.json().get("data", [])
+                for task in cluster_tasks[:limit]:
+                    # Parse the task and extract useful info
+                    task_info = {
+                        "upid": task.get("upid", ""),
+                        "node": task.get("node", ""),
+                        "type": task.get("type", ""),
+                        "status": task.get("status", "running"),
+                        "starttime": task.get("starttime"),
+                        "endtime": task.get("endtime"),
+                        "user": task.get("user", ""),  # Proxmox user (e.g. root@pam)
+                        "id": task.get("id", ""),
+                    }
+
+                    # Add ProxmoxVEx user who initiated this task (if known)
+                    from ProxmoxVEx.api.helpers import get_task_user
+
+                    ProxmoxVEx_user = get_task_user(task_info["upid"])
+                    if ProxmoxVEx_user:
+                        task_info["ProxmoxVEx_user"] = ProxmoxVEx_user
+
+                    # Generalized audit-log fallback. Many endpoints don't
+                    # call register_task_user (snapshots, migrations, config updates, …)
+                    # so the explicit upid→user map only covers ~30% of tasks. For the
+                    # rest we infer from audit_log by matching task type → known action,
+                    # vmid in details, and a tight time window around the task starttime.
+                    # Survives F5 because audit_log is persistent.
+                    _neg_ent = _TASK_USER_NEGCACHE.get(task_info.get("upid") or "")
+                    _neg_fresh = _neg_ent is not None and (time.monotonic() - _neg_ent) < _TASK_USER_NEGCACHE_TTL
+                    if not ProxmoxVEx_user and not _neg_fresh:
+                        try:
+                            from ProxmoxVEx.core.db import get_db
+
+                            _db = get_db()
+                            _c = _db.conn.cursor()
+                            # Wider window for slower operations (migrations, backups)
+                            _slow_types = {
+                                "qmigrate",
+                                "vzmigrate",
+                                "vzdump",
+                                "qmrestore",
+                                "vzrestore",
+                                "snapshot",
+                                "qmsnapshot",
+                                "qmclone",
+                            }
+                            _window = 600 if task_info["type"] in _slow_types else 90
+                            # task.starttime is a unix timestamp; audit_log.timestamp is ISO local
+                            _start_ts = task_info.get("starttime") or 0
+                            if _start_ts:
+                                _from = (datetime.fromtimestamp(_start_ts) - timedelta(seconds=_window)).isoformat()
+                                _to = (datetime.fromtimestamp(_start_ts) + timedelta(seconds=30)).isoformat()
+                            else:
+                                _from = (datetime.now() - timedelta(seconds=_window)).isoformat()
+                                _to = datetime.now().isoformat()
+                            vmid = task_info.get("id") or ""
+                            if vmid:
+                                # any audit entry referencing this VMID in the time window
+                                _c.execute(
+                                    "SELECT user FROM audit_log WHERE "
+                                    "(details LIKE ? OR details LIKE ? OR details LIKE ?) "
+                                    "AND timestamp BETWEEN ? AND ? "
+                                    "ORDER BY timestamp DESC LIMIT 1",
+                                    (f"%/{vmid} %", f"%/{vmid}\n%", f"%VM {vmid}%", _from, _to),
+                                )
+                                _row = _c.fetchone()
+                                if _row:
+                                    task_info["ProxmoxVEx_user"] = _row[0]
+                            else:
+                                # cluster-level task (no vmid) — match by node + action timing
+                                _c.execute(
+                                    "SELECT user FROM audit_log WHERE "
+                                    "details LIKE ? AND timestamp BETWEEN ? AND ? "
+                                    "ORDER BY timestamp DESC LIMIT 1",
+                                    (f"%{task_info.get('node', '')}%", _from, _to),
+                                )
+                                _row = _c.fetchone()
+                                if _row:
+                                    task_info["ProxmoxVEx_user"] = _row[0]
+                            # Promote audit-log match into task_users so future calls
+                            # hit the fast path instead of re-running the LIKE query.
+                            if task_info.get("ProxmoxVEx_user") and task_info["upid"]:
+                                try:
+                                    from ProxmoxVEx.api.helpers import register_task_user
+
+                                    register_task_user(task_info["upid"], task_info["ProxmoxVEx_user"], self.id)
+                                except Exception:
+                                    pass
+                            elif task_info.get("upid"):
+                                # H1: no audit match (system/automation task) — negative-cache
+                                # so we don't re-run this scan every broadcast tick.
+                                if len(_TASK_USER_NEGCACHE) >= _TASK_USER_NEGCACHE_MAX:
+                                    _TASK_USER_NEGCACHE.clear()
+                                _TASK_USER_NEGCACHE[task_info["upid"]] = time.monotonic()
+                        except Exception:
+                            pass
+
+                    # Parse VMID from ID if present
+                    if task_info["id"]:
+                        try:
+                            task_info["vmid"] = int(task_info["id"])
+                        except (ValueError, TypeError):
+                            task_info["vmid"] = task_info["id"]
+
+                    # Get exit status for completed tasks
+                    if getattr(task, "status", None) and task["status"] != "running":
+                        task_info["exitstatus"] = task.get("exitstatus", "")
+                        # Mark as failed if exit status indicates error
+                        if (
+                            task_info["exitstatus"]
+                            and "error" in task_info["exitstatus"].lower()
+                            or task_info["exitstatus"]
+                            and task_info["exitstatus"] != "OK"
+                        ):
+                            task_info["status"] = "failed"
+                            task_info["error"] = task_info["exitstatus"]
+
+                    tasks.append(task_info)
+
+            # Sort by starttime descending (newest first)
+            tasks.sort(key=lambda x: x.get("starttime") or 0, reverse=True)
+
+            if _tt > 0:
+                _tcache[limit] = (time.monotonic(), tasks)
+            return tasks
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            # Don't immediately mark disconnected - transient errors happen
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting tasks: {e}")
+            return []
+
+    def get_datacenter_options(self) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/options"
+            response = self._create_session().get(url, timeout=15)
+
+            if response.status_code == 200:
+                options = response.json().get("data", {})
+                return {
+                    "success": True,
+                    "options": {
+                        "task_log_max_days": options.get("max-workers", 4),  # Default 4
+                        "console": options.get("console", "default"),
+                        "keyboard": options.get("keyboard", ""),
+                        "language": options.get("language", ""),
+                        "email_from": options.get("email_from", ""),
+                        "migration_type": options.get("migration", {}).get("type", "secure"),
+                        "migration_network": options.get("migration", {}).get("network", ""),
+                        "ha_shutdown_policy": options.get("ha", {}).get("shutdown_policy", "conditional"),
+                        # Raw options for reference
+                        "raw": options,
+                    },
+                }
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            self.logger.error(f"Error getting datacenter options: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_metric_servers(self) -> list:
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/metrics/server"
+            response = self._api_get(url)
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting metric servers: {e}")
+            return []
+
+    def stop_task(self, node: str, upid: str) -> bool:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return False
+
+        try:
+            import urllib.parse as _up
+
+            host = self.host
+            # UPIDs contain ':', '@' and sometimes '!'; PVE expects the
+            # task ID URL-encoded just like the rest of the web UI does.
+            encoded_upid = _up.quote(upid, safe="")
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/tasks/{encoded_upid}"
+            response = self._api_delete(url)
+
+            if response.status_code == 200:
+                self.logger.info(f"Task {upid} cancelled on {node}")
+                return True
+            else:
+                self.logger.error(
+                    f"Failed to cancel task {upid}: {response.status_code} {getattr(response, 'text', '')[:200]}"
+                )
+                return False
+        except Exception as e:
+            self.logger.error(f"Error cancelling task: {e}")
+            return False
+
+    def get_task_log(self, node: str, upid: str, limit: int = 1000) -> str:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return "Error: Not connected to Proxmox"
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/tasks/{upid}/log"
+            params = {"limit": limit}
+            response = self._create_session().get(url, params=params)
+
+            if response.status_code == 200:
+                data = response.json().get("data", [])
+                # Combine log lines
+                log_lines = []
+                for entry in sorted(data, key=lambda x: x.get("n", 0)):
+                    line = entry.get("t", "")
+                    log_lines.append(line)
+                return "\n".join(log_lines)
+            else:
+                return f"Error: Could not fetch log (Status {response.status_code})"
+        except Exception as e:
+            self.logger.error(f"Error getting task log: {e}")
+            return f"Error: {str(e)}"
+
+    # =====================================================
+    # PROXMOX NATIVE HA INTEGRATION
+    # =====================================================
+
+    def get_proxmox_ha_resources(self) -> List[Dict]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/ha/resources"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting Proxmox HA resources: {e}")
+            return []
+
+    def get_proxmox_ha_groups(self) -> List[Dict]:
+        """Return HA groups in the legacy group shape so the existing UI keeps working.
+
+        PVE 9.1.x removed `/cluster/ha/groups` (now returns 500
+        with "ha groups have been migrated to rules") and replaced it with
+        `/cluster/ha/rules`. The hybrid path here tries rules first and
+        translates the node-affinity rule shape back into the group shape
+        the frontend already speaks. Falls back to the legacy endpoint when
+        rules isn't available (PVE 8.x).
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        host = self.host
+
+        # 1) Try the new endpoint first (PVE 9.1+).
+        try:
+            response = self._api_get(f"https://{host}:{self.api_port}/api2/json/cluster/ha/rules")
+            if response.status_code == 200:
+                rules = response.json().get("data", []) or []
+                groups = []
+                for r in rules:
+                    # Only node-affinity rules map cleanly onto the group concept.
+                    # Other rule types (e.g. resource-affinity / anti-affinity) get
+                    # surfaced via the dedicated Affinity Rules UI when that lands;
+                    # for now they're not exposed via the group view.
+                    if (r.get("type") or "").lower() != "node-affinity":
+                        continue
+                    groups.append({
+                        "group": r.get("rule", ""),
+                        "nodes": r.get("nodes", ""),
+                        "restricted": 1 if r.get("strict") else 0,
+                        # PVE rules don't carry nofailback — set 0 so the UI keeps the column populated.
+                        "nofailback": 0,
+                        "comment": r.get("comment", ""),
+                        # Extra fields surfaced read-only so the UI
+                        # can flag rule-only attributes if it wants to.
+                        "_pve_rule_id": r.get("rule", ""),
+                        "_pve_rule_resources": r.get("resources", ""),
+                        "_pve_rule_disable": 1 if r.get("disable") else 0,
+                    })
+                return groups
+            if response.status_code not in (404, 501):
+                # Real error from /rules — don't silently swallow into a fallback
+                self.logger.warning(f"[HA] /cluster/ha/rules returned {response.status_code}: {response.text[:200]}")
+        except Exception as e:
+            self.logger.debug(f"[HA] /cluster/ha/rules probe failed (pre-PVE-9 cluster?): {e}")
+
+        # 2) Legacy fallback for PVE 8.x where /rules doesn't exist yet.
+        try:
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/ha/groups"
+            response = self._api_get(url)
+            if response.status_code == 200:
+                return response.json().get("data", []) or []
+            # On PVE 9.1.x the old endpoint returns 500 "migrated to rules" — log once
+            # and return empty rather than bubble up the misleading error to the UI.
+            if response.status_code == 500 and "migrated to rules" in (response.text or "").lower():
+                self.logger.info(
+                    "[HA] /cluster/ha/groups is gone on this cluster (PVE 9.1+); /rules call must have failed earlier"
+                )
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting Proxmox HA groups: {e}")
+            return []
+
+    def add_vm_to_proxmox_ha(
+        self,
+        vmid: int,
+        vm_type: str = "vm",
+        group: str = None,
+        max_restart: int = 1,
+        max_relocate: int = 1,
+        state: str = "started",
+        comment: str = None,
+        auto_rebalance=None,
+    ) -> Dict:
+        """add VM/CT to Proxmox native HA with restart/relocate limits.
+
+        (PVE 9.2) - auto_rebalance is the per-resource opt-out for
+        dynamic CRS rebalancing. Accept None (don't send), True/1, or False/0.
+        Stripped for pre-9.2 clusters.
+
+        Also: PVE 9.2 retired the `group` resource property — groups migrated
+        to the rules engine, so passing `group=...` returns
+        500 "invalid parameter 'group': ha groups have been migrated to rules".
+        We drop the legacy field on 9.2+ and rely on the caller having set up
+        an equivalent node-affinity rule via /cluster/ha/rules.
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/ha/resources"
+
+            # sid format: vm:100 or ct:100
+            sid = f"{vm_type}:{vmid}"
+
+            data = {"sid": sid, "max_restart": max_restart, "max_relocate": max_relocate, "state": state or "started"}
+
+            pve_ver = self.get_pve_version_tuple()
+            ha_supports_groups = pve_ver is None or pve_ver < (9, 2)
+
+            if group:
+                if ha_supports_groups:
+                    data["group"] = group
+                else:
+                    self.logger.info(
+                        f"[HA] dropping legacy 'group={group}' for PVE {pve_ver} — "
+                        f"groups migrated to /cluster/ha/rules; create a node-affinity rule instead"
+                    )
+            if comment:
+                data["comment"] = comment
+            if auto_rebalance is not None and not ha_supports_groups:
+                # auto-rebalance only exists on 9.2+; ha_supports_groups inverse = 9.2+
+                data["auto-rebalance"] = 1 if auto_rebalance else 0
+            elif auto_rebalance is not None:
+                self.logger.debug(f"[HA] auto-rebalance skipped (PVE {pve_ver} < 9.2)")
+
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                self.logger.info(f"[HA] Added {sid} to Proxmox HA")
+                return {"success": True, "message": f"{sid} added to HA"}
+            else:
+                error = response.text
+                self.logger.error(f"[HA] Failed to add {sid} to HA: {error}")
+                return {"success": False, "error": error}
+
+        except Exception as e:
+            self.logger.error(f"Error adding to Proxmox HA: {e}")
+            return {"success": False, "error": str(e)}
+
+    def remove_vm_from_proxmox_ha(self, vmid: int, vm_type: str = "vm") -> Dict:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Not connected"}
+
+        try:
+            host = self.host
+            sid = f"{vm_type}:{vmid}"
+            url = f"https://{host}:{self.api_port}/api2/json/cluster/ha/resources/{sid}"
+
+            response = self._api_delete(url)
+
+            if response.status_code == 200:
+                self.logger.info(f"[HA] Removed {sid} from Proxmox HA")
+                return {"success": True, "message": f"{sid} removed from HA"}
+            else:
+                error = response.text
+                self.logger.error(f"[HA] Failed to remove {sid} from HA: {error}")
+                return {"success": False, "error": error}
+
+        except Exception as e:
+            self.logger.error(f"Error removing from Proxmox HA: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _get_node_ip(self, node_name: str) -> Optional[str]:
+        """Thin wrapper around _get_node_ip_impl that gates on the per-node
+        circuit breaker (skip lookups for known-dead nodes) and feeds the
+        breaker on the result (None → register failure, IP → reset).
+        """
+        blocked, remaining = self._is_node_blocked(node_name)
+        if blocked:
+            self.logger.debug(
+                f"[NodeIP] '{node_name}' is in circuit-breaker backoff "
+                f"({remaining}s remaining), returning None without probing"
+            )
+            return None
+
+        ip = self._get_node_ip_impl(node_name)
+        if ip:
+            self._reset_node_failures(node_name)
+        else:
+            self._register_node_failure(node_name)
+        return ip
+
+    def _get_node_ip_impl(self, node_name: str) -> Optional[str]:
+        """Get the best REACHABLE management IP address for a node.
+
+        Fixed for VLAN setups (vmbr0 / vmbr0.10 / vmbr0.510):
+
+        Works for ANY management interface:
+          - vmbr0         (flat, no VLAN)
+          - vmbr0.10      (VLAN 10)
+          - vmbr0.510     (VLAN 510)
+          - vmbr1.100     (second bridge, VLAN 100)
+          - bond0 / eno1  (direct interface, no bridge)
+
+        Strategy:
+        1. Query the CURRENT/PRIMARY node to find which interface has the mgmt IP
+        2. On the TARGET node, find the IP on the SAME interface name (vmbr0.10 -> vmbr0.10)
+        3. Fall back to same CIDR network
+        4. Verify reachability with TCP probe (port 8006)
+        5. NEVER blindly use Corosync/storage IPs
+        """
+        try:
+            import ipaddress
+            import socket
+
+            if not self.is_connected and not self.connect_to_proxmox():
+                return None
+
+            host = self.host
+            primary_ip = self.config.host
+
+            # If the cluster is configured with a hostname (very common), resolve it
+            # to an IP so we can compare it against the addresses reported by the
+            # Proxmox network API. Without this, primary_network stays None and
+            # remote nodes on the same management subnet get low scores, which
+            # causes "Could not determine node IP" even when the IP is listed.
+            try:
+                ipaddress.ip_address(primary_ip)
+            except ValueError:
+                try:
+                    for _af, _socktype, _proto, _canonname, sa in socket.getaddrinfo(
+                        primary_ip, self.api_port, socket.AF_UNSPEC, socket.SOCK_STREAM
+                    ):
+                        resolved = str(sa[0])
+                        if resolved and not resolved.startswith("127.") and resolved != "::1":
+                            self.logger.debug(f"[NodeIP] Resolved configured host {primary_ip} -> {resolved}")
+                            primary_ip = resolved
+                            break
+                except Exception as e:
+                    self.logger.debug(f"[NodeIP] Could not resolve configured host {primary_ip}: {e}")
+
+            # If target is the local/primary node, return its IP directly
+            # Otherwise the logic below skips it (ip == primary_ip filter)
+            try:
+                cs_url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
+                cs_resp = self._api_get(cs_url)
+                if cs_resp.status_code == 200:
+                    for item in cs_resp.json().get("data", []):
+                        if item.get("type") == "node" and item.get("name") == node_name and item.get("local", 0) == 1:
+                            # #199: in failover, self.host is the actual connected node,
+                            # self.config.host is the (possibly dead) configured primary
+                            local_ip = host if host != primary_ip else primary_ip
+                            # The API IP (pveproxy) may not be the same interface as
+                            # SSH. Verify the SSH port is reachable before using it so
+                            # local nodes get the same probing as remote nodes.
+                            ssh_port = getattr(self.config, "ssh_port", 22) or 22
+                            try:
+                                af = socket.AF_INET6 if ":" in local_ip else socket.AF_INET
+                                s = socket.socket(af, socket.SOCK_STREAM)
+                                s.settimeout(2)
+                                reachable = s.connect_ex((local_ip, ssh_port)) == 0
+                                s.close()
+                                if reachable:
+                                    self.logger.info(
+                                        f"[NodeIP] {node_name} is the local node, {local_ip} reachable on :{ssh_port}"
+                                    )
+                                    return local_ip
+                            except Exception:
+                                pass
+                            self.logger.debug(
+                                f"[NodeIP] {node_name} is the local node, but {local_ip} "
+                                f"not reachable on :{ssh_port}; continuing to discover"
+                            )
+            except Exception:
+                pass
+
+            def _parse_cidr(addr_str, cidr_str=None, netmask_str=None):
+                try:
+                    if cidr_str and "/" in cidr_str:
+                        return ipaddress.ip_interface(cidr_str)  # Auto IPv4/IPv6
+                    if netmask_str:
+                        return ipaddress.ip_interface(f"{addr_str}/{netmask_str}")
+                    # Default prefix: /24 for IPv4, /64 for IPv6
+                    prefix = "/64" if ":" in addr_str else "/24"
+                    return ipaddress.ip_interface(f"{addr_str}{prefix}")
+                except Exception:
+                    return None
+
+            def _quick_probe(ip, port=8006, timeout=2):
+                """Quick TCP probe to check if IP:port is reachable (IPv4+IPv6)."""
+                try:
+                    # Issue #71: Detect address family for IPv6 support
+                    af = socket.AF_INET6 if ":" in ip else socket.AF_INET
+                    s = socket.socket(af, socket.SOCK_STREAM)
+                    s.settimeout(timeout)
+                    result = s.connect_ex((ip, port))
+                    s.close()
+                    return result == 0
+                except Exception:
+                    return False
+
+            try:
+                primary_parsed = ipaddress.ip_address(primary_ip)  # IPv4 or IPv6
+            except Exception:
+                primary_parsed = None
+
+            # (PR #324): probe the *SSH* port, not 8006.
+            # pveproxy listens on every bridge incl. the corosync link, so
+            # 8006 reachability says nothing about whether we can actually SSH
+            # there. Default 22, override via cluster.ssh_port.
+            ssh_port = getattr(self.config, "ssh_port", 22) or 22
+
+            # ================================================================
+            # STEP 1: Find which interface the PRIMARY node uses for management
+            # Query the PRIMARY node, NOT the target -- this was the old bug
+            # Run BEFORE STEP 0 so primary_network is available when we check
+            # whether cluster/status returned a Corosync ring IP.
+            # ================================================================
+            primary_iface = None  # e.g., 'vmbr0.10' or 'vmbr0'
+            primary_network = None  # ipaddress.IPv4Network
+            primary_vlan_id = None  # e.g., '10', '510', or None
+
+            # Cache per-cluster to avoid repeated API calls
+            if not hasattr(self, "_cached_mgmt_iface"):
+                self._cached_mgmt_iface = None
+                self._cached_mgmt_network = None
+                self._cached_mgmt_vlan = None
+
+            if self._cached_mgmt_iface:
+                primary_iface = self._cached_mgmt_iface
+                primary_network = self._cached_mgmt_network
+                primary_vlan_id = self._cached_mgmt_vlan
+            else:
+                try:
+                    # Find current node name
+                    status_url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
+                    status_resp = self._api_get(status_url)
+                    current_node_name = None
+                    if status_resp.status_code == 200:
+                        for item in status_resp.json().get("data", []):
+                            if item.get("type") == "node" and item.get("local", 0) == 1:
+                                current_node_name = item.get("name")
+                                break
+
+                    if not current_node_name:
+                        nodes_url = f"https://{host}:{self.api_port}/api2/json/nodes"
+                        nodes_resp = self._api_get(nodes_url)
+                        if nodes_resp.status_code == 200:
+                            for n in nodes_resp.json().get("data", []):
+                                if n.get("status") == "online":
+                                    current_node_name = n.get("node")
+                                    break
+
+                    if current_node_name:
+                        net_url = f"https://{host}:{self.api_port}/api2/json/nodes/{current_node_name}/network"
+                        net_resp = self._api_get(net_url)
+                        if net_resp.status_code == 200:
+                            for net in net_resp.json().get("data", []):
+                                addr = net.get("address") or ""
+                                if not addr:
+                                    continue
+                                try:
+                                    if ipaddress.ip_address(addr) == primary_parsed:
+                                        primary_iface = net.get("iface", "")
+                                        ci = net.get("cidr", "")
+                                        nm = net.get("netmask", "")
+                                        pi = _parse_cidr(addr, ci, nm)
+                                        if pi:
+                                            primary_network = pi.network
+                                        if "." in primary_iface:
+                                            primary_vlan_id = primary_iface.rsplit(".", 1)[-1]
+                                        self._cached_mgmt_iface = primary_iface
+                                        self._cached_mgmt_network = primary_network
+                                        self._cached_mgmt_vlan = primary_vlan_id
+                                        self.logger.info(
+                                            f"[NodeIP] Mgmt interface: {primary_iface} ({primary_ip}/{pi.network.prefixlen if pi else '?'}) VLAN={primary_vlan_id or 'none'}"
+                                        )
+                                        break
+                                except Exception:
+                                    continue
+                except Exception as e:
+                    self.logger.debug(f"[NodeIP] Could not detect primary interface: {e}")
+
+            # ================================================================
+            # STEP 0 (Issue #71, PR #324): Quick path via cluster/status.
+            # cluster/status reports each node's "ip" field, which can be:
+            #  - the mgmt IP (great -> return it)
+            #  - the corosync ring IP on a dedicated cluster VLAN (bad ->
+            #    reachable on 8006 but NOT on SSH from the ProxmoxVEx server)
+            # So we only trust it if it sits in primary_network (STEP 1)
+            # and probes on the SSH port.
+            # ================================================================
+            try:
+                cs_url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
+                cs_resp = self._api_get(cs_url)
+                if cs_resp.status_code == 200:
+                    for item in cs_resp.json().get("data", []):
+                        if item.get("type") == "node" and item.get("name") == node_name:
+                            node_direct_ip = item.get("ip", "")
+                            if node_direct_ip and node_direct_ip != primary_ip:
+                                in_mgmt_net = True
+                                if primary_network:
+                                    try:
+                                        in_mgmt_net = ipaddress.ip_address(node_direct_ip) in primary_network
+                                    except Exception:
+                                        in_mgmt_net = False
+                                if not in_mgmt_net:
+                                    self.logger.debug(
+                                        f"[NodeIP] {node_name}: cluster/status IP {node_direct_ip} outside mgmt net {primary_network}, skipping quick path (probably corosync)"
+                                    )
+                                elif _quick_probe(node_direct_ip, port=ssh_port):
+                                    self.logger.info(
+                                        f"[NodeIP] {node_name} -> {node_direct_ip} (cluster/status, reachable on :{ssh_port})"
+                                    )
+                                    return node_direct_ip
+                                else:
+                                    self.logger.debug(
+                                        f"[NodeIP] {node_name}: cluster/status IP {node_direct_ip} not reachable on :{ssh_port}, continuing"
+                                    )
+                            break
+            except Exception as e:
+                self.logger.debug(f"[NodeIP] cluster/status quick path failed: {e}")
+
+            # ================================================================
+            # STEP 2: Get ALL network interfaces from the TARGET node
+            # ================================================================
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node_name}/network"
+            response = self._api_get(url)
+
+            candidates = []
+
+            if response.status_code == 200:
+                networks = response.json().get("data", [])
+
+                for net in networks:
+                    iface = net.get("iface", "")
+                    net_type = net.get("type", "")
+
+                    if (
+                        iface.startswith("lo")
+                        or iface.startswith("tun")
+                        or iface.startswith("tap")
+                        or iface.startswith("veth")
+                    ):
+                        continue
+
+                    # Issue #71: Collect both IPv4 and IPv6 addresses from each interface
+                    addr_candidates = []
+                    # IPv4
+                    addr4 = net.get("address") or net.get("address4") or ""
+                    if addr4 and not addr4.startswith("127."):
+                        addr_candidates.append((addr4, net.get("cidr", ""), net.get("netmask", "")))
+                    # IPv6 (Proxmox reports as address6/cidr6)
+                    addr6 = net.get("address6") or ""
+                    if addr6 and addr6 != "::1" and not addr6.startswith("fe80:"):  # Skip link-local
+                        addr_candidates.append((addr6, net.get("cidr6", ""), ""))
+
+                    for addr, cidr, netmask in addr_candidates:
+                        parsed = _parse_cidr(addr, cidr, netmask)
+                        if not parsed:
+                            continue
+
+                        is_bridge = iface.startswith("vmbr") or net_type in ("bridge", "OVSBridge")
+                        is_vlan = "." in iface or net_type in ("vlan", "OVSIntPort")
+
+                        this_vlan_id = None
+                        if "." in iface:
+                            this_vlan_id = iface.rsplit(".", 1)[-1]
+
+                        # SCORING:
+                        # 100: EXACT same interface name (vmbr0.10 <-> vmbr0.10)
+                        #  95: Same VLAN ID, different bridge (vmbr0.10 <-> vmbr1.10)
+                        #  85: Same IP network + bridge/vlan
+                        #  80: Same IP network, any interface
+                        #  70: Non-VLAN bridge when primary is also non-VLAN
+                        #  40: Non-VLAN bridge when primary IS on a VLAN
+                        #  20: VLAN on different network (Corosync/NFS)
+                        #  30: Any other interface
+
+                        score = 30
+                        reason = f"iface={iface}"
+
+                        if primary_iface and iface == primary_iface:
+                            score = 100
+                            reason = f"exact_match {iface}"
+                        elif primary_vlan_id and this_vlan_id == primary_vlan_id:
+                            score = 95
+                            reason = f"same_vlan .{this_vlan_id} via {iface}"
+                        elif primary_parsed and parsed:
+                            try:
+                                same_net = primary_parsed in parsed.network
+                            except Exception:
+                                same_net = False
+                            if same_net:
+                                score = 85 if (is_bridge or is_vlan) else 80
+                                reason = f"same_network via {iface}"
+                        elif is_bridge and not is_vlan:
+                            if primary_iface and "." not in primary_iface:
+                                score = 70
+                                reason = f"bridge_no_vlan {iface}"
+                            else:
+                                score = 40
+                                reason = f"bridge_but_primary_is_vlan {iface}"
+                        elif is_vlan:
+                            score = 20
+                            reason = f"vlan_no_match {iface}"
+
+                        candidates.append((score, addr, iface, reason))
+                        self.logger.debug(f"[NodeIP] {node_name}: {addr} ({iface}) score={score} -- {reason}")
+
+            candidates.sort(key=lambda x: x[0], reverse=True)
+
+            # ================================================================
+            # STEP 3: Try candidates with connectivity probe (SSH port).
+            # Cap at 3 attempts so a cluster-creds call stays under the WS
+            # server's 10s timeout even on bad networks (PR #324).
+            # ================================================================
+            probed = 0
+            for score, ip, _, reason in candidates:
+                if score < 20 or ip == primary_ip:
+                    continue
+                if probed >= 3:
+                    self.logger.debug(f"[NodeIP] {node_name}: probe cap reached, falling through to STEP 4")
+                    break
+                probed += 1
+                if _quick_probe(ip, port=ssh_port):
+                    self.logger.info(f"[NodeIP] {node_name} -> {ip} (score={score}, {reason}) reachable on :{ssh_port}")
+                    return ip
+                else:
+                    self.logger.debug(f"[NodeIP] {node_name}: {ip} score={score} NOT reachable on :{ssh_port}")
+
+            # ================================================================
+            # STEP 4: Corosync -- ONLY if in management network
+            # ================================================================
+            try:
+                coro_url = f"https://{host}:{self.api_port}/api2/json/cluster/config/nodes"
+                coro_resp = self._api_get(coro_url)
+                if coro_resp.status_code == 200:
+                    for node in coro_resp.json().get("data", []):
+                        if node.get("name") == node_name:
+                            for key, value in node.items():
+                                if key.startswith("link") and value:
+                                    link_ip = value.split(",")[0].strip()
+                                    if not link_ip or link_ip.startswith("127.") or link_ip == "::1":
+                                        continue
+                                    try:
+                                        la = ipaddress.ip_address(link_ip)
+                                        if primary_network and la in primary_network:
+                                            if _quick_probe(link_ip, port=ssh_port):
+                                                self.logger.info(
+                                                    f"[NodeIP] {node_name} -> {link_ip} (corosync {key}, mgmt net) reachable on :{ssh_port}"
+                                                )
+                                                return link_ip
+                                        else:
+                                            self.logger.debug(
+                                                f"[NodeIP] SKIP corosync {link_ip} ({key}) -- not in mgmt network"
+                                            )
+                                    except Exception:
+                                        pass
+            except Exception:
+                pass
+
+            # ================================================================
+            # STEP 5: High-confidence without probe (firewall may block)
+            # ================================================================
+            for score, ip, _, reason in candidates:
+                if score >= 85 and ip != primary_ip:
+                    self.logger.warning(
+                        f"[NodeIP] {node_name} -> {ip} (score={score}, {reason}) -- probe failed, high confidence"
+                    )
+                    return ip
+
+            # ================================================================
+            # STEP 6: DNS / hostname fallback
+            # ================================================================
+            try:
+                # Use getaddrinfo instead of gethostbyname (supports both IPv4+IPv6)
+                import socket
+
+                addrs = socket.getaddrinfo(node_name, 8006, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                for af, _socktype, _proto, _canonname, sa in addrs:
+                    ip = str(sa[0])
+                    if (
+                        ip
+                        and ip != primary_ip
+                        and not ip.startswith("127.")
+                        and ip != "::1"
+                        and _quick_probe(ip, port=ssh_port)
+                    ):
+                        self.logger.info(
+                            f"[NodeIP] Resolved {node_name} to {ip} (DNS, {'IPv6' if af == socket.AF_INET6 else 'IPv4'})"
+                        )
+                        return ip
+                # If probe failed, return first result anyway
+                for _, _socktype, _proto, _canonname, sa in addrs:
+                    ip = str(sa[0])
+                    if ip and not ip.startswith("127.") and ip != "::1":
+                        self.logger.info(f"[NodeIP] Resolved {node_name} to {ip} (DNS, no probe)")
+                        return ip
+            except (socket.gaierror, OSError):
+                pass
+
+            # ================================================================
+            # STEP 6b: Best-effort fallback to the interface with the gateway.
+            # If all reachability probes fail (firewall, routing, SSH on a non-
+            # standard port), the bridge/VLAN that carries the default gateway is
+            # still the management IP listed on the node. Return it so callers
+            # can distinguish "SSH not available" from "Could not determine node IP".
+            # ================================================================
+            try:
+                networks = response.json().get("data", []) if response.status_code == 200 else []
+                for net in networks:
+                    iface = net.get("iface", "")
+                    net_type = net.get("type", "")
+                    gateway = net.get("gateway") or net.get("gateway6") or ""
+                    if not gateway:
+                        continue
+                    if not (
+                        iface.startswith("vmbr")
+                        or iface.startswith("bond")
+                        or "." in iface
+                        or net_type in ("bridge", "vlan", "OVSBridge", "OVSIntPort")
+                    ):
+                        continue
+                    addr4 = net.get("address") or net.get("address4") or ""
+                    if addr4 and not addr4.startswith("127."):
+                        self.logger.warning(f"[NodeIP] {node_name} -> {addr4} (gateway bridge {iface}, probe failed)")
+                        return addr4
+                    addr6 = net.get("address6") or ""
+                    if addr6 and addr6 != "::1" and not addr6.startswith("fe80:"):
+                        self.logger.warning(f"[NodeIP] {node_name} -> {addr6} (gateway bridge {iface}, probe failed)")
+                        return addr6
+            except Exception as e:
+                self.logger.debug(f"[NodeIP] gateway bridge fallback failed: {e}")
+
+            # (PR #324): only fall back to the connected host when
+            # the requested node is literally that host -- otherwise multi-node
+            # clusters would silently SSH into the wrong box.
+            connected = self.host or self.config.host
+            if connected and (node_name in connected or node_name in self.config.host):
+                if _quick_probe(connected, port=ssh_port):
+                    self.logger.debug(f"[NodeIP] {node_name} matches connected host, using {connected}")
+                    return connected
+                self.logger.warning(
+                    f"[NodeIP] {node_name} connected host {connected} is not reachable on SSH port {ssh_port}; skipping"
+                )
+                return None
+
+            self.logger.warning(f"[NodeIP] No reachable management IP for {node_name}")
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Error getting node IP: {e}")
+            return None
+
+    def _ssh_connect(self, host: str, retries: int = 3, retry_delay: float = 2.0):
+        """SSH connect with retry logic and connection rate limiting
+
+        Limits concurrent CONNECTION ATTEMPTS (not active sessions).
+        The semaphore is released after successful connection, allowing new
+        connections while this one is active. This prevents connection storms
+        while not blocking long-running operations.
+
+        HA operations use separate methods without any rate limiting.
+        """
+        # strip URL brackets from IPv6 if someone passes host property
+        if host and host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        paramiko = get_paramiko()
+        if not paramiko:
+            self.logger.error("paramiko not installed, cannot use SSH features")
+            return None
+
+        # Get connection parameters
+        username = self.config.ssh_user if self.config.ssh_user else self.config.user.split("@")[0]
+        ssh_port = getattr(self.config, "ssh_port", 22) or 22
+        ssh_key = getattr(self.config, "ssh_key", "")
+
+        for attempt in range(1, retries + 1):
+            # Rate limit connection ATTEMPTS (not active connections)
+            stats = get_ssh_connection_stats()
+            self.logger.debug(f"SSH queue: {stats['active_normal']} connecting, {stats['active_ha']} HA active")
+
+            if _g._ssh_semaphore is None:
+                _g.init_ssh_semaphore(SSH_MAX_CONCURRENT)
+            if _g._ssh_semaphore is None:
+                self.logger.error("SSH semaphore not initialized")
+                return None
+            acquired = _g._ssh_semaphore.acquire(timeout=120)
+            if not acquired:
+                self.logger.error(f"SSH to {host} queued too long (120s) - increase ProxmoxVEx_SSH_MAX_CONCURRENT")
+                return None
+
+            _ssh_track_connection("normal", +1)
+
+            try:
+                if attempt > 1:
+                    self.logger.info(f"SSH retry {attempt}/{retries} to {host}...")
+                else:
+                    self.logger.info(f"Connecting to {host}:{ssh_port} as {username}...")
+
+                ssh = paramiko.SSHClient()
+                apply_ssh_host_key_policy(ssh)
+
+                connect_kwargs = {
+                    "hostname": host,
+                    "port": ssh_port,
+                    "username": username,
+                    "timeout": 30,
+                    "banner_timeout": 30,
+                    "allow_agent": False,
+                    "look_for_keys": False,
+                }
+
+                if ssh_key:
+                    import io
+
+                    key_file = io.StringIO(ssh_key)
+                    pkey = None
+                    for _key_name, key_class in [
+                        ("RSA", paramiko.RSAKey),
+                        ("Ed25519", paramiko.Ed25519Key),
+                        ("ECDSA", paramiko.ECDSAKey),
+                        ("DSA", getattr(paramiko, "DSSKey", None)),
+                    ]:
+                        if key_class is None:
+                            continue
+                        try:
+                            key_file.seek(0)
+                            pkey = key_class.from_private_key(key_file)
+                            break
+                        except Exception:
+                            continue
+
+                    if not pkey:
+                        self.logger.error("Could not load SSH key - unsupported format")
+                        return None
+
+                    connect_kwargs["pkey"] = pkey
+                else:
+                    connect_kwargs["password"] = self.config.pass_
+
+                ssh.connect(**connect_kwargs)
+                self.logger.info(f"SSH connected to {host}" + (f" (attempt {attempt})" if attempt > 1 else ""))
+
+                # SUCCESS - release semaphore immediately, connection is established
+                # This allows new connections while this session runs
+                return ssh
+
+            except paramiko.ssh_exception.AuthenticationException as e:
+                self.logger.error(f"SSH auth failed for {username}@{host}: {e}")
+                self.logger.error("Configure key-based SSH with: python scripts/setup_ssh_keys.py")
+                return None
+
+            except (paramiko.ssh_exception.NoValidConnectionsError, socket.timeout, TimeoutError) as e:
+                if attempt < retries:
+                    delay = retry_delay * (2 ** (attempt - 1))
+                    self.logger.warning(f"SSH to {host} failed (attempt {attempt}), retry in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                self.logger.error(f"SSH to {host} failed after {retries} attempts: {e}")
+                return None
+
+            except Exception as e:
+                if attempt < retries:
+                    delay = retry_delay * (2 ** (attempt - 1))
+                    self.logger.warning(f"SSH error (attempt {attempt}), retry in {delay}s: {e}")
+                    time.sleep(delay)
+                    continue
+                self.logger.error(f"SSH to {host} failed: {e}")
+                return None
+
+            finally:
+                # Always release semaphore after attempt (success or failure)
+                _ssh_track_connection("normal", -1)
+                if _g._ssh_semaphore is not None:
+                    _g._ssh_semaphore.release()
+
+        return None
+
+    def _ssh_execute(self, ssh, command: str, task: UpdateTask = None) -> tuple:
+
+        try:
+            self.logger.info(f"Executing: {command}")
+
+            stdin, stdout, stderr = ssh.exec_command(command, get_pty=True)  # nosec: B601 - command built by callers with shlex.quote
+
+            output_lines = []
+
+            # Read output line by line
+            for line in iter(stdout.readline, ""):
+                line = line.strip()
+                if line:
+                    output_lines.append(line)
+                    if task:
+                        task.add_output(line)
+                    self.logger.debug(f"SSH: {line}")
+
+            exit_code = stdout.channel.recv_exit_status()
+
+            # Also capture any stderr
+            stderr_output = stderr.read().decode("utf-8").strip()
+            if stderr_output and task:
+                for line in stderr_output.split("\n"):
+                    if line.strip():
+                        task.add_output(f"[stderr] {line.strip()}")
+
+            return exit_code, "\n".join(output_lines), stderr_output
+
+        except Exception as e:
+            self.logger.error(f"SSH execute error: {e}")
+            return -1, "", str(e)
+
+    def _wait_for_node_online(self, node_name: str, timeout: int = 600) -> bool:
+
+        self.logger.info(f"Waiting for {node_name} to come back online (timeout: {timeout}s)...")
+        start_time = time.time()
+
+        # First wait a bit for the node to actually go down
+        # 30s seems to work, less and you get false positives
+        time.sleep(30)
+
+        while time.time() - start_time < timeout:
+            try:
+                # Try to get node status from Proxmox API
+                # Force reconnect in case session expired
+                self.session = None  # force new session
+                if self.connect_to_proxmox():
+                    node_status = self.get_node_status()
+                    if node_name in node_status and node_status[node_name]["status"] == "online":
+                        self.logger.info(f"[OK] {node_name} is back online!")
+                        return True
+
+            except Exception as e:
+                self.logger.debug(f"Waiting for {node_name}: {e}")
+
+            time.sleep(10)
+
+        self.logger.error(f"Timeout waiting for {node_name} to come online")
+        return False
+
+    def start_node_update(self, node_name: str, reboot: bool = True, force: bool = False) -> Optional[UpdateTask]:
+
+        # check node is in maintenance mode (unless force)
+        if not force:
+            if node_name not in self.nodes_in_maintenance:
+                self.logger.error(f"Cannot update {node_name}: not in maintenance mode")
+                return None
+
+            maintenance_task = self.nodes_in_maintenance[node_name]
+            if maintenance_task.status not in ["completed", "completed_with_errors"]:
+                self.logger.error(f"Cannot update {node_name}: evacuation not complete")
+                return None
+        else:
+            self.logger.warning(f"Force-updating {node_name} without maintenance mode!")
+
+        # check already updating
+        with self.update_lock:
+            existing = self.nodes_updating.get(node_name)
+            # #592: a finished task can still sit here (cleared on a grace timer or by the
+            # UI's DELETE) — don't let a completed/failed one block a fresh update of the node.
+            if existing and existing.status not in ("completed", "failed"):
+                return existing
+
+            task = UpdateTask(node_name, reboot)
+            self.nodes_updating[node_name] = task
+
+        self.logger.info(f"[SYNC] Starting update for node: {node_name} (reboot: {reboot}, force: {force})")
+
+        # Start update in background - use gevent if available for paramiko compatibility
+        if GEVENT_PATCHED:
+            try:
+                import gevent
+
+                gevent.spawn(self._perform_node_update, node_name, task)
+                self.logger.info("[SYNC] Update spawned with gevent greenlet")
+            except Exception as e:
+                self.logger.warning(f"Gevent spawn failed, falling back to thread: {e}")
+                update_thread = threading.Thread(target=self._perform_node_update, args=(node_name, task))
+                update_thread.daemon = True
+                update_thread.start()
+        else:
+            update_thread = threading.Thread(target=self._perform_node_update, args=(node_name, task))
+            update_thread.daemon = True
+            update_thread.start()
+
+        return task
+
+    def _perform_node_update(self, node_name: str, task: UpdateTask):
+
+        ssh = None
+
+        try:
+            task.status = "updating"
+            task.phase = "connecting"
+            task.add_output(f"Connecting to / Verbinde zu {node_name}...")
+
+            # Get node IP
+            node_ip = self._get_node_ip(node_name)
+            if not node_ip:
+                raise Exception(f"Could not determine IP for {node_name}")
+
+            task.add_output(f"Node IP: {node_ip}")
+
+            # Connect via SSH
+            ssh = self._ssh_connect(node_ip)
+            if not ssh:
+                # Check why SSH failed - get username for hint
+                username = self.config.ssh_user or self.config.user.split("@")[0]
+                ssh_port = getattr(self.config, "ssh_port", 22) or 22
+
+                if self.config.ssh_key:
+                    raise Exception(
+                        f"SSH connection failed to {username}@{node_ip}:{ssh_port} - Check SSH key configuration / SSH Verbindung fehlgeschlagen - Prüfe SSH Key Konfiguration"
+                    )
+                else:
+                    raise Exception(
+                        f"SSH connection failed to {username}@{node_ip}:{ssh_port} - Check if password auth is enabled on the node or configure an SSH key / SSH Verbindung fehlgeschlagen - Prüfe ob Passwort-Auth auf dem Node aktiviert ist oder konfiguriere einen SSH Key"
+                    )
+
+            task.add_output("SSH connection established / SSH Verbindung hergestellt")
+
+            # Check if we're root (common on Proxmox) - if so, no sudo needed
+            stdin, stdout, stderr = ssh.exec_command("id -u")  # nosec: B601 - fixed command
+            uid = stdout.read().decode().strip()
+            sudo_prefix = "" if uid == "0" else "sudo "
+
+            if uid == "0":
+                task.add_output("Running as root - no sudo needed")
+            else:
+                task.add_output(f"Running as uid {uid} - using sudo")
+
+            # Phase 1: apt update
+            task.phase = "apt_update"
+            task.add_output("Running apt update...")
+
+            exit_code, output, stderr = self._ssh_execute(
+                ssh, f"{sudo_prefix}DEBIAN_FRONTEND=noninteractive apt-get update", task
+            )
+
+            if exit_code != 0:
+                raise Exception(f"apt update failed / fehlgeschlagen: {stderr}")
+
+            task.add_output("[OK] apt update successful / erfolgreich")
+
+            # Phase 2: apt dist-upgrade
+            task.phase = "apt_dist_upgrade"
+            task.add_output("Running apt dist-upgrade...")
+
+            exit_code, output, stderr = self._ssh_execute(
+                ssh,
+                f'{sudo_prefix}DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"',
+                task,
+            )
+
+            if exit_code != 0:
+                raise Exception(f"apt dist-upgrade failed / fehlgeschlagen: {stderr}")
+
+            # Count upgraded packages (rough estimate from output)
+            if "upgraded" in output.lower():
+                for line in output.split("\n"):
+                    if "upgraded" in line.lower() and "newly installed" in line.lower():
+                        parts = line.split()
+                        with contextlib.suppress(Exception):
+                            task.packages_upgraded = int(parts[0])
+
+            task.add_output(
+                f"[OK] apt dist-upgrade successful / erfolgreich ({task.packages_upgraded} packages / Pakete)"
+            )
+
+            # Phase 3: Cleanup
+            task.add_output("Cleaning up / Aufräumen...")
+            self._ssh_execute(ssh, f"{sudo_prefix}apt-get autoremove -y", task)
+            self._ssh_execute(ssh, f"{sudo_prefix}apt-get autoclean", task)
+
+            # Close SSH before reboot
+            ssh.close()
+            ssh = None
+
+            # Phase 4: Reboot if requested
+            if task.reboot:
+                task.phase = "reboot"
+                task.status = "rebooting"
+                task.add_output("[SYNC] Initiating reboot / Starte Neustart...")
+
+                # Reconnect for reboot command
+                ssh = self._ssh_connect(node_ip)
+                if ssh:
+                    try:
+                        # Check if root
+                        stdin, stdout, stderr = ssh.exec_command("id -u")  # nosec: B601 - fixed command
+                        uid = stdout.read().decode().strip()
+                        is_root = uid == "0"
+
+                        self.logger.info(f"Sending reboot command to {node_name} (root={is_root})")
+                        task.add_output(f"Running as {'root' if is_root else 'non-root user'}")
+
+                        # Get transport and open channel with PTY for sudo support
+                        transport = ssh.get_transport()
+                        channel = transport.open_session()
+                        channel.get_pty()
+                        channel.settimeout(10)
+
+                        # Execute reboot command
+                        if is_root:
+                            channel.exec_command("shutdown -r now")  # nosec: B601 - fixed command
+                        else:
+                            channel.exec_command("sudo shutdown -r now")  # nosec: B601 - fixed command
+
+                        # Wait briefly for command to be sent
+                        time.sleep(3)
+
+                        # Try to read any output (will fail when connection drops, that's ok)
+                        try:
+                            output = channel.recv(1024).decode()
+                            if output:
+                                task.add_output(f"Reboot output: {output.strip()}")
+                        except Exception:
+                            pass
+
+                        channel.close()
+                        task.add_output("Reboot command sent / Reboot-Befehl gesendet")
+
+                    except Exception as e:
+                        self.logger.info(f"Reboot command sent (connection closed as expected): {e}")
+                        task.add_output("Reboot command sent / Reboot-Befehl gesendet")
+                    finally:
+                        with contextlib.suppress(Exception):
+                            ssh.close()
+                        ssh = None
+                else:
+                    task.add_output("[WARN] Could not reconnect for reboot / Konnte nicht für Reboot verbinden")
+                    task.add_output("Trying alternative reboot method / Versuche alternative Methode...")
+
+                    # Try via Proxmox API as fallback
+                    try:
+                        # Was `self.session.post(..., verify=False)` which
+                        # hardcoded the SSL bypass even when the operator configured
+                        # `_ssl_verify=True` on this cluster. Use _create_session()
+                        # so the per-cluster TLS preference is honoured (proper CA
+                        # verification when the user pinned a custom CA bundle).
+                        url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node_name}/status"
+                        response = self._create_session().post(url, data={"command": "reboot"})
+                        if response.status_code == 200:
+                            task.add_output("Reboot initiated via Proxmox API")
+                        else:
+                            task.add_output(f"API reboot failed: {response.status_code}")
+                    except Exception as api_e:
+                        task.add_output(f"API reboot also failed: {api_e}")
+
+                task.add_output("Waiting for node to reboot / Warte auf Neustart...")
+
+                # Wait for node to come back online
+                task.phase = "wait_online"
+                task.status = "waiting_online"
+
+                if self._wait_for_node_online(node_name):
+                    task.add_output(f"[OK] {node_name} is back online / ist wieder online!")
+                else:
+                    task.add_output(f"[ERROR] Timeout waiting for / beim Warten auf {node_name}")
+                    task.error = "Node did not come back online in time"
+                    task.status = "failed"
+                    task.phase = "wait_timeout"
+                    task.completed_at = datetime.now()
+                    return
+
+            # Done!
+            task.status = "completed"
+            task.phase = "done"
+            task.completed_at = datetime.now()
+            task.add_output("[OK] Update completed / abgeschlossen!")
+
+            # Auto-exit maintenance mode after successful update
+            if node_name in self.nodes_in_maintenance:
+                task.add_output("Exiting maintenance mode / Beende Wartungsmodus...")
+                try:
+                    self.exit_maintenance_mode(node_name)
+                    task.add_output("[OK] Maintenance mode exited / Wartungsmodus beendet")
+                except Exception as e:
+                    task.add_output(f"[WARN] Could not exit maintenance mode / Konnte Wartungsmodus nicht beenden: {e}")
+
+            self.logger.info(f"[OK] Node update completed for {node_name}")
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Node update failed for {node_name}: {e}")
+            task.status = "failed"
+            task.error = str(e)
+            task.add_output(f"[ERROR] Error / Fehler: {e}")
+
+        finally:
+            if ssh:
+                with contextlib.suppress(Exception):
+                    ssh.close()
+            # #592: the UI auto-dismiss (DELETE /update) only fires from a mounted node
+            # card — from the sidebar alone nothing clears a finished task, so the "(Updating)"
+            # badge stuck until a service restart. Clear it server-side after a grace period.
+            if task.status in ("completed", "failed"):
+                self._schedule_update_clear(node_name, task)
+
+    def _schedule_update_clear(self, node_name: str, task) -> None:
+        # mirror the UI banner timing (#183): 30s after success, 2min after a failure so the
+        # completed/failed confirmation is still visible, then drop the stale entry.
+        grace = 30 if task.status == "completed" else 120
+
+        def _clear():
+            with self.update_lock:
+                cur = self.nodes_updating.get(node_name)
+                # only if it's still THIS finished task — a new run must not be wiped
+                if cur is task and cur.status in ("completed", "failed"):
+                    del self.nodes_updating[node_name]
+                    self.logger.info(f"[SYNC] cleared finished update state for {node_name}")
+
+        try:
+            if GEVENT_PATCHED:
+                import gevent
+
+                gevent.spawn_later(grace, _clear)
+            else:
+                t = threading.Timer(grace, _clear)
+                t.daemon = True
+                t.start()
+        except Exception as e:
+            self.logger.debug(f"[SYNC] couldn't schedule update-state clear for {node_name}: {e}")
+
+    def get_update_status(self, node_name: str) -> Optional[Dict]:
+
+        with self.update_lock:
+            if node_name in self.nodes_updating:
+                return self.nodes_updating[node_name].to_dict()
+            return None
+
+    def clear_update_status(self, node_name: str) -> bool:
+
+        with self.update_lock:
+            if node_name in self.nodes_updating:
+                task = self.nodes_updating[node_name]
+                if task.status in ["completed", "failed"]:
+                    del self.nodes_updating[node_name]
+                    return True
+            return False
+
+    # VM Control Methods
+    def vm_action(self, node: str, vmid: int, vm_type: str, action: str, force: bool = False) -> Dict[str, Any]:
+        # Start/stop/shutdown/reboot/reset - basic VM lifecycle stuff
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        # LXC containers don't support 'reset' - only QEMU VMs do
+        if vm_type == "lxc" and action == "reset":
+            return {"success": False, "error": "Reset is not supported for LXC containers. Use reboot instead."}
+
+        try:
+            # If the caller omitted the node (empty URL path segment), resolve
+            # it from cluster resources so we don't build malformed PVE URLs
+            # such as /nodes//qemu/<id>/status/reboot.
+            if not node:
+                vm = next(
+                    (
+                        r
+                        for r in self.get_vm_resources(max_age=1.0)
+                        if str(r.get("vmid", "")) == str(vmid) and r.get("type") == vm_type
+                    ),
+                    None,
+                )
+                # Cached snapshot (max_age=1.0) may not include a VM that just
+                # joined/migrated; fall back to a fresh /cluster/resources lookup once.
+                if not vm:
+                    self.logger.warning(f"[VM] {vm_type}/{vmid} not found in cached resources; trying fresh lookup")
+                    vm = next(
+                        (
+                            r
+                            for r in self.get_vm_resources(max_age=0.0)
+                            if str(r.get("vmid", "")) == str(vmid) and r.get("type") == vm_type
+                        ),
+                        None,
+                    )
+                if not vm:
+                    self.logger.error(f"[VM] Cannot resolve node for {vm_type}/{vmid}")
+                    return {"success": False, "error": f"Cannot resolve node for {vm_type}/{vmid}"}
+                node = vm.get("node", "")
+                if not node:
+                    self.logger.error(f"[VM] Resource for {vm_type}/{vmid} has no node")
+                    return {"success": False, "error": f"Resource for {vm_type}/{vmid} has no node"}
+                self.logger.info(f"[VM] Resolved node for {vm_type}/{vmid} to {node}")
+
+            host = self.host
+            endpoint = "qemu" if vm_type == "qemu" else "lxc"
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/{endpoint}/{vmid}/status/{action}"
+
+            data = {}
+
+            # Force stop handling - different for QEMU vs LXC
+            # Fixed 27.01.2026 - skiplock requires root@pam, removed for non-root users
+            if force and action == "stop":
+                self.logger.info(f"Force stopping {vm_type}/{vmid}")
+                if vm_type == "qemu":
+                    # QEMU: Use timeout=0 for immediate stop (more compatible than forceStop)
+                    data["timeout"] = 0
+                # Skiplock only works for root@pam - causes error for other users
+                # "Only root may use this option" - so we skip it for non-root
+                # (#391): the username-startswith check is necessary
+                # but not sufficient. PVE *also* rejects skiplock when the auth
+                # context is an API token with privilege separation, even if the
+                # token's owner is root@pam. Optimistic send + graceful retry on
+                # the specific PVE error is the only reliable path.
+                if self.config.user.lower().startswith("root@"):
+                    data["skiplock"] = 1
+
+            self.logger.info(f"VM Action: {action} on {vm_type}/{vmid}@{node}" + (" FORCE" if force else ""))
+            resp = self._api_post(url, data=data if data else None)
+
+            # (#391): graceful skiplock retry. PVE returns
+            # 500 + body containing "Only root may use this option" when the
+            # auth path can't actually pass skiplock (token-based auth, role-
+            # based admins, or custom realms). Drop the param and retry once.
+            # The non-skiplock force-stop still works for unlocked VMs which
+            # is the overwhelming majority of "force stop" use cases.
+            if (
+                resp.status_code != 200
+                and force
+                and action == "stop"
+                and isinstance(data, dict)
+                and "skiplock" in data
+                and "Only root may use this option" in (resp.text or "")
+            ):
+                self.logger.warning(
+                    f"[VM] PVE rejected skiplock for {self.config.user!r} "
+                    f"(likely API-token auth or role-restricted user) — retrying force "
+                    f"stop without skiplock. Locked VMs may still need manual unlock."
+                )
+                data.pop("skiplock", None)
+                resp = self._api_post(url, data=data if data else None)
+
+            if resp.status_code == 200:
+                # #237: clear no-agent cache on start/reboot so agent gets re-checked
+                if action in ("start", "reboot", "reset"):
+                    self._no_agent_vms.discard(vmid)
+                self.logger.info(f"[OK] {action} on {vmid}")
+                return {"success": True, "data": resp.json().get("data"), "node": node}
+            else:
+                self.logger.error(f"[ERROR] {resp.text}")
+                return {"success": False, "error": resp.text}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] vm_action: {e}")
+            return {"success": False, "error": str(e)}
+
+    def start_vm(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        return self.vm_action(node, vmid, vm_type, "start")
+
+    def stop_vm(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        return self.vm_action(node, vmid, vm_type, "stop")
+
+    def shutdown_vm(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        return self.vm_action(node, vmid, vm_type, "shutdown")
+
+    def restart_vm(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        return self.vm_action(node, vmid, vm_type, "reboot")
+
+    def clone_vm(
+        self,
+        node: str,
+        vmid: int,
+        vm_type: str,
+        newid: int,
+        name: str = None,
+        full: bool = True,
+        target_node: str = None,
+        target_storage: str = None,
+        description: str = None,
+    ) -> Dict[str, Any]:
+        """clone a vm"""
+        # Full clone = independent copy, linked clone = shares base with original
+        # linked clones only work for qemu
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/clone"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/clone"
+
+            data: Dict[str, Any] = {"newid": newid}
+
+            # (#448 @DarmokNoob) - PVE LXC clone schema doesn't
+            # accept `name=`, it wants `hostname=` (verified via pvesh).
+            # QEMU clone schema is the other way around. The xcrepl + repl
+            # paths in api/vms.py have the same bug fixed in the same commit;
+            # this is the manual-clone-from-UI path.
+            if name:
+                if vm_type == "lxc":
+                    data["hostname"] = name
+                else:
+                    data["name"] = name
+
+            if full:
+                data["full"] = 1
+            else:
+                # linked clone
+                if vm_type == "qemu":
+                    data["full"] = 0
+
+            # Optional target location
+            if target_node:
+                data["target"] = target_node
+            if target_storage:
+                data["storage"] = target_storage
+            if description:
+                data["description"] = description
+
+            self._no_agent_vms.discard(newid)  # #237
+            self.logger.info(f"Cloning {vm_type}/{vmid} to {newid} (full={full})")
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                result = response.json()
+                self.logger.info(f"[OK] Clone started: {vmid} -> {newid}")
+                return {"success": True, "data": result.get("data")}
+            else:
+                error_msg = response.text
+                self.logger.error(f"[ERROR] Clone failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Clone error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_next_vmid(self) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/nextid"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                data = response.json()
+                return {"success": True, "vmid": int(data.get("data", 100))}
+            else:
+                return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def migrate_vm_manual(
+        self, node: str, vmid: int, vm_type: str, target_node: str, online: bool = True, options: Dict = None
+    ) -> Dict[str, Any]:
+        # manual migrate
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        if options is None:
+            options = {}
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/migrate"
+                data = {
+                    "target": target_node,
+                    "online": 1 if online else 0,
+                }
+                # Add target storage if specified
+                if options.get("targetstorage"):
+                    data["targetstorage"] = options["targetstorage"]
+                # Add with-local-disks option
+                if options.get("with_local_disks"):
+                    data["with-local-disks"] = 1
+            else:  # lxc
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/migrate"
+                data = {
+                    "target": target_node,
+                    "restart": 1 if online else 0,  # LXC uses restart instead of online
+                }
+                # Add target storage if specified
+                if options.get("targetstorage"):
+                    data["target-storage"] = options["targetstorage"]
+                # Force (for conntrack state)
+                if options.get("force"):
+                    data["force"] = 1
+
+            self.logger.info(
+                f"Migrating {vm_type}/{vmid} from {node} to {target_node}"
+                + (f" (storage: {options.get('targetstorage')})" if options.get("targetstorage") else "")
+            )
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                task_data = response.json()
+                self.logger.info(f"[OK] Migration started for {vmid}, task: {task_data.get('data')}")
+                # (#375) - drop the no-agent skip-flag on migration so
+                # the IP/disk refresh re-probes once the VM lands on the new node.
+                # Without this the agent shows up on the target but we keep
+                # short-circuiting the probe based on the pre-migration result.
+                self._no_agent_vms.discard(vmid)
+                return {"success": True, "task": task_data.get("data")}
+            else:
+                error_msg = response.text
+                self.logger.error(f"[ERROR] Migration failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Migration error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def remote_migrate_vm(
+        self,
+        node: str,
+        vmid: int,
+        vm_type: str,
+        target_endpoint: str,
+        target_storage: str,
+        target_bridge: str,
+        target_vmid: int = None,
+        online: bool = True,
+        delete_source: bool = True,
+        bwlimit: int = None,
+    ) -> Dict[str, Any]:
+        """cross-cluster VM migration using Proxmox remote-migrate API"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+            if vm_type == "qemu":
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/remote_migrate"
+            else:  # lxc
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/remote_migrate"
+
+            # target-vmid is required - use same as source if not specified
+            actual_target_vmid = target_vmid if target_vmid else vmid
+
+            data = {
+                "target-endpoint": target_endpoint,
+                "target-vmid": actual_target_vmid,
+                "target-storage": target_storage,
+                "target-bridge": target_bridge,
+            }
+
+            if vm_type == "qemu":
+                data["online"] = 1 if online else 0
+
+            if delete_source:
+                data["delete"] = 1
+
+            if bwlimit:
+                data["bwlimit"] = bwlimit
+
+            self.logger.info(
+                f"Remote migrating {vm_type}/{vmid} from {node} to target cluster (target vmid: {actual_target_vmid})"
+            )
+            # (pentest HIGH) - data['target-endpoint'] carries a cleartext,
+            # full-rights, non-expiring PVEAPIToken secret; never write it to the log.
+            _safe_data = {k: ("***REDACTED***" if k == "target-endpoint" else v) for k, v in data.items()}
+            self.logger.debug(f"Migration data: {_safe_data}")
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                task_data = response.json()
+                self.logger.info(f"[OK] Remote migration started for {vmid}, task: {task_data.get('data')}")
+                return {"success": True, "task": task_data.get("data")}
+            else:
+                error_msg = response.text
+                self.logger.error(f"[ERROR] Remote migration failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Remote migration error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_cluster_fingerprint(self) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            import hashlib
+            import socket
+            import ssl
+
+            # Get SSL certificate
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+            with socket.create_connection((self.config.host, 8006)) as sock, context.wrap_socket(
+                sock, server_hostname=self.config.host
+            ) as ssock:
+                cert_der = ssock.getpeercert(binary_form=True)
+                if not cert_der:
+                    return {"success": False, "error": "No certificate received"}
+                fingerprint = hashlib.sha256(cert_der).hexdigest()
+                # Format as colon-separated
+                fingerprint_formatted = ":".join(fingerprint[i : i + 2] for i in range(0, len(fingerprint), 2))
+
+            return {"success": True, "fingerprint": fingerprint_formatted, "host": self.config.host, "port": 8006}
+        except Exception as e:
+            self.logger.error(f"Error getting fingerprint: {e}")
+            return {"success": False, "error": str(e)}
+
+    def create_api_token(self, token_name: str = "ProxmoxVEx-migrate") -> Dict[str, Any]:
+        # (#413 layer 6, blackshocks bundle 20260530_220647):
+        # if a prior Planned/Emergency failover crashed or its _delayed_cleanup
+        # hadn't fired yet, the same token_name is still on target → PVE returns
+        # 400 "Token already exists" and the next failover bails before it ever
+        # touches qmigrate. Pre-delete is the cleanest path — we'd issue the
+        # delete on cleanup anyway, doing it up-front makes the create idempotent.
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        host = self.host
+        user = self.config.user
+        url = f"https://{host}:{self.api_port}/api2/json/access/users/{user}/token/{token_name}"
+
+        def _do_create():
+            data = {
+                "privsep": 0,  # No privilege separation - token has same permissions as user
+                "expire": 0,  # No expiration (we'll delete it manually)
+                "comment": "ProxmoxVEx temporary migration token",
+            }
+            return self._api_post(url, data=data)
+
+        try:
+            response = _do_create()
+
+            # Stale token from a previous run? Drop it and retry once.
+            if response.status_code != 200 and "already exists" in (response.text or "").lower():
+                self.logger.warning(f"[create_api_token] stale '{token_name}' on {host}, dropping + retry")
+                try:
+                    self._api_delete(url)
+                except Exception as _e:
+                    self.logger.debug(f"[create_api_token] pre-delete swallowed: {_e}")
+                response = _do_create()
+
+            if response.status_code == 200:
+                result = response.json()
+                token_data = result.get("data", {})
+                token_value = token_data.get("value", "")
+                full_token_id = token_data.get("full-tokenid", f"{user}!{token_name}")
+
+                self.logger.info(f"[OK] Created API token: {full_token_id}")
+                return {
+                    "success": True,
+                    "token_id": full_token_id,
+                    "token_value": token_value,
+                    "token_name": token_name,
+                }
+            else:
+                error_msg = response.text
+                self.logger.error(f"[ERROR] Failed to create API token: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Error creating API token: {e}")
+            return {"success": False, "error": str(e)}
+
+    def delete_api_token(self, token_name: str = "ProxmoxVEx-migrate") -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+            user = self.config.user
+
+            url = f"https://{host}:{self.api_port}/api2/json/access/users/{user}/token/{token_name}"
+            response = self._api_delete(url)
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Deleted API token: {user}!{token_name}")
+                return {"success": True}
+            else:
+                error_msg = response.text
+                self.logger.warning(f"[WARN] Failed to delete API token: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Error deleting API token: {e}")
+            return {"success": False, "error": str(e)}
+
+    def delete_vm(
+        self, node: str, vmid: int, vm_type: str, purge: bool = False, destroy_unreferenced: bool = False
+    ) -> Dict[str, Any]:
+        """Fixed: now sanitizes boot order before delete and waits for task completion (fixes"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            # First check if VM is running and stop it
+            if vm_type == "qemu":
+                status_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/status/current"
+            else:
+                status_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/status/current"
+
+            status_response = self._create_session().get(status_url, timeout=15)
+            if status_response.status_code == 200:
+                status = status_response.json()["data"].get("status")
+                if status == "running":
+                    self.logger.info(f"Stopping {vm_type}/{vmid} before deletion")
+                    if vm_type == "qemu":
+                        stop_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/status/stop"
+                    else:
+                        stop_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/status/stop"
+                    stop_resp = self._create_session().post(stop_url, timeout=15)
+                    # Wait for stop task to finish instead of fixed 3s sleep
+                    if stop_resp.status_code == 200:
+                        stop_task = stop_resp.json().get("data", "")
+                        if stop_task:
+                            self._wait_for_task(node, stop_task, timeout=30)
+                        else:
+                            import time
+
+                            time.sleep(3)
+                    else:
+                        import time
+
+                        time.sleep(3)
+
+            # Sanitize boot order before deletion to prevent
+            # "storage volume does not exist" errors when Proxmox tries to cleanup
+            # disks that are referenced in boot order but no longer available
+            try:
+                sanitize_result = self.sanitize_boot_order(node, vmid, vm_type)
+                if sanitize_result.get("changed"):
+                    self.logger.info(
+                        f"[DELETE] Sanitized boot order before deleting {vm_type}/{vmid}: removed {sanitize_result.get('removed', [])}"
+                    )
+            except Exception as e:
+                self.logger.warning(f"[DELETE] Boot order sanitize failed (continuing): {e}")
+
+            # Now delete
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}"
+
+            params = {}
+            if purge:
+                params["purge"] = 1
+            if destroy_unreferenced and vm_type == "qemu":
+                params["destroy-unreferenced-disks"] = 1
+
+            self.logger.info(f"Deleting {vm_type}/{vmid} on {node} with params: {params}")
+            # #237: clear agent cache for this vmid
+            self._no_agent_vms.discard(vmid)
+            response = self._create_session().delete(url, params=params)
+
+            if response.status_code == 200:
+                task_data = response.json()
+                task_upid = task_data.get("data", "")
+                self.logger.info(f"[DELETE] {vm_type}/{vmid} delete task started: {task_upid}")
+
+                # Wait for the actual deletion task to complete (fixes
+                # Previously returned success immediately without checking if Proxmox actually deleted the VM
+                task_ok = True
+                if task_upid:
+                    task_ok = self._wait_for_task(node, task_upid, timeout=120)
+                    if not task_ok:
+                        # Task failed - get the error details from task log
+                        error_detail = f"Proxmox deletion task failed for {vm_type}/{vmid}"
+                        try:
+                            log_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/tasks/{task_upid}/log?limit=10"
+                            log_resp = self._api_get(log_url)
+                            if log_resp.status_code == 200:
+                                log_lines = log_resp.json().get("data", [])
+                                error_lines = [
+                                    line.get("t", "")
+                                    for line in log_lines
+                                    if "error" in line.get("t", "").lower()
+                                    or "WARN" in line.get("t", "")
+                                    or "failed" in line.get("t", "").lower()
+                                ]
+                                if error_lines:
+                                    error_detail = "; ".join(error_lines[-3:])  # Last 3 error lines
+                        except Exception:
+                            pass
+                        self.logger.error(f"[ERROR] Deletion task failed: {error_detail}")
+                        return {"success": False, "error": error_detail, "task": task_upid}
+
+                self.logger.info(f"[OK] {vm_type}/{vmid} successfully deleted")
+
+                # Cleanup - remove VM from balancing exclusion list
+                try:
+                    db = get_db()
+                    cursor = db.conn.cursor()
+                    cursor.execute(
+                        "DELETE FROM balancing_excluded_vms WHERE cluster_id = ? AND vmid = ?", (self.id, vmid)
+                    )
+                    if cursor.rowcount > 0:
+                        self.logger.info(f"Removed VM {vmid} from balancing exclusion list")
+                    db.conn.commit()
+                except Exception as cleanup_err:
+                    self.logger.warning(f"Failed to cleanup balancing exclusion for VM {vmid}: {cleanup_err}")
+
+                return {"success": True, "task": task_upid}
+            else:
+                error_msg = response.text
+                self.logger.error(f"[ERROR] Deletion failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Deletion error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_templates(self, node: str) -> List[Dict]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        templates = []
+        try:
+            # Get VM templates
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu"
+            response = self._api_get(url)
+            if response.status_code == 200:
+                for vm in response.json()["data"]:
+                    if vm.get("template"):
+                        templates.append({
+                            "type": "qemu",
+                            "vmid": vm["vmid"],
+                            "name": vm.get("name", f"VM {vm['vmid']}"),
+                        })
+
+            # Get CT templates from storage
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/storage"
+            storage_response = self._api_get(url)
+            if storage_response.status_code == 200:
+                for storage in storage_response.json()["data"]:
+                    if "vztmpl" in storage.get("content", ""):
+                        tmpl_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/storage/{storage['storage']}/content"
+                        tmpl_response = self._create_session().get(tmpl_url, params={"content": "vztmpl"})
+                        if tmpl_response.status_code == 200:
+                            for tmpl in tmpl_response.json()["data"]:
+                                templates.append({
+                                    "type": "lxc",
+                                    "volid": tmpl["volid"],
+                                    "name": tmpl.get("volid", "").split("/")[-1],
+                                })
+        except Exception as e:
+            self.logger.error(f"Error getting templates: {e}")
+
+        return templates
+
+    def create_vm(self, node: str, vm_config: Dict) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu"
+
+            # Required fields
+            vmid = vm_config.get("vmid")
+            if not vmid:
+                next_id = self.get_next_vmid()
+                if not next_id["success"]:
+                    return next_id
+                vmid = next_id["vmid"]
+
+            data = {
+                "vmid": vmid,
+                "name": vm_config.get("name", f"vm-{vmid}"),
+                "memory": vm_config.get("memory", 2048),
+                "cores": vm_config.get("cores", 2),
+                "sockets": vm_config.get("sockets", 1),
+            }
+
+            # CPU
+            if vm_config.get("cpu"):
+                data["cpu"] = vm_config["cpu"]
+
+            # CPU Affinity
+            if vm_config.get("cpu_affinity"):
+                data["affinity"] = vm_config["cpu_affinity"]
+
+            # NUMA
+            if vm_config.get("numa"):
+                data["numa"] = "1"
+
+            # Advanced Memory - Ballooning
+            if vm_config.get("min_memory"):
+                data["balloon"] = vm_config["min_memory"]
+            elif vm_config.get("ballooning") is False:
+                data["balloon"] = "0"  # Disable ballooning
+
+            # Memory Shares
+            if vm_config.get("shares"):
+                data["shares"] = vm_config["shares"]
+
+            # BIOS
+            if vm_config.get("bios"):
+                data["bios"] = vm_config["bios"]
+
+            # OS Type
+            if vm_config.get("ostype"):
+                data["ostype"] = vm_config["ostype"]
+
+            # Machine type - Proxmox expects format: type=<machine> or just pc/q35
+            if vm_config.get("machine"):
+                machine = vm_config["machine"]
+                # Proxmox 8+ expects the machine type directly without 'type=' prefix
+                # Valid values: pc, q35, pc-i440fx-*, pc-q35-*, etc.
+                if machine in ["i440fx", "pc"]:
+                    data["machine"] = "pc"
+                elif machine == "q35":
+                    data["machine"] = "q35"
+                else:
+                    data["machine"] = machine
+
+            # Storage/Disk with enhanced options
+            storage = vm_config.get("storage", "local-lvm")
+            disk_size = vm_config.get("disk_size", "32")
+            # Remove G suffix if present - Proxmox API expects just the number
+            disk_size = str(disk_size).replace("G", "").replace("g", "")
+
+            disk_type = vm_config.get("disk_type", "scsi")
+            disk_format = vm_config.get("disk_format", "")  # raw, qcow2, vmdk
+            scsi_hw = vm_config.get("scsihw", "virtio-scsi-pci")
+
+            # Build disk string - format depends on storage type
+            # For LVM/ZFS: storage:size (e.g., local-lvm:32)
+            # For directory: storage:size,format=X (e.g., local:32,format=qcow2)
+            disk_str = f"{storage}:{disk_size}"
+
+            # Add disk options
+            disk_options = []
+
+            # Add format if specified (needed for directory-based storage)
+            if disk_format:
+                disk_options.append(f"format={disk_format}")
+
+            if vm_config.get("disk_cache"):
+                disk_options.append(f"cache={vm_config['disk_cache']}")
+            if vm_config.get("disk_discard"):
+                disk_options.append("discard=on")
+            if vm_config.get("disk_iothread") and disk_type == "scsi":
+                disk_options.append("iothread=1")
+            if vm_config.get("disk_ssd"):
+                disk_options.append("ssd=1")
+
+            if disk_options:
+                disk_str += "," + ",".join(disk_options)
+
+            # Set disk based on type
+            if disk_type == "scsi":
+                data["scsihw"] = scsi_hw
+                data["scsi0"] = disk_str
+            elif disk_type == "virtio":
+                data["virtio0"] = disk_str
+            elif disk_type == "ide":
+                data["ide0"] = disk_str
+            elif disk_type == "sata":
+                data["sata0"] = disk_str
+
+            # Additional Disks
+            additional_disks = vm_config.get("additional_disks", [])
+            disk_counters = {"scsi": 1, "virtio": 1, "sata": 1}  # Start at 1, 0 is primary
+            for add_disk in additional_disks:
+                add_type = add_disk.get("type", "scsi")
+                add_storage = add_disk.get("storage", storage)
+                add_size = str(add_disk.get("size", "32")).replace("G", "").replace("g", "")
+                add_disk_str = f"{add_storage}:{add_size}"
+
+                # Use per-disk options - each disk has its own format, cache, discard, iothread, ssd
+                add_opts = []
+
+                # Format: per-disk only (no fallback to global)
+                add_format = add_disk.get("format", "")
+                if add_format:
+                    add_opts.append(f"format={add_format}")
+
+                # Cache: per-disk only
+                add_cache = add_disk.get("cache", "")
+                if add_cache:
+                    add_opts.append(f"cache={add_cache}")
+
+                # Discard: per-disk (defaults to true in UI)
+                if add_disk.get("discard", True):
+                    add_opts.append("discard=on")
+
+                # IO Thread for SCSI: per-disk (defaults to true in UI)
+                if add_disk.get("iothread", True) and add_type == "scsi":
+                    add_opts.append("iothread=1")
+
+                # SSD emulation: per-disk
+                if add_disk.get("ssd", False):
+                    add_opts.append("ssd=1")
+
+                if add_opts:
+                    add_disk_str += "," + ",".join(add_opts)
+
+                disk_idx = disk_counters.get(add_type, 1)
+                data[f"{add_type}{disk_idx}"] = add_disk_str
+                disk_counters[add_type] = disk_idx + 1
+
+                # If this disk uses a different SCSI controller, note it (Proxmox only allows one scsihw though)
+                # The per-disk scsihw is mostly for UI consistency; Proxmox uses one controller for all SCSI disks
+
+            # EFI disk for UEFI
+            if vm_config.get("bios") == "ovmf":
+                # (#607) - an empty efi_storage (e.g. a quick template
+                # that sets bios=ovmf but leaves the EFI-storage field untouched)
+                # must fall back to the VM's main storage. `.get(k, default)` keeps
+                # an empty string, which produced `efidisk0=:1` → PVE "unable to
+                # parse volume ID ':1'". `or storage` handles both missing + empty.
+                efi_storage = vm_config.get("efi_storage") or storage
+                efi_type = "4m"
+                if vm_config.get("efi_pre_enroll"):
+                    data["efidisk0"] = f"{efi_storage}:1,efitype={efi_type},pre-enrolled-keys=1"
+                else:
+                    data["efidisk0"] = f"{efi_storage}:1,efitype={efi_type}"
+                # UEFI requires q35 machine type
+                if not vm_config.get("machine") or vm_config.get("machine") in ["i440fx", "pc"]:
+                    data["machine"] = "q35"
+
+            # TPM
+            if vm_config.get("tpm_storage"):
+                tpm_version = vm_config.get("tpm_version", "v2.0")
+                data["tpmstate0"] = f"{vm_config['tpm_storage']}:1,version={tpm_version}"
+
+            # Network
+            net_model = vm_config.get("net_model", "virtio")
+            net_bridge = vm_config.get("net_bridge", "vmbr0")
+            net_str = f"{net_model},bridge={net_bridge}"
+            if vm_config.get("net_firewall"):
+                net_str += ",firewall=1"
+            if vm_config.get("net_tag"):
+                net_str += f",tag={vm_config['net_tag']}"
+            # MAC Address
+            if vm_config.get("net_macaddr"):
+                net_str += f",macaddr={vm_config['net_macaddr']}"
+            # MTU
+            if vm_config.get("net_mtu"):
+                net_str += f",mtu={vm_config['net_mtu']}"
+            # Rate Limit (MB/s -> Proxmox uses MB/s directly)
+            if vm_config.get("net_rate"):
+                net_str += f",rate={vm_config['net_rate']}"
+            # Disconnect (link_down)
+            if vm_config.get("net_disconnect"):
+                net_str += ",link_down=1"
+            data["net0"] = net_str
+
+            # CD-ROM / ISO
+            boot_order = []
+
+            # Only add disk to boot order if it was actually created
+            if disk_type == "scsi" and "scsi0" in data:
+                boot_order.append("scsi0")
+            elif disk_type == "virtio" and "virtio0" in data:
+                boot_order.append("virtio0")
+            elif disk_type == "ide" and "ide0" in data:
+                boot_order.append("ide0")
+            elif disk_type == "sata" and "sata0" in data:
+                boot_order.append("sata0")
+
+            if vm_config.get("iso"):
+                data["ide2"] = f"{vm_config['iso']},media=cdrom"
+                boot_order.append("ide2")
+
+            # VirtIO drivers ISO for Windows (secondary CD-ROM)
+            if vm_config.get("virtio_iso"):
+                data["ide3"] = f"{vm_config['virtio_iso']},media=cdrom"
+
+            boot_order.append("net0")
+            data["boot"] = "order=" + ";".join(boot_order)
+
+            # VGA
+            if vm_config.get("vga"):
+                data["vga"] = vm_config["vga"]
+
+            # QEMU Agent
+            if vm_config.get("agent"):
+                data["agent"] = "1"
+
+            # Start on boot
+            if vm_config.get("onboot"):
+                data["onboot"] = "1"
+
+            # Start after creation
+            vm_config.get("start", False)
+
+            # HA config (will be applied after VM creation)
+            ha_enabled = vm_config.get("ha_enabled", False)
+            ha_group = vm_config.get("ha_group", "")
+
+            self.logger.info(f"Creating VM {vmid} on {node} with config: {data}")
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                task_data = response.json()
+                self.logger.info(f"[OK] VM {vmid} created, task: {task_data.get('data')}")
+
+                # Add to HA if enabled
+                if ha_enabled:
+                    try:
+                        ha_url = f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/resources"
+                        ha_data = {"sid": f"vm:{vmid}"}
+                        if ha_group:
+                            ha_data["group"] = ha_group
+                        ha_response = self._api_post(ha_url, data=ha_data)
+                        if ha_response.status_code == 200:
+                            self.logger.info(f"[OK] VM {vmid} added to HA")
+                        else:
+                            self.logger.warning(f"[WARN] Failed to add VM {vmid} to HA: {ha_response.text}")
+                    except Exception as ha_err:
+                        self.logger.warning(f"[WARN] HA config failed: {ha_err}")
+
+                return {"success": True, "vmid": vmid, "task": task_data.get("data")}
+            else:
+                error_msg = response.text
+                self.logger.error(f"[ERROR] VM creation failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] VM creation error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def create_container(self, node: str, ct_config: Dict) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc"
+
+            # Required fields
+            vmid = ct_config.get("vmid")
+            if not vmid:
+                next_id = self.get_next_vmid()
+                if not next_id["success"]:
+                    return next_id
+                vmid = next_id["vmid"]
+
+            # Template is required for CT creation
+            template = ct_config.get("template")
+            if not template:
+                return {"success": False, "error": "Template is required for container creation"}
+
+            # Build data payload
+            # Defaults are conservative, users can change later
+            ct_password = ct_config.get("password")
+            if not ct_password:
+                return {"success": False, "error": "Root password is required for container creation"}
+
+            data = {
+                "vmid": vmid,
+                "hostname": ct_config.get("hostname", ct_config.get("name", f"ct-{vmid}")),
+                "ostemplate": template,
+                "memory": ct_config.get("memory", 512),  # MB
+                "swap": ct_config.get("swap", 512),
+                "cores": ct_config.get("cores", 1),
+                "password": ct_password,
+            }
+
+            # Root disk
+            storage = ct_config.get("storage", "local-lvm")
+            disk_size = ct_config.get("disk_size", "8")  # GB
+            data["rootfs"] = f"{storage}:{disk_size}"
+
+            # Additional Mount Points
+            # (PVE 9.2) - mountpoints gained idmap=<map> and
+            # keepattrs=1 sub-options. Both are optional in our request
+            # dict; we only emit them when the caller set them, so older
+            # clusters that don't know the keys aren't surprised.
+            pve_ver = self.get_pve_version_tuple()
+            mp_supports_92 = pve_ver is None or pve_ver >= (9, 2)
+            additional_disks = ct_config.get("additional_disks", [])
+            for idx, mp in enumerate(additional_disks):
+                mp_storage = mp.get("storage", storage)
+                mp_size = str(mp.get("size", "8")).replace("G", "").replace("g", "")
+                mp_path = mp.get("path", f"/mnt/data{idx}")
+                # Format: storage:size,mp=/path[,idmap=...][,keepattrs=1]
+                parts = [f"{mp_storage}:{mp_size}", f"mp={mp_path}"]
+                if mp_supports_92:
+                    if mp.get("idmap"):
+                        parts.append(f"idmap={mp['idmap']}")
+                    if mp.get("keepattrs"):
+                        parts.append("keepattrs=1")
+                data[f"mp{idx}"] = ",".join(parts)
+
+            # Network configuration
+            # This networking stuff is confusing, Proxmox docs are not great
+            net_bridge = ct_config.get("net_bridge", "vmbr0")
+            net_str = f"name=eth0,bridge={net_bridge}"
+
+            # IPv4 configuration
+            net_ip_type = ct_config.get("net_ip_type", "dhcp")
+            if net_ip_type == "dhcp":
+                net_str += ",ip=dhcp"
+            elif net_ip_type == "static":
+                net_ip = ct_config.get("net_ip", "")
+                if net_ip:
+                    net_str += f",ip={net_ip}"
+                    if ct_config.get("net_gw"):
+                        net_str += f",gw={ct_config['net_gw']}"
+            # 'manual' = no ip config
+
+            # IPv6 configuration
+            net_ip6_type = ct_config.get("net_ip6_type", "dhcp")
+            if net_ip6_type == "dhcp":
+                net_str += ",ip6=dhcp"
+            elif net_ip6_type == "slaac":
+                net_str += ",ip6=auto"
+            elif net_ip6_type == "static":
+                net_ip6 = ct_config.get("net_ip6", "")
+                if net_ip6:
+                    net_str += f",ip6={net_ip6}"
+                    if ct_config.get("net_gw6"):
+                        net_str += f",gw6={ct_config['net_gw6']}"
+            # 'manual' = no ip6 config
+
+            # VLAN tag
+            if ct_config.get("net_tag"):
+                net_str += f",tag={ct_config['net_tag']}"
+
+            # Firewall
+            if ct_config.get("net_firewall"):
+                net_str += ",firewall=1"
+
+            # Disconnected
+            if ct_config.get("net_disconnected"):
+                net_str += ",link_down=1"
+
+            # MAC Address
+            if ct_config.get("net_macaddr"):
+                net_str += f",hwaddr={ct_config['net_macaddr']}"
+
+            # MTU
+            if ct_config.get("net_mtu"):
+                net_str += f",mtu={ct_config['net_mtu']}"
+
+            # Rate Limit (MB/s)
+            if ct_config.get("net_rate"):
+                net_str += f",rate={ct_config['net_rate']}"
+
+            data["net0"] = net_str
+
+            # DNS settings
+            if ct_config.get("dns_domain"):
+                data["searchdomain"] = ct_config["dns_domain"]
+            if ct_config.get("dns_servers"):
+                data["nameserver"] = ct_config["dns_servers"]
+
+            # Unprivileged
+            if ct_config.get("unprivileged", True):
+                data["unprivileged"] = "1"
+
+            # Start on boot
+            if ct_config.get("onboot"):
+                data["onboot"] = "1"
+
+            # SSH public keys
+            ssh_keys = ct_config.get("ssh_public_keys") or ct_config.get("ssh_key")
+            if ssh_keys:
+                data["ssh-public-keys"] = ssh_keys
+
+            # Features (nesting, keyctl, fuse, mount) — #278
+            features = []
+            if ct_config.get("nesting"):
+                features.append("nesting=1")
+            if ct_config.get("keyctl"):
+                features.append("keyctl=1")
+            if ct_config.get("fuse"):
+                features.append("fuse=1")
+            mount = ct_config.get("mount", "")
+            if mount:
+                features.append(f"mount={mount}")
+            if features:
+                data["features"] = ",".join(features)
+
+            # HA config (will be applied after CT creation)
+            ha_enabled = ct_config.get("ha_enabled", False)
+            ha_group = ct_config.get("ha_group", "")
+
+            self.logger.info(f"Creating container {vmid} on {node}")
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                task_data = response.json()
+                self.logger.info(f"[OK] Container {vmid} created, task: {task_data.get('data')}")
+
+                # Add to HA if enabled
+                if ha_enabled:
+                    try:
+                        ha_url = f"https://{self.host}:{self.api_port}/api2/json/cluster/ha/resources"
+                        ha_data = {"sid": f"ct:{vmid}"}
+                        if ha_group:
+                            ha_data["group"] = ha_group
+                        ha_response = self._api_post(ha_url, data=ha_data)
+                        if ha_response.status_code == 200:
+                            self.logger.info(f"[OK] Container {vmid} added to HA")
+                        else:
+                            self.logger.warning(f"[WARN] Failed to add CT {vmid} to HA: {ha_response.text}")
+                    except Exception as ha_err:
+                        self.logger.warning(f"[WARN] HA config failed: {ha_err}")
+
+                return {"success": True, "vmid": vmid, "task": task_data.get("data")}
+            else:
+                error_msg = response.text
+                self.logger.error(f"[ERROR] Container creation failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Container creation error: {e}")
+            return {"success": False, "error": str(e)}
+
+    # ==================== SNAPSHOT METHODS ====================
+
+    def get_snapshots(self, node: str, vmid: int, vm_type: str) -> List[Dict]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            host = self.host
+            if vm_type == "qemu":
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/snapshot"
+            else:
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/snapshot"
+
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                snapshots = response.json()["data"]
+                filtered = [s for s in snapshots if s.get("name") != "current"]
+
+                # Try to get disk sizes for snapshot volumes
+                try:
+                    conf_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/{vm_type}/{vmid}/config"
+                    conf_resp = self._api_get(conf_url)
+                    if conf_resp.status_code == 200:
+                        conf = conf_resp.json().get("data", {})
+                        # sum up all disk sizes from VM config
+                        total_disk = 0
+                        for key, val in conf.items():
+                            if (
+                                any(key.startswith(p) for p in ("scsi", "virtio", "sata", "ide", "mp", "rootfs"))
+                                and isinstance(val, str)
+                                and "size=" in val
+                            ):
+                                import re as _re
+
+                                sz = _re.search(r"size=(\d+)([GMTK]?)", val)
+                                if sz:
+                                    num = int(sz.group(1))
+                                    unit = sz.group(2)
+                                    if unit == "T":
+                                        num *= 1024 * 1024 * 1024 * 1024
+                                    elif unit == "G" or not unit:
+                                        num *= 1024 * 1024 * 1024
+                                    elif unit == "M":
+                                        num *= 1024 * 1024
+                                    elif unit == "K":
+                                        num *= 1024
+                                    total_disk += num
+                        # memory size for vmstate snapshots
+                        mem_bytes = int(conf.get("memory", 0)) * 1024 * 1024  # MB -> bytes
+                        for s in filtered:
+                            # disk size = total disk allocation (snapshot stores delta, but we show VM disk size)
+                            s["disk_size"] = total_disk
+                            if s.get("vmstate"):
+                                s["ram_size"] = mem_bytes
+                except Exception:
+                    pass
+
+                return sorted(filtered, key=lambda x: x.get("snaptime", 0), reverse=True)
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting snapshots: {e}")
+            return []
+
+    def check_snapshot_capability(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"can_snapshot": False, "reason": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+
+            # Get VM/CT config
+            if vm_type == "qemu":
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            response = self._create_session().get(config_url, timeout=15)
+            if response.status_code != 200:
+                return {"can_snapshot": False, "reason": "Could not get VM configuration"}
+
+            config = response.json().get("data", {})
+            issues = []
+
+            # Build a map of storage names to their PVE types so we can flag
+            # disks that live on storage which genuinely does not support snapshots.
+            storage_types = {s.get("storage", ""): s.get("type", "") for s in self.get_storage_list(node)}
+            # QEMU guests can use qcow2/{} on a wide range of storage, but LXC
+            # containers can only snapshot when their rootfs is on a storage type
+            # that natively supports subvolumes/LVM-thin/rbd/zfs.
+            qemu_capable = {"dir", "nfs", "cifs", "glusterfs", "cephfs", "lvmthin", "rbd", "zfs", "zfspool"}
+            lxc_capable = {"lvmthin", "rbd", "zfs", "zfspool", "btrfs"}
+
+            def _storage_type_for(value):
+                if not isinstance(value, str):
+                    return None, None
+                name = value.split(":", 1)[0]
+                return name, storage_types.get(name)
+
+            if vm_type == "qemu":
+                # Check for issues that prevent QEMU snapshots
+                for key, value in config.items():
+                    if (
+                        key.startswith("scsi")
+                        or key.startswith("virtio")
+                        or key.startswith("ide")
+                        or key.startswith("sata")
+                    ) and isinstance(value, str):
+                        # Check for raw format (no snapshots)
+                        if ",format=raw" in value or value.endswith(":raw"):
+                            issues.append(f"Disk {key} uses raw format (no snapshots)")
+                        # Check for passthrough devices
+                        if "/dev/" in value:
+                            issues.append(f"Disk {key} is a passthrough device")
+                        # Check for iscsi without snapshots
+                        if "iscsi:" in value.lower():
+                            issues.append(f"Disk {key} is iSCSI (may not support snapshots)")
+
+                        # Check the underlying storage type. Some storage (e.g. thick LVM,
+                        # plain iSCSI, DRBD) does not support Proxmox VM snapshots at all.
+                        if ":" in value:
+                            storage_name, storage_type = _storage_type_for(value)
+                            if storage_type and storage_type not in qemu_capable:
+                                issues.append(
+                                    f"Disk {key} is on {storage_type} storage ({storage_name}) which does not support snapshots"
+                                )
+
+                        # Raw disk images anywhere in the path prevent snapshots.
+                        if ".raw" in value.lower():
+                            issues.append(f"Disk {key} is a raw disk image")
+
+                    # Check for PCI passthrough
+                    if key.startswith("hostpci"):
+                        issues.append(f"PCI passthrough device {key} prevents live snapshots with RAM")
+
+                    # Check for USB passthrough
+                    if key.startswith("usb") and "/dev/" in str(value):
+                        issues.append(f"USB passthrough {key} may affect snapshots")
+
+                # check EFI disk exists without proper storage
+                if "efidisk0" in config:
+                    efi_disk = config["efidisk0"]
+                    if isinstance(efi_disk, str) and "raw" in efi_disk.lower():
+                        issues.append("EFI disk uses raw format")
+
+            else:  # LXC container
+                # Check for bind mounts and the storage underneath mount points
+                for key, value in config.items():
+                    if key.startswith("mp") and isinstance(value, str):
+                        if ",bind" in value or "bind=" in value:
+                            issues.append(f"Mount point {key} is a bind mount (excluded from snapshots)")
+                        elif ":" in value:
+                            storage_name, storage_type = _storage_type_for(value)
+                            if storage_type and storage_type not in lxc_capable:
+                                issues.append(
+                                    f"Mount point {key} is on {storage_type} storage ({storage_name}) which does not support snapshots"
+                                )
+                        if ".raw" in value.lower():
+                            issues.append(f"Mount point {key} is a raw disk image")
+
+                # Check rootfs
+                rootfs = config.get("rootfs", "")
+                if isinstance(rootfs, str):
+                    if "dir:" in rootfs.lower() or "nfs:" in rootfs.lower():
+                        issues.append("Container uses directory or NFS storage (limited snapshot support)")
+                    if ":" in rootfs:
+                        storage_name, storage_type = _storage_type_for(rootfs)
+                        if storage_type and storage_type not in lxc_capable:
+                            issues.append(
+                                f"Container rootfs is on {storage_type} storage ({storage_name}) which does not support snapshots"
+                            )
+                    if ".raw" in rootfs.lower():
+                        issues.append("Container rootfs is a raw disk image (LXC snapshots require thin/rbd/zfs/btrfs)")
+
+            if issues:
+                result = {
+                    "can_snapshot": True,  # Usually still possible, just with limitations
+                    "warnings": issues,
+                    "reason": "; ".join(issues),
+                }
+                try:
+                    result["efficient_snapshot"] = self.check_efficient_snapshot_capability(node, vmid, vm_type)
+                except Exception:
+                    result["efficient_snapshot"] = {"eligible": False}
+                return result
+
+            result = {"can_snapshot": True, "warnings": [], "reason": None}
+            # Add efficient snapshot capability info
+            try:
+                result["efficient_snapshot"] = self.check_efficient_snapshot_capability(node, vmid, vm_type)
+            except Exception:
+                result["efficient_snapshot"] = {"eligible": False}
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Error checking snapshot capability: {e}")
+            return {"can_snapshot": False, "reason": str(e)}
+
+    def create_snapshot(
+        self, node: str, vmid: int, vm_type: str, snapname: str, description: str = "", vmstate: bool = False
+    ) -> Dict[str, Any]:
+        """create a snapshot"""
+        # This was surprisingly annoying to get right
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+            if vm_type == "qemu":
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/snapshot"
+            else:
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/snapshot"
+
+            data: Dict[str, Any] = {"snapname": snapname}
+            if description:
+                data["description"] = description
+            if vmstate and vm_type == "qemu":
+                data["vmstate"] = 1  # include RAM
+
+            # self.logger.info(f"creating snapshot {snapname}")  # DEBUG
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                task_data = response.json()
+                return {"success": True, "task": task_data.get("data")}
+            else:
+                # try to parse error msg
+                error_text = response.text
+                try:
+                    error_json = response.json()
+                    if "errors" in error_json:
+                        error_text = str(error_json["errors"])
+                    elif "data" in error_json:
+                        error_text = str(error_json["data"])
+                except Exception:
+                    pass
+
+                # make error messages nicer
+                if "not supported" in error_text.lower():
+                    error_text = "Snapshots are not supported for this storage type"
+                elif "running" in error_text.lower() and "vmstate" in error_text.lower():
+                    error_text = "Cannot create RAM snapshot: VM has PCI passthrough or other incompatible devices"
+                elif "lock" in error_text.lower():
+                    error_text = "VM is locked (another operation in progress)"
+
+                return {"success": False, "error": error_text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def delete_snapshot(self, node: str, vmid: int, vm_type: str, snapname: str) -> Dict[str, Any]:
+        """delete snapshot"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/snapshot/{snapname}"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/snapshot/{snapname}"
+
+            # self.logger.info(f"deleting snapshot {snapname}")  # spammy
+            response = self._api_delete(url)
+
+            if response.status_code == 200:
+                task_data = response.json()
+                return {"success": True, "task": task_data.get("data")}
+            else:
+                return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def rollback_snapshot(self, node: str, vmid: int, vm_type: str, snapname: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback"
+
+            self.logger.info(f"Rolling back {vm_type}/{vmid} to snapshot '{snapname}'")
+            response = self._create_session().post(url, timeout=15)
+
+            if response.status_code == 200:
+                task_data = response.json()
+                return {"success": True, "task": task_data.get("data")}
+            else:
+                return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ==================== EFFICIENT (LVM COW) SNAPSHOT METHODS ====================
+    # Space-efficient LVM snapshots for shared storage (iSCSI SAN)
+    # These create small COW snapshots via SSH lvcreate -s instead of full Proxmox snapshots
+
+    def _node_ssh_exec(self, node: str, command: str, timeout: int = 30) -> tuple:
+        """Run SSH command on a specific Proxmox node, returns (exit_code, stdout, stderr)"""
+        node_ip = self._get_node_ip(node)
+        if not node_ip:
+            return -1, "", f"Cannot resolve IP for node {node}"
+
+        ssh = self._ssh_connect(node_ip)
+        if not ssh:
+            return -1, "", f"SSH connection to {node} ({node_ip}) failed"
+
+        try:
+            return self._ssh_execute(ssh, command)
+        finally:
+            with contextlib.suppress(Exception):
+                ssh.close()
+
+    def _get_vm_lvm_disks(self, node: str, vmid: int, vm_type: str) -> list:
+        """Parse VM config, find disks on shared LVM storage.
+        Returns list of dicts: [{disk_key, storage_name, lv_name, vg_name, size_gb}]
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            host = self.host
+
+            # Get VM config
+            if vm_type == "qemu":
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            response = self._create_session().get(config_url, timeout=15)
+            if response.status_code != 200:
+                return []
+            config = response.json().get("data", {})
+
+            # Get storage configs
+            storage_url = f"https://{host}:{self.api_port}/api2/json/storage"
+            storage_response = self._create_session().get(storage_url, timeout=10)
+            storage_configs = {}
+            if storage_response.status_code == 200:
+                for s in storage_response.json().get("data", []):
+                    storage_configs[s["storage"]] = s
+
+            lvm_disks = []
+            # Disk key prefixes by vm_type
+            prefixes = ("scsi", "virtio", "ide", "sata") if vm_type == "qemu" else ("rootfs", "mp")
+
+            for key, value in config.items():
+                is_disk = False
+                if vm_type == "qemu":
+                    is_disk = any(key.startswith(p) and (key[len(p) :].isdigit() or key == p) for p in prefixes)
+                else:
+                    is_disk = key == "rootfs" or (key.startswith("mp") and key[2:].isdigit())
+
+                if not is_disk or not isinstance(value, str) or ":" not in value:
+                    continue
+
+                storage_name = value.split(":")[0]
+                storage_cfg = storage_configs.get(storage_name, {})
+
+                # Only shared LVM storage
+                if storage_cfg.get("type") != "lvm":
+                    continue
+                if not storage_cfg.get("shared", 0):
+                    continue
+
+                vg_name = storage_cfg.get("vgname", "")
+                if not vg_name:
+                    continue
+
+                # Extract LV name: "iscsi-lvm:vm-100-disk-0,size=100G" -> "vm-100-disk-0"
+                disk_part = value.split(":")[1].split(",")[0]
+
+                # Extract size from config value
+                size_gb = 0.0
+                for part in value.split(","):
+                    if part.startswith("size="):
+                        size_str = part[5:].upper().strip()
+                        if size_str.endswith("G"):
+                            size_gb = float(size_str[:-1])
+                        elif size_str.endswith("T"):
+                            size_gb = float(size_str[:-1]) * 1024
+                        elif size_str.endswith("M"):
+                            size_gb = float(size_str[:-1]) / 1024
+
+                lvm_disks.append({
+                    "disk_key": key,
+                    "storage_name": storage_name,
+                    "lv_name": disk_part,
+                    "vg_name": vg_name,
+                    "size_gb": size_gb,
+                })
+
+            return lvm_disks
+
+        except Exception as e:
+            self.logger.error(f"Error getting LVM disks for {vm_type}/{vmid}: {e}")
+            return []
+
+    def check_efficient_snapshot_capability(self, node: str, vmid: int, vm_type: str) -> dict:
+        """check if VM supports space-efficient LVM snapshots"""
+        result: Dict[str, Any] = {
+            "eligible": False,
+            "lvm_disks": [],
+            "vg_name": "",
+            "vg_free_gb": 0.0,
+            "total_disk_size_gb": 0.0,
+            "recommended_snap_size_gb": 0.0,
+            "savings_percent": 0,
+            "has_guest_agent": False,
+            "warnings": [],
+        }
+
+        try:
+            lvm_disks = self._get_vm_lvm_disks(node, vmid, vm_type)
+            if not lvm_disks:
+                return result
+
+            result["lvm_disks"] = lvm_disks
+            vg_name = lvm_disks[0]["vg_name"]
+            result["vg_name"] = vg_name
+
+            total_size = sum(d["size_gb"] for d in lvm_disks)
+            result["total_disk_size_gb"] = total_size
+
+            # Get VG free space via SSH
+            exit_code, stdout, stderr = self._node_ssh_exec(
+                node, f"vgs --noheadings --nosuffix --units g -o vg_free {shlex.quote(vg_name)}"
+            )
+            if exit_code == 0 and stdout.strip():
+                try:
+                    result["vg_free_gb"] = float(stdout.strip())
+                except ValueError:
+                    result["warnings"].append("Could not parse VG free space")
+
+            # Recommend 10% of total disk size
+            recommended = round(max(1.0, total_size * 0.10), 1)
+            result["recommended_snap_size_gb"] = recommended
+
+            if total_size > 0:
+                result["savings_percent"] = round((1 - recommended / total_size) * 100)
+
+            # Check existing efficient snapshot count
+            db = get_db()
+            existing = db.get_efficient_snapshots(self.id, vmid)
+            if len(existing) >= 5:
+                result["warnings"].append("Maximum of 5 efficient snapshots reached")
+                return result
+
+            # Check VG has enough space (recommended + 2GB buffer)
+            if result["vg_free_gb"] < recommended + 2:
+                result["warnings"].append(
+                    f"Not enough VG free space ({result['vg_free_gb']:.1f} GB free, need {recommended + 2:.1f} GB)"
+                )
+                return result
+
+            # Check guest agent availability (QEMU only)
+            if vm_type == "qemu":
+                try:
+                    host = self.host
+                    config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+                    resp = self._create_session().get(config_url, timeout=10)
+                    if resp.status_code == 200:
+                        config = resp.json().get("data", {})
+                        result["has_guest_agent"] = bool(config.get("agent", 0))
+                except Exception:
+                    pass
+
+            result["eligible"] = True
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Error checking efficient snapshot capability: {e}")
+            result["warnings"].append(str(e))
+            return result
+
+    def create_efficient_snapshot(
+        self, node: str, vmid: int, vm_type: str, snapname: str, description: str = "", snap_size_gb: float = None
+    ) -> dict:
+        """Create space-efficient LVM COW snapshots for all VM disks.
+
+        Core creation flow:
+        1. Check capability + VG free space
+        2. Sanitize snapname
+        3. Optionally freeze guest FS
+        4. lvcreate -s for each disk
+        5. Rollback on partial failure
+        6. Save to DB
+        """
+        # Sanitize snapname
+        snapname = re.sub(r"[^a-zA-Z0-9_-]", "", snapname)
+        if not snapname:
+            return {"success": False, "error": "Invalid snapshot name"}
+
+        # Check capability
+        cap = self.check_efficient_snapshot_capability(node, vmid, vm_type)
+        if not cap["eligible"]:
+            reason = cap["warnings"][0] if cap["warnings"] else "VM not eligible for efficient snapshots"
+            return {"success": False, "error": reason}
+
+        lvm_disks = cap["lvm_disks"]
+        vg_name = cap["vg_name"]
+
+        # Check duplicate name
+        db = get_db()
+        existing = db.get_efficient_snapshots(self.id, vmid)
+        for s in existing:
+            if s["snapname"] == snapname:
+                return {"success": False, "error": f"Snapshot name '{snapname}' already exists"}
+
+        # Calculate per-disk snapshot size
+        if snap_size_gb is None:
+            snap_size_gb = cap["recommended_snap_size_gb"]
+        total_disk_size = cap["total_disk_size_gb"]
+        per_disk_sizes = []
+        for d in lvm_disks:
+            ratio = d["size_gb"] / total_disk_size if total_disk_size > 0 else 1.0 / len(lvm_disks)
+            per_disk_sizes.append(max(1.0, round(snap_size_gb * ratio, 1)))
+
+        # Check VG has enough free space
+        total_alloc = sum(per_disk_sizes)
+        if cap["vg_free_gb"] < total_alloc + 2:
+            return {
+                "success": False,
+                "error": f"Not enough VG space: {cap['vg_free_gb']:.1f} GB free, need {total_alloc + 2:.1f} GB",
+            }
+
+        # Try to freeze guest filesystem (QEMU with agent only)
+        fs_frozen = False
+        if vm_type == "qemu" and cap.get("has_guest_agent"):
+            try:
+                host = self.host
+                freeze_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/fsfreeze-freeze"
+                resp = self._create_session().post(freeze_url, timeout=30)
+                if resp.status_code == 200:
+                    fs_frozen = True
+                    self.logger.info(f"FS frozen for {vm_type}/{vmid}")
+            except Exception as e:
+                self.logger.warning(f"FS freeze failed for {vm_type}/{vmid}, proceeding without: {e}")
+
+        created_lvs = []
+        disk_records = []
+        try:
+            for i, disk in enumerate(lvm_disks):
+                snap_lv = f"{disk['lv_name']}-snap-{snapname}"
+                alloc_gb = per_disk_sizes[i]
+
+                exit_code, stdout, stderr = self._node_ssh_exec(
+                    node,
+                    f"lvcreate -s -L {alloc_gb:.0f}G -n {shlex.quote(snap_lv)} /dev/{shlex.quote(vg_name)}/{shlex.quote(disk['lv_name'])}",
+                )
+
+                if exit_code != 0:
+                    error_msg = stderr or stdout or "lvcreate failed"
+                    raise RuntimeError(f"Failed to create snapshot LV for {disk['disk_key']}: {error_msg}")
+
+                created_lvs.append(snap_lv)
+                disk_records.append({
+                    "disk_key": disk["disk_key"],
+                    "original_lv": disk["lv_name"],
+                    "snap_lv": snap_lv,
+                    "disk_size_gb": disk["size_gb"],
+                    "snap_alloc_gb": alloc_gb,
+                    "snap_used_percent": 0.0,
+                })
+
+        except Exception as e:
+            # Rollback: remove already-created LVs
+            for lv in created_lvs:
+                try:
+                    self._node_ssh_exec(node, f"lvremove -y /dev/{shlex.quote(vg_name)}/{shlex.quote(lv)}")
+                    self.logger.info(f"Rolled back snapshot LV: {lv}")
+                except Exception:
+                    pass
+            return {"success": False, "error": str(e)}
+
+        finally:
+            # Always thaw if we froze
+            if fs_frozen:
+                try:
+                    host = self.host
+                    thaw_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/fsfreeze-thaw"
+                    self._create_session().post(thaw_url, timeout=30)
+                    self.logger.info(f"FS thawed for {vm_type}/{vmid}")
+                except Exception as e:
+                    self.logger.error(f"FS thaw failed for {vm_type}/{vmid}: {e}")
+
+        # Save to DB
+        snap_id = str(uuid.uuid4())
+        total_alloc = sum(d["snap_alloc_gb"] for d in disk_records)
+        db.save_efficient_snapshot({
+            "id": snap_id,
+            "cluster_id": self.id,
+            "node": node,
+            "vmid": vmid,
+            "vm_type": vm_type,
+            "snapname": snapname,
+            "description": description,
+            "vg_name": vg_name,
+            "disks": disk_records,
+            "total_disk_size_gb": total_disk_size,
+            "total_snap_alloc_gb": total_alloc,
+            "fs_frozen": fs_frozen,
+            "status": "active",
+            "created_by": "",
+        })
+
+        self.logger.info(
+            f"Created efficient snapshot '{snapname}' for {vm_type}/{vmid}: "
+            f"{total_alloc:.1f} GB allocated vs {total_disk_size:.1f} GB normal"
+        )
+
+        return {
+            "success": True,
+            "snap_id": snap_id,
+            "space_savings": {
+                "normal_size_gb": total_disk_size,
+                "efficient_size_gb": total_alloc,
+                "savings_percent": round((1 - total_alloc / total_disk_size) * 100) if total_disk_size > 0 else 0,
+            },
+        }
+
+    def get_efficient_snapshots(self, cluster_id: str, vmid: int, refresh_usage: bool = False) -> list:
+        """Get efficient snapshots for a VM, optionally refreshing LV usage from node."""
+        db = get_db()
+        snapshots = db.get_efficient_snapshots(cluster_id, vmid)
+
+        if not refresh_usage or not snapshots:
+            return snapshots
+
+        # All snapshots for this VM are on the same node/VG
+        node = snapshots[0]["node"]
+        vg_name = snapshots[0]["vg_name"]
+
+        # Get LV usage data via SSH
+        # Use separator so empty columns don't break the parsing, was causing
+        # false "snapshot lost" status when data_percent was blank on some LVM versions
+        exit_code, stdout, stderr = self._node_ssh_exec(
+            node,
+            f'lvs --noheadings --nosuffix --units g --separator "|" -o lv_name,lv_size,data_percent,snap_percent {shlex.quote(vg_name)}',
+        )
+        if exit_code != 0:
+            return snapshots
+
+        # Parse lvs output: lv_name|size|data_pct|snap_pct
+        lv_usage = {}
+        for line in stdout.strip().split("\n"):
+            cols = [c.strip() for c in line.split("|")]
+            if len(cols) < 2 or not cols[0]:
+                continue
+            try:
+                size = float(cols[1]) if cols[1] else 0.0
+                # take whichever percent column has a value (data_percent or snap_percent)
+                pct = 0.0
+                for col in cols[2:]:
+                    if col:
+                        try:
+                            pct = float(col)
+                            break
+                        except ValueError:
+                            pass
+                lv_usage[cols[0]] = {"size": size, "data_percent": pct}
+            except ValueError:
+                continue
+
+        # Also get VG free space for auto-extend
+        vg_free_gb = 0.0
+        exit_code2, stdout2, _ = self._node_ssh_exec(
+            node, f"vgs --noheadings --nosuffix --units g -o vg_free {shlex.quote(vg_name)}"
+        )
+        if exit_code2 == 0 and stdout2.strip():
+            with contextlib.suppress(ValueError):
+                vg_free_gb = float(stdout2.strip())
+
+        # Update each snapshot's disk usage
+        for snap in snapshots:
+            updated = False
+            new_status = snap["status"]
+            for disk in snap["disks"]:
+                snap_lv = disk["snap_lv"]
+                if snap_lv in lv_usage:
+                    usage = lv_usage[snap_lv]
+                    disk["snap_used_percent"] = usage["data_percent"]
+                    disk["snap_alloc_gb"] = usage["size"]
+                    data_pct = usage["data_percent"]
+
+                    # Auto-extend at 90-99%
+                    if 90 <= data_pct < 100:
+                        extend_size = max(1.0, disk["snap_alloc_gb"] * 0.5)
+                        if vg_free_gb > extend_size + 1:
+                            ext_code, _, _ = self._node_ssh_exec(
+                                node,
+                                f"lvextend -L +{extend_size:.0f}G /dev/{shlex.quote(vg_name)}/{shlex.quote(snap_lv)}",
+                            )
+                            if ext_code == 0:
+                                self.logger.info(f"Auto-extended snapshot LV {snap_lv} by {extend_size:.0f}G")
+                                vg_free_gb -= extend_size
+                                disk["snap_alloc_gb"] += extend_size
+                            new_status = "critical"
+                        else:
+                            new_status = "critical"
+                    elif data_pct >= 80:
+                        if new_status == "active":
+                            new_status = "warning"
+                    updated = True
+                else:
+                    # LV not found - snapshot was invalidated by LVM (100% full)
+                    disk["snap_used_percent"] = 100.0
+                    new_status = "invalidated"
+                    updated = True
+
+            if updated:
+                total_alloc = sum(d.get("snap_alloc_gb", 0) for d in snap["disks"])
+                db.update_efficient_snapshot_disks(snap["id"], snap["disks"], total_alloc)
+                if new_status != snap["status"]:
+                    snap["status"] = new_status
+                    db.update_efficient_snapshot_status(snap["id"], new_status)
+
+        # Detect orphaned snapshots (disk moved to different storage)
+        try:
+            vm_type = snapshots[0].get("vm_type", "qemu")
+            current_lvm_disks = self._get_vm_lvm_disks(node, vmid, vm_type)
+            current_disk_set = {(d["lv_name"], d["vg_name"]) for d in current_lvm_disks}
+
+            for snap in snapshots:
+                if snap["status"] == "invalidated":
+                    continue
+                for disk in snap["disks"]:
+                    if (disk["original_lv"], snap["vg_name"]) not in current_disk_set:
+                        snap["status"] = "invalidated"
+                        db.update_efficient_snapshot_status(
+                            snap["id"], "invalidated", f"Origin LV {disk['original_lv']} no longer on storage"
+                        )
+                        self.logger.warning(
+                            f"Efficient snapshot '{snap['snapname']}' orphaned: "
+                            f"{disk['original_lv']} not in VG {snap['vg_name']}"
+                        )
+                        break
+        except Exception as e:
+            self.logger.warning(f"Could not validate origin LVs for VM {vmid}: {e}")
+
+        return snapshots
+
+    def delete_efficient_snapshot(self, node: str, vmid: int, snap_id: str) -> dict:
+        """Delete an efficient snapshot: remove LVs from node, then DB record."""
+        db = get_db()
+        snap = db.get_efficient_snapshot(snap_id)
+        if not snap:
+            return {"success": False, "error": "Snapshot not found"}
+
+        vg_name = snap["vg_name"]
+        errors = []
+
+        for disk in snap["disks"]:
+            snap_lv = disk["snap_lv"]
+            # Check if LV still exists before trying to remove
+            chk_code, chk_out, _ = self._node_ssh_exec(
+                node, f"lvs /dev/{shlex.quote(vg_name)}/{shlex.quote(snap_lv)} 2>/dev/null"
+            )
+            if chk_code != 0:
+                # LV already gone (invalidated or manually removed)
+                continue
+
+            exit_code, stdout, stderr = self._node_ssh_exec(
+                node, f"lvremove -y /dev/{shlex.quote(vg_name)}/{shlex.quote(snap_lv)}"
+            )
+            if exit_code != 0:
+                errors.append(f"{snap_lv}: {stderr or stdout}")
+
+        if errors:
+            self.logger.error(f"Errors deleting efficient snapshot LVs: {errors}")
+            # Still delete DB record since partial cleanup is better than orphaned records
+            db.delete_efficient_snapshot(snap_id)
+            return {"success": False, "error": f"Some LVs could not be removed: {'; '.join(errors)}"}
+
+        db.delete_efficient_snapshot(snap_id)
+        self.logger.info(f"Deleted efficient snapshot '{snap['snapname']}' for VM {vmid}")
+        return {"success": True}
+
+    def rollback_efficient_snapshot(self, node: str, vmid: int, vm_type: str, snap_id: str) -> dict:
+        """Rollback VM to an efficient snapshot. VM must be stopped."""
+        db = get_db()
+        snap = db.get_efficient_snapshot(snap_id)
+        if not snap:
+            return {"success": False, "error": "Snapshot not found"}
+
+        if snap["status"] == "invalidated":
+            return {"success": False, "error": "Snapshot invalidated (overflow)"}
+
+        # Check VM is stopped
+        try:
+            host = self.host
+            if vm_type == "qemu":
+                status_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/status/current"
+            else:
+                status_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/status/current"
+            resp = self._create_session().get(status_url, timeout=10)
+            if resp.status_code == 200:
+                vm_status = resp.json().get("data", {}).get("status", "")
+                if vm_status == "running":
+                    return {"success": False, "error": "VM must be stopped before rollback"}
+        except Exception as e:
+            return {"success": False, "error": f"Cannot check VM status: {e}"}
+
+        vg_name = snap["vg_name"]
+        errors = []
+
+        for disk in snap["disks"]:
+            snap_lv = disk["snap_lv"]
+            exit_code, stdout, stderr = self._node_ssh_exec(
+                node, f"lvconvert --merge /dev/{shlex.quote(vg_name)}/{shlex.quote(snap_lv)}"
+            )
+            if exit_code != 0:
+                errors.append(f"{snap_lv}: {stderr or stdout}")
+
+        if errors:
+            db.update_efficient_snapshot_status(snap_id, "error", "; ".join(errors))
+            return {"success": False, "error": f"Merge failed: {'; '.join(errors)}"}
+
+        # Merge started - snapshot LV will be consumed by LVM
+        db.update_efficient_snapshot_status(snap_id, "merging")
+        # Delete DB record since the LVs are being merged and will disappear
+        db.delete_efficient_snapshot(snap_id)
+
+        self.logger.info(f"Rollback started for efficient snapshot '{snap['snapname']}' on VM {vmid}")
+        return {"success": True, "message": "Rollback started (lvconvert --merge)"}
+
+    # ==================== REPLICATION METHODS ====================
+
+    def get_replication_jobs(self, vmid: int = None) -> List[Dict]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/replication"
+            response = self._api_get(url)
+
+            if response.status_code != 200:
+                return []
+            jobs = response.json()["data"]
+            if vmid:
+                jobs = [j for j in jobs if j.get("guest") == vmid]
+
+            # (#333) - /cluster/replication only carries the job
+            # DEFINITION (id, target, schedule, …); runtime fields like
+            # last_sync / last_try / duration / state / error / fail_count
+            # only come back from the per-node /nodes/{node}/replication
+            # endpoint. Fetch that for the source node(s) and merge in by
+            # job id so the UI's "Last sync" stops showing "Never" for jobs
+            # that have actually been running.
+            try:
+                source_nodes = {j.get("source") for j in jobs if j.get("source")}
+                # PVE typically only fills `source` after first run; fall back to
+                # iterating all online nodes if the field is missing.
+                if not source_nodes:
+                    nodes_url = f"https://{self.host}:{self.api_port}/api2/json/nodes"
+                    nr = self._api_get(nodes_url)
+                    if nr.status_code == 200:
+                        source_nodes = {n["node"] for n in nr.json().get("data", []) if n.get("status") == "online"}
+                runtime_by_id = {}
+                for nname in source_nodes:
+                    try:
+                        nu = f"https://{self.host}:{self.api_port}/api2/json/nodes/{nname}/replication"
+                        rr = self._api_get(nu)
+                        if rr.status_code == 200:
+                            for entry in rr.json().get("data", []) or []:
+                                jid = entry.get("id")
+                                if not jid:
+                                    continue
+                                # Take the freshest record across nodes (last_sync wins)
+                                prev = runtime_by_id.get(jid)
+                                if not prev or (entry.get("last_sync") or 0) > (prev.get("last_sync") or 0):
+                                    runtime_by_id[jid] = entry
+                    except Exception:
+                        continue
+                for j in jobs:
+                    rt = runtime_by_id.get(j.get("id"))
+                    if rt:
+                        for k in ("last_sync", "last_try", "duration", "state", "error", "fail_count", "pid"):
+                            if k in rt and rt[k] is not None:
+                                j.setdefault(k, rt[k])
+            except Exception as _enrich_err:
+                self.logger.debug(f"Replication runtime enrichment failed: {_enrich_err}")
+
+            return jobs
+        except Exception as e:
+            self.logger.error(f"Error getting replication jobs: {e}")
+            return []
+
+    def get_replication_status(self) -> List[Dict]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/replication"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json()["data"]
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting replication status: {e}")
+            return []
+
+    def create_replication_job(
+        self, vmid: int, target_node: str, schedule: str = "*/15", rate: int = None, comment: str = ""
+    ) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            # Find the source node for this VM
+            resources = self.get_vm_resources()
+            vm = next((r for r in resources if r.get("vmid") == vmid), None)
+            if not vm:
+                return {"success": False, "error": f"VM {vmid} not found"}
+
+            vm.get("node")
+            vm.get("type")
+
+            # Create job ID
+            job_id = f"{vmid}-0"  # Default to first replication job
+
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/replication"
+
+            data: Dict[str, Any] = {
+                "id": job_id,
+                "target": target_node,
+                "type": "local",
+                "schedule": schedule,
+            }
+
+            if rate:
+                data["rate"] = rate  # Rate limit in MB/s
+            if comment:
+                data["comment"] = comment
+
+            self.logger.info(f"Creating replication job for {vmid} to {target_node}")
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "job_id": job_id}
+            else:
+                return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def delete_replication_job(self, job_id: str, keep: bool = False, force: bool = False) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/cluster/replication/{job_id}"
+
+            params = {}
+            if keep:
+                params["keep"] = 1  # Keep replicated data
+            if force:
+                params["force"] = 1
+
+            self.logger.info(f"Deleting replication job {job_id}")
+            response = self._create_session().delete(url, params=params)
+
+            if response.status_code == 200:
+                return {"success": True}
+            else:
+                return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def run_replication_now(self, job_id: str) -> Dict[str, Any]:
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+        # (#333) - `nodes/localhost/replication/.../schedule_now` only
+        # works if the API endpoint we're talking to happens to be on the same
+        # node where the replication source VM lives. In any real cluster the
+        # cluster-host (self.host) and the source-node usually differ, so the
+        # request silently no-ops and the customer sees a green toast with no
+        # actual replication. Resolve the real source node first.
+        try:
+            source_node = None
+            # 1. Cheapest: ask /cluster/replication, find the job, read .source
+            try:
+                rj = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/cluster/replication")
+                if rj.status_code == 200:
+                    for j in rj.json().get("data", []) or []:
+                        if j.get("id") == job_id and j.get("source"):
+                            source_node = j["source"]
+                            break
+            except Exception:
+                pass
+            # 2. Fallback: derive from the VM's current node via /cluster/resources
+            if not source_node:
+                try:
+                    vmid = job_id.split("-", 1)[0]
+                    rr = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/cluster/resources?type=vm")
+                    if rr.status_code == 200:
+                        for r in rr.json().get("data", []) or []:
+                            if str(r.get("vmid")) == str(vmid):
+                                source_node = r.get("node")
+                                break
+                except Exception:
+                    pass
+            if not source_node:
+                return {
+                    "success": False,
+                    "error": f"Could not resolve source node for job '{job_id}' — job not found in /cluster/replication and VM not in /cluster/resources",
+                }
+
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{source_node}/replication/{job_id}/schedule_now"
+            self.logger.info(f"Triggering immediate replication for job {job_id} on node {source_node}")
+            response = self._create_session().post(url, timeout=15)
+            if response.status_code == 200:
+                return {"success": True, "node": source_node}
+            else:
+                return {"success": False, "error": response.text or f"PVE returned {response.status_code}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def mint_console_auth_ticket(self):
+        """Mint a FRESH PVE session ticket (PVEAuthCookie) for the console WS proxy.
+
+        2026-06-05 (security audit C-1): the cluster-wide PVE ticket must NOT
+        transit the browser — it's effectively root on pve:8006. The standalone
+        WS subprocess fetches it server-side (via the internal cluster-creds /
+        ws-token-validate path) right before connecting to PVE's vncwebsocket.
+        Returns the ticket string, or None when the cluster has no stored
+        password (API-token clusters can't mint session tickets anyway, and
+        termproxy needs a real session cookie). Kept off self._ticket on purpose
+        so we always hand out a freshly-minted, non-stale cookie.
+        """
+        pwd = getattr(self.config, "pass_", None) or getattr(self.config, "password", None)
+        usr = getattr(self.config, "user", None) or "root@pam"
+        if not pwd:
+            return None
+        try:
+            import ssl as _ssl
+            import urllib.request as _ur
+            from urllib.parse import urlencode as _ue
+
+            ctx = _ssl.create_default_context()
+            # (CodeAnt) - gate TLS verify on the per-cluster ssl_verify flag,
+            # matching the VNC/termproxy paths (default off: PVE self-signed).
+            if not getattr(self, "_ssl_verify", False):
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+            req = _ur.Request(
+                f"https://{self.host}:{self.api_port}/api2/json/access/ticket",
+                data=_ue({"username": usr, "password": pwd}).encode("utf-8"),
+                method="POST",
+            )
+            with _ur.urlopen(req, context=ctx, timeout=10) as resp:  # nosec: B310 - hardcoded HTTPS URL
+                import json as _json
+
+                res = _json.loads(resp.read().decode("utf-8"))
+            return res["data"]["ticket"]
+        except Exception as e:
+            self.logger.warning(f"[CONSOLE] auth-ticket mint failed: {type(e).__name__}")
+            return None
+
+    def get_vnc_ticket(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            # Use the cluster host - Proxmox API will route to correct node
+            host = self.host
+
+            # Build URL based on VM type
+            if vm_type == "qemu":
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/vncproxy"
+            else:  # lxc
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/vncproxy"
+
+            self.logger.info(f"[VNC] Requesting ticket from {host} for {vm_type}/{vmid} on {node}")
+
+            # Request websocket VNC with longer timeout
+            session = self._create_session()
+            response = session.post(url, data={"websocket": 1}, timeout=30)
+
+            if response.status_code == 200:
+                data = response.json()["data"]
+                ticket = data.get("ticket")
+                port = data.get("port")
+                self.logger.info(f"[VNC] Got ticket for {vm_type}/{vmid}, port={port}")
+
+                # 2026-06-05 (C-1): do NOT leak the cluster PVEAuthCookie to the
+                # browser. The in-process VNC proxy uses self._ticket server-side;
+                # this field was returned but never consumed client-side.
+                return {
+                    "success": True,
+                    "ticket": ticket,
+                    "port": port,
+                    "host": host,
+                    "node": node,
+                    "vmid": vmid,
+                    "vm_type": vm_type,
+                    # PVE returns the vncproxy task upid; carry it so the
+                    # console-open route can register_task_user() and the taskbar shows
+                    # WHO opened the console (it never did before).
+                    "upid": data.get("upid"),
+                }
+            else:
+                error_msg = response.text
+                self.logger.error(f"[VNC] Ticket failed ({response.status_code}): {error_msg}")
+                return {"success": False, "error": f"Proxmox error: {error_msg}"}
+
+        except requests.exceptions.Timeout as e:
+            self.logger.error(f"[VNC] Timeout connecting to Proxmox: {e}")
+            return {"success": False, "error": "Proxmox connection timeout. Is the VM running?"}
+        except requests.exceptions.ConnectionError as e:
+            self.logger.error(f"[VNC] Connection error: {e}")
+            return {"success": False, "error": "Cannot connect to Proxmox"}
+        except Exception as e:
+            self.logger.error(f"[VNC] Error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_term_ticket(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        """Get xterm.js terminal ticket for LXC/QEMU — uses Proxmox termproxy instead of vncproxy"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+        try:
+            host = self.host
+            if vm_type == "qemu":
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/termproxy"
+            else:
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/termproxy"
+
+            self.logger.info(f"[TERM] Requesting terminal ticket from {host} for {vm_type}/{vmid} on {node}")
+            session = self._create_session()
+            response = session.post(url, timeout=30)
+
+            if response.status_code == 200:
+                data = response.json()["data"]
+                return {
+                    "success": True,
+                    "ticket": data.get("ticket"),
+                    "port": data.get("port"),
+                    # Termproxy needs the PVE user for the WS
+                    # auth handshake (`user:ticket\n`). PVE returns it; if not,
+                    # fall back to the manager's configured user.
+                    "user": data.get("user") or self.config.user,
+                    "host": host,
+                    "node": node,
+                    "vmid": vmid,
+                    "vm_type": vm_type,
+                    # C-1: PVEAuthCookie stays server-side, fetched by the WS proxy
+                }
+            else:
+                return {"success": False, "error": f"Proxmox error: {response.text}"}
+        except Exception as e:
+            self.logger.error(f"[TERM] Error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_node_shell_ticket(self, node: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/termproxy"
+
+            # Request websocket terminal
+            response = self._create_session().post(url, timeout=15)
+
+            self.logger.info(f"Termproxy response status: {response.status_code}")
+
+            if response.status_code == 200:
+                data = response.json()["data"]
+                user = data.get("user") or self.config.user
+                self.logger.info(f"[OK] Got shell ticket for node {node}, port={data.get('port')}, user={user}")
+                return {
+                    "success": True,
+                    "ticket": data.get("ticket"),
+                    "port": data.get("port"),
+                    "user": user,
+                    "host": self.config.host,
+                    "node": node,
+                    "pve_auth_cookie": self._ticket,
+                }
+            else:
+                error_msg = response.text
+                self.logger.error(f"[ERROR] Shell ticket failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.exception(f"[ERROR] Shell ticket error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_spice_ticket(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+
+        if vm_type != "qemu":
+            return {"success": False, "error": "SPICE only available for QEMU VMs"}
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/spiceproxy"
+            response = self._create_session().post(url, timeout=15)
+
+            if response.status_code == 200:
+                data = response.json()["data"]
+                self.logger.info(f"[OK] Got SPICE ticket for {vmid}")
+                return {"success": True, "data": data}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_vm_config(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                config = response.json()["data"]
+
+                # Also get current status for some dynamic info
+                if vm_type == "qemu":
+                    status_url = (
+                        f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/status/current"
+                    )
+                else:
+                    status_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/status/current"
+
+                status_response = self._create_session().get(status_url, timeout=15)
+                status = {}
+                if status_response.status_code == 200:
+                    status = status_response.json()["data"]
+
+                # Parse config into structured format
+                parsed = self._parse_vm_config(config, vm_type)
+                parsed["raw"] = config
+                parsed["status"] = status
+                parsed["vmid"] = vmid
+                parsed["node"] = node
+                parsed["type"] = vm_type
+
+                # Populate ostype cache from config so sidebar icons show OS type
+                ostype_val = config.get("ostype")
+                if ostype_val:
+                    with self._ostype_cache_lock:
+                        self._ostype_cache[(node, vmid)] = ostype_val
+
+                # Add lock info - important for UI to show locked state
+                lock_reason = config.get("lock")
+                if lock_reason:
+                    parsed["lock"] = {
+                        "locked": True,
+                        "reason": lock_reason,
+                        "description": self.LOCK_DESCRIPTIONS.get(lock_reason, f"Locked: {lock_reason}"),
+                        "unlock_command": f"qm unlock {vmid}" if vm_type == "qemu" else f"pct unlock {vmid}",
+                    }
+                else:
+                    parsed["lock"] = {"locked": False}
+
+                return {"success": True, "config": parsed}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Get VM config error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def unlock_vm(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        """remove lock from VM config - use carefully during stuck operations"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+
+            # First get current config to see lock reason
+            if vm_type == "qemu":
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            config_response = self._api_get(config_url)
+            if config_response.status_code != 200:
+                return {"success": False, "error": "Could not get VM config"}
+
+            config = config_response.json().get("data", {})
+            lock_reason = config.get("lock")
+
+            if not lock_reason:
+                return {"success": True, "message": "VM is not locked", "was_locked": False}
+
+            self.logger.info(f"Unlocking {vm_type}/{vmid} on {node} (lock reason: {lock_reason})")
+
+            # Remove the lock by setting delete=lock
+            response = self._api_put(config_url, data={"delete": "lock"})
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Unlocked {vm_type}/{vmid} (was: {lock_reason})")
+                return {
+                    "success": True,
+                    "message": "VM unlocked successfully",
+                    "was_locked": True,
+                    "lock_reason": lock_reason,
+                }
+            else:
+                error = response.text
+                self.logger.error(f"[ERROR] Failed to unlock {vm_type}/{vmid}: {error}")
+                return {"success": False, "error": error}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Unlock VM error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_vm_lock_status(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        """Get lock status of a VM/CT"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+
+            if vm_type == "qemu":
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            response = self._api_get(config_url)
+
+            if response.status_code == 200:
+                config = response.json().get("data", {})
+                lock_reason = config.get("lock")
+
+                return {
+                    "success": True,
+                    "locked": bool(lock_reason),
+                    "lock_reason": lock_reason,
+                    "lock_description": self.LOCK_DESCRIPTIONS.get(lock_reason, f"Locked: {lock_reason}")
+                    if lock_reason
+                    else None,
+                }
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_vm_rrd(self, node: str, vmid: int, vm_type: str, timeframe: str = "day") -> Dict[str, Any]:
+        """Get RRD metrics data for a VM or container
+
+        Proxmox stores historical data in RRD format.
+        Timeframes: hour, day, week, month, year
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+
+            if vm_type == "qemu":
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/rrddata"
+            else:
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/rrddata"
+
+            response = self._create_session().get(url, params={"timeframe": timeframe})
+
+            if response.status_code == 200:
+                rrd_data = response.json().get("data", [])
+
+                # Process and format the data for charts
+                formatted_data: Dict[str, Any] = {
+                    "timeframe": timeframe,
+                    "vmid": vmid,
+                    "node": node,
+                    "type": vm_type,
+                    "metrics": {
+                        "cpu": [],
+                        "memory": [],
+                        "disk_read": [],
+                        "disk_write": [],
+                        "net_in": [],
+                        "net_out": [],
+                    },
+                    "timestamps": [],
+                }
+
+                # Check for pressure stall data (PSI)
+                pressure_keys = [
+                    "pressurecpusome",
+                    "pressurecpufull",
+                    "pressurememorysome",
+                    "pressurememoryfull",
+                    "pressureiosome",
+                    "pressureiofull",
+                ]
+                active_pressure_keys = []
+
+                # Check first valid point to determine available metrics
+                if rrd_data:
+                    first_point = next((p for p in rrd_data if p), None)
+                    if first_point:
+                        for k in pressure_keys:
+                            if k in first_point:
+                                active_pressure_keys.append(k)
+                                formatted_data["metrics"][k] = []
+
+                for point in rrd_data:
+                    if not point:
+                        continue
+
+                    timestamp = point.get("time", 0)
+                    formatted_data["timestamps"].append(timestamp)
+
+                    # CPU usage (0-1 -> 0-100%)
+                    cpu = point.get("cpu", 0)
+                    formatted_data["metrics"]["cpu"].append(round((cpu or 0) * 100, 2))
+
+                    # Memory usage (bytes)
+                    mem = point.get("mem", 0)
+                    maxmem = point.get("maxmem", 1)
+                    mem_percent = ((mem or 0) / (maxmem or 1)) * 100
+                    formatted_data["metrics"]["memory"].append(round(mem_percent, 2))
+
+                    # Disk I/O (bytes/s)
+                    formatted_data["metrics"]["disk_read"].append(point.get("diskread", 0) or 0)
+                    formatted_data["metrics"]["disk_write"].append(point.get("diskwrite", 0) or 0)
+
+                    # Network I/O (bytes/s)
+                    formatted_data["metrics"]["net_in"].append(point.get("netin", 0) or 0)
+                    formatted_data["metrics"]["net_out"].append(point.get("netout", 0) or 0)
+
+                    # Pressure Stall (PSI)
+                    for k in active_pressure_keys:
+                        formatted_data["metrics"][k].append(point.get(k, 0) or 0)
+
+                return {"success": True, "data": formatted_data}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Get VM RRD error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _parse_vm_config(self, config: Dict, vm_type: str) -> Dict:
+
+        parsed: Dict[str, Any] = {
+            "general": {},
+            "hardware": {},
+            "disks": [],
+            "networks": [],
+            "options": {},
+            "unused_disks": [],  # Track unused/detached disks
+        }
+
+        if vm_type == "qemu":
+            # General
+            parsed["general"] = {
+                "name": config.get("name", ""),
+                "description": config.get("description", ""),
+                "vmgenid": config.get("vmgenid", ""),
+                "tags": config.get("tags", ""),
+            }
+
+            # Hardware
+            # May 2026: scsihw default is `lsi` per PVE upstream (matches
+            # /usr/share/perl5/PVE/QemuServer.pm). Was 'virtio-scsi-pci' here
+            # which made the Configure dropdown lie about what PVE actually
+            # uses when scsihw is omitted from config — user reported in
+            # comments that picking VirtIO in ProxmoxVEx left PVE on LSI; turns
+            # out the dropdown was already showing VirtIO without anything to
+            # save against, so the user's "no-op" save kept PVE's lsi default.
+            parsed["hardware"] = {
+                "cores": config.get("cores", 1),
+                "sockets": config.get("sockets", 1),
+                "cpu": config.get("cpu", "host"),
+                "memory": config.get("memory", 512),
+                "balloon": config.get("balloon", 0),
+                "numa": config.get("numa", 0),
+                "vga": config.get("vga", "std"),
+                "machine": config.get("machine", ""),
+                "bios": config.get("bios", "seabios"),
+                "scsihw": config.get("scsihw", "lsi"),
+            }
+
+            # Options
+            parsed["options"] = {
+                "onboot": config.get("onboot", 0),
+                "boot": config.get("boot", ""),
+                "bootdisk": config.get("bootdisk", ""),
+                "ostype": config.get("ostype", "other"),
+                "agent": config.get("agent", "0"),
+                "protection": config.get("protection", 0),
+                "tablet": config.get("tablet", 1),
+                "hotplug": config.get("hotplug", ""),
+                "acpi": config.get("acpi", 1),
+                "kvm": config.get("kvm", 1),
+                "smbios1": config.get("smbios1", ""),
+            }
+
+            # Parse disks and networks from config keys
+            for key, value in config.items():
+                # Disks: scsi0, virtio0, ide0, sata0, etc.
+                if (
+                    any(key.startswith(prefix) for prefix in ["scsi", "virtio", "ide", "sata", "efidisk", "tpmstate"])
+                    and isinstance(value, str)
+                    and ":" in value
+                ):
+                    parsed["disks"].append({"id": key, "value": value, **self._parse_disk_string(value)})
+
+                # Unused disks - these are detached but not deleted
+                if key.startswith("unused") and isinstance(value, str):
+                    # Parse unused disk: "local-lvm:vm-100-disk-1" or similar
+                    parts = value.split(":")
+                    storage = parts[0] if len(parts) > 0 else ""
+                    volume = parts[1] if len(parts) > 1 else value
+                    parsed["unused_disks"].append({
+                        "id": key,
+                        "value": value,
+                        "storage": storage,
+                        "volume": volume,
+                    })
+
+                # Networks: net0, net1, etc.
+                if key.startswith("net"):
+                    parsed["networks"].append({"id": key, "value": value, **self._parse_network_string(value, "qemu")})
+
+                # CD/DVD
+                if key in ["cdrom", "ide2"] and "media=cdrom" in str(value):
+                    parsed["hardware"]["cdrom"] = value
+
+        else:  # LXC
+            # General
+            parsed["general"] = {
+                "hostname": config.get("hostname", ""),
+                "description": config.get("description", ""),
+                "tags": config.get("tags", ""),
+                "ostype": config.get("ostype", ""),
+                "arch": config.get("arch", "amd64"),
+            }
+
+            # Hardware/Resources
+            parsed["hardware"] = {
+                "cores": config.get("cores", 1),
+                "cpulimit": config.get("cpulimit", 0),
+                "cpuunits": config.get("cpuunits", 1024),
+                "memory": config.get("memory", 512),
+                "swap": config.get("swap", 512),
+            }
+
+            # Options
+            parsed["options"] = {
+                "onboot": config.get("onboot", 0),
+                "protection": config.get("protection", 0),
+                "unprivileged": config.get("unprivileged", 0),
+                "features": config.get("features", ""),
+                "startup": config.get("startup", ""),
+                "nameserver": config.get("nameserver", ""),
+                "searchdomain": config.get("searchdomain", ""),
+            }
+
+            # Parse storage and networks
+            for key, value in config.items():
+                # Storage: rootfs, mp0, mp1, etc.
+                if key == "rootfs" or key.startswith("mp"):
+                    parsed["disks"].append({"id": key, "value": value, **self._parse_lxc_storage_string(value)})
+
+                # Unused disks for LXC too
+                if key.startswith("unused") and isinstance(value, str):
+                    parts = value.split(":")
+                    storage = parts[0] if len(parts) > 0 else ""
+                    volume = parts[1] if len(parts) > 1 else value
+                    parsed["unused_disks"].append({
+                        "id": key,
+                        "value": value,
+                        "storage": storage,
+                        "volume": volume,
+                    })
+
+                # Networks: net0, net1, etc.
+                if key.startswith("net"):
+                    parsed["networks"].append({"id": key, "value": value, **self._parse_network_string(value, "lxc")})
+
+        return parsed
+
+    def _parse_disk_string(self, disk_str: str) -> Dict:
+        """Parse QEMU disk string like 'local-lvm:vm-100-disk-0,size=32G'"""
+        result = {"storage": "", "size": "", "format": "", "cache": "", "iothread": 0, "ssd": 0}
+        parts = disk_str.split(",")
+
+        if parts and ":" in parts[0]:
+            # First part is storage:volume
+            storage_parts = parts[0].split(":")
+            result["storage"] = storage_parts[0]
+            result["volume"] = storage_parts[1] if len(storage_parts) > 1 else ""
+
+        for part in parts[1:]:
+            if "=" in part:
+                key, value = part.split("=", 1)
+                if key == "size":
+                    result["size"] = value
+                elif key == "cache":
+                    result["cache"] = value
+                elif key == "format":
+                    result["format"] = value
+                elif key == "iothread":
+                    result["iothread"] = int(value)
+                elif key == "ssd":
+                    result["ssd"] = int(value)
+
+        return result
+
+    def _parse_lxc_storage_string(self, storage_str: str) -> Dict:
+        """Parse LXC storage string like 'local-lvm:vm-100-disk-0,size=8G'"""
+        result = {"storage": "", "size": "", "mountpoint": ""}
+        parts = storage_str.split(",")
+
+        if parts and ":" in parts[0]:
+            storage_parts = parts[0].split(":")
+            result["storage"] = storage_parts[0]
+            result["volume"] = storage_parts[1] if len(storage_parts) > 1 else ""
+
+        for part in parts[1:]:
+            if "=" in part:
+                key, value = part.split("=", 1)
+                if key == "size":
+                    result["size"] = value
+                elif key == "mp":
+                    result["mountpoint"] = value
+
+        return result
+
+    def _parse_network_string(self, net_str: str, vm_type: str) -> Dict:
+        """Parse Proxmox network config string into a dict
+
+        Format varies between QEMU and LXC
+        QEMU: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1,link_down=1,queues=4
+        LXC: name=eth0,bridge=vmbr0,ip=dhcp,hwaddr=AA:BB:CC:DD:EE:FF
+        """
+        result = {
+            "bridge": "",
+            "firewall": 0,
+            "tag": "",
+            "rate": "",
+            "mtu": "",
+            "queues": "",  # Multiqueue support
+            "link_down": False,  # Track network disconnect state
+        }
+
+        if vm_type == "qemu":
+            result.update({"model": "virtio", "macaddr": ""})
+        else:  # lxc
+            result.update({"name": "", "hwaddr": "", "ip": "", "gw": "", "ip6": "", "gw6": ""})
+
+        parts = net_str.split(",")
+
+        for i, part in enumerate(parts):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                key.lower()
+
+                # First part for QEMU: model=MAC (e.g., e1000=AA:BB:CC:DD:EE:FF)
+                if i == 0 and vm_type == "qemu" and ":" in value:
+                    # This is model=MAC format
+                    result["model"] = key
+                    result["macaddr"] = value
+                elif key == "bridge":
+                    result["bridge"] = value
+                elif key == "firewall":
+                    result["firewall"] = int(value)
+                elif key == "tag":
+                    result["tag"] = value
+                elif key == "rate":
+                    result["rate"] = value
+                elif key == "mtu":
+                    result["mtu"] = value
+                elif key == "queues":
+                    result["queues"] = value
+                elif key == "model":
+                    result["model"] = value
+                elif key == "macaddr" or key == "hwaddr":
+                    result["macaddr" if vm_type == "qemu" else "hwaddr"] = value
+                elif key == "name":
+                    result["name"] = value
+                elif key == "ip":
+                    result["ip"] = value
+                elif key == "gw":
+                    result["gw"] = value
+                elif key == "ip6":
+                    result["ip6"] = value
+                elif key == "gw6":
+                    result["gw6"] = value
+                elif key == "link_down":
+                    # Link_down=1 means cable is "unplugged"
+                    result["link_down"] = value == "1"
+
+        return result
+
+    def update_vm_config(self, node: str, vmid: int, vm_type: str, config_updates: Dict) -> Dict[str, Any]:
+        """Update VM configuration with boot order validation.
+
+        Added automatic boot order sanitization to prevent
+        'device does not exist' errors when updating config.
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            # If boot order is being updated, validate it against current config
+            if "boot" in config_updates:
+                boot_val = config_updates.get("boot", "")
+                if boot_val and "order=" in boot_val:
+                    # Get current VM config to validate boot devices
+                    current_config = self.get_vm_config(node, vmid, vm_type)
+                    if current_config.get("success"):
+                        config = current_config.get("config", {})
+                        # Two bugs lived here (#580). (1) `.split(';')[0]` kept only the FIRST
+                        # device, so reordering silently dropped the rest. (2) device existence was
+                        # checked against the *structured* config — but the real device keys (scsi0,
+                        # ide2, net0…) live in config['raw'], so every device looked invalid, boot got
+                        # del'd, and PVE got an empty body → "no options specified". Parse the whole
+                        # order and validate against raw.
+                        raw = config.get("raw", config)
+                        order_str = boot_val.split("order=", 1)[1] if "order=" in boot_val else ""
+                        if order_str:
+                            devices = [d.strip() for d in order_str.split(";") if d.strip()]
+                            valid_devices = []
+                            for dev in devices:
+                                # disks/cdroms/nets are all keys in the raw PVE config
+                                if dev in raw or re.match(r"^net\d+$", dev):
+                                    valid_devices.append(dev)
+                                else:
+                                    self.logger.warning(f"Boot order device '{dev}' not found in VM config, removing")
+
+                            if valid_devices:
+                                config_updates["boot"] = "order=" + ";".join(valid_devices)
+                            else:
+                                # No valid boot devices - remove boot order from update
+                                del config_updates["boot"]
+                                self.logger.warning("No valid boot devices found, skipping boot order update")
+
+            self.logger.info(f"Updating {vm_type}/{vmid} config: {config_updates}")
+
+            response = self._api_put(url, data=config_updates)
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Config updated for {vm_type}/{vmid}")
+                return {"success": True, "message": "Configuration updated"}
+            else:
+                error_msg = response.text
+                self.logger.error(f"[ERROR] Config update failed: {error_msg}")
+                return {"success": False, "error": error_msg}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Update config error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def sanitize_boot_order(self, node: str, vmid: int, vm_type: str) -> Dict[str, Any]:
+        """Sanitize boot order by removing non-existent devices.
+
+        Fixes 'invalid bootorder: device does not exist' errors
+        by removing devices from boot order that no longer exist in the VM config.
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            # Get current config
+            config_result = self.get_vm_config(node, vmid, vm_type)
+            if not config_result.get("success"):
+                return {"success": False, "error": "Could not get VM config"}
+
+            config = config_result.get("config", {})
+            boot_val = config.get("boot", "")
+
+            if not boot_val or "order=" not in boot_val:
+                return {"success": True, "message": "No boot order to sanitize", "changed": False}
+
+            # Parse boot order
+            order_part = boot_val.split("order=")[1].split(";")[0] if "order=" in boot_val else ""
+            if not order_part:
+                return {"success": True, "message": "Empty boot order", "changed": False}
+
+            devices = [d.strip() for d in boot_val.split("order=")[1].split(";") if d.strip()]
+            valid_devices = []
+            removed_devices = []
+
+            for dev in devices:
+                # Check if device exists in config (net0 is always valid for QEMU)
+                if dev in config or (dev == "net0" and vm_type == "qemu"):
+                    valid_devices.append(dev)
+                else:
+                    removed_devices.append(dev)
+                    self.logger.info(f"Boot order: removing non-existent device '{dev}' from VM {vmid}")
+
+            if not removed_devices:
+                return {"success": True, "message": "Boot order is valid", "changed": False}
+
+            # Update boot order
+            if valid_devices:
+                new_boot = "order=" + ";".join(valid_devices)
+            else:
+                # No valid devices - default to net0 for QEMU
+                new_boot = "order=net0" if vm_type == "qemu" else ""
+
+            # Apply update
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            response = self._api_put(url, data={"boot": new_boot})
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Sanitized boot order for {vm_type}/{vmid}: removed {removed_devices}")
+                return {
+                    "success": True,
+                    "message": f"Removed invalid devices: {', '.join(removed_devices)}",
+                    "changed": True,
+                    "removed": removed_devices,
+                    "new_boot_order": new_boot,
+                }
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Sanitize boot order error: {e}")
+            return {"success": False, "error": str(e)}
+
+    def resize_vm_disk(self, node: str, vmid: int, vm_type: str, disk: str, size: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/resize"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/resize"
+
+            data = {"disk": disk, "size": size}
+            response = self._api_put(url, data=data)
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Disk {disk} resized to {size}")
+                return {"success": True, "message": f"Disk resized to {size}"}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_storage_list(self, node: str) -> List[Dict]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/storage"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json()["data"]
+            return []
+        except Exception:
+            return []
+
+    def get_network_list(self, node: str) -> List[Dict]:
+        """Get available networks/bridges for a node, including SDN VNets
+
+        Added SDN VNet support (GitHub Issue
+        SDN VNets are cluster-wide virtual networks that appear as bridges
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            host = self.host
+            result = []
+            found_bridges = set()
+
+            # 1. Get local bridges from node
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/network"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                networks = response.json()["data"]
+                # (#385 maxilee): only actual bridge types here.
+                # OVSIntPort is an OVS *internal* port — typically used for
+                # host-side L3 attachment (mgmt IP, iscsi access port, etc.)
+                # and NOT a valid target for a VM NIC's `bridge=` config.
+                # PVE's own web UI doesn't expose those either; we were
+                # over-listing them, which on OVS setups polluted the
+                # dropdown with mgmt/iscsi-style ports.
+                for n in networks:
+                    if n.get("type") in ["bridge", "OVSBridge"]:
+                        n["source"] = "local"
+                        result.append(n)
+                        if n.get("iface"):
+                            found_bridges.add(n["iface"])
+
+            # 2. Get SDN VNets (cluster-wide)
+            # Improved SDN support for GitHub Issue
+            try:
+                sdn_url = f"https://{host}:{self.api_port}/api2/json/cluster/sdn/vnets"
+                sdn_response = self._api_get(sdn_url)
+
+                if sdn_response.status_code == 200:
+                    vnets = sdn_response.json().get("data", [])
+                    logging.info(f"Found {len(vnets)} SDN VNets")
+                    for vnet in vnets:
+                        vnet_name = vnet.get("vnet", "")
+                        if vnet_name and vnet_name not in found_bridges:
+                            result.append({
+                                "iface": vnet_name,
+                                "type": "sdn_vnet",
+                                "source": "sdn",
+                                "zone": vnet.get("zone", ""),
+                                "alias": vnet.get("alias", ""),
+                                "tag": vnet.get("tag"),
+                                "vlanaware": vnet.get("vlanaware"),
+                                "comments": f"SDN: {vnet.get('zone', '')}",
+                                "active": True,
+                            })
+                            found_bridges.add(vnet_name)
+                elif sdn_response.status_code == 501:
+                    logging.debug("SDN not enabled on this cluster")
+                else:
+                    logging.warning(f"SDN VNets API returned {sdn_response.status_code}")
+            except Exception as e:
+                logging.debug(f"SDN VNets not available: {e}")
+
+            # 3. Get SDN Zones and update VNet info
+            try:
+                zones_url = f"https://{host}:{self.api_port}/api2/json/cluster/sdn/zones"
+                zones_response = self._api_get(zones_url)
+
+                if zones_response.status_code == 200:
+                    zones = zones_response.json().get("data", [])
+                    zone_map = {z.get("zone", ""): z for z in zones}
+
+                    for item in result:
+                        if item.get("source") == "sdn" and item.get("zone") in zone_map:
+                            zone_info = zone_map[item["zone"]]
+                            item["zone_type"] = zone_info.get("type", "")
+            except Exception as e:
+                logging.debug(f"SDN Zones not available: {e}")
+
+            # 4. Discover networks from running VMs (catches SDN VNets not in API)
+            try:
+                vms_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu"
+                vms_response = self._api_get(vms_url)
+
+                if vms_response.status_code == 200:
+                    vms = vms_response.json().get("data", [])
+
+                    for vm in vms[:15]:  # Check first 15 VMs
+                        vmid = vm.get("vmid")
+                        if vmid:
+                            config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+                            config_response = self._api_get(config_url)
+
+                            if config_response.status_code == 200:
+                                config = config_response.json().get("data", {})
+                                for key, value in config.items():
+                                    if key.startswith("net") and isinstance(value, str):
+                                        for part in value.split(","):
+                                            if part.startswith("bridge="):
+                                                bridge_name = part.split("=")[1]
+                                                if bridge_name and bridge_name not in found_bridges:
+                                                    logging.info(f"Discovered network '{bridge_name}' from VM {vmid}")
+                                                    result.append({
+                                                        "iface": bridge_name,
+                                                        "type": "sdn_vnet",
+                                                        "source": "sdn",
+                                                        "zone": "",
+                                                        "comments": "SDN (discovered)",
+                                                        "active": True,
+                                                    })
+                                                    found_bridges.add(bridge_name)
+                                                break
+            except Exception as e:
+                logging.debug(f"Could not scan VMs for networks: {e}")
+
+            return result
+        except Exception as e:
+            logging.error(f"Error getting network list: {e}")
+            return []
+
+    # Cluster-wide network overview (corporate layout)
+    def get_cluster_networks(self) -> Dict[str, Any]:
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"networks": []}
+
+        # (scale) - the walk below fires one PVE /config roundtrip per
+        # guest to map bridges + disk-storage for the topology view; at 1000+ VMs
+        # that is 1000 roundtrips per call. Network/storage topology changes slowly,
+        # so serve a 30s per-cluster TTL cache to bound how often that N+1 storm runs
+        # (repeat opens / polls of the topology view hit the cache). Errors below are
+        # returned uncached so a transient failure never pins an empty diagram.
+        _now = time.monotonic()
+        _cn = getattr(self, "_cluster_networks_cache", None)
+        if _cn is not None and (_now - getattr(self, "_cluster_networks_cache_time", 0.0)) < 30.0:
+            return _cn
+
+        try:
+            host = self.host
+
+            # get online nodes
+            nodes_url = f"https://{host}:{self.api_port}/api2/json/nodes"
+            nodes_resp = self._api_get(nodes_url)
+            if nodes_resp.status_code != 200:
+                return {"networks": []}
+
+            online_nodes = [n["node"] for n in nodes_resp.json().get("data", []) if n.get("status") == "online"]
+
+            # get VMs from cluster resources
+            res_url = f"https://{host}:{self.api_port}/api2/json/cluster/resources?type=vm"
+            res_resp = self._api_get(res_url)
+            all_vms = res_resp.json().get("data", []) if res_resp.status_code == 200 else []
+
+            vms_by_node = {}
+            for vm in all_vms:
+                vms_by_node.setdefault(vm.get("node"), []).append(vm)
+
+            # fetch network configs + VM configs concurrently per node
+            def fetch_node(node):
+                net_data = []
+                vm_bridges = []
+                vm_storages = []  # Disk → storage refs
+
+                # node network interfaces
+                try:
+                    net_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/network"
+                    r = self._api_get(net_url)
+                    if r.status_code == 200:
+                        net_data = r.json().get("data", [])
+                except Exception:
+                    pass
+
+                # VM configs on this node - extract bridge assignments
+                for vm in vms_by_node.get(node, []):
+                    vmid = vm.get("vmid")
+                    if not vmid:
+                        continue
+                    vtype = "qemu" if vm.get("type") == "qemu" else "lxc"
+                    try:
+                        cfg_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/{vtype}/{vmid}/config"
+                        cr = self._api_get(cfg_url)
+                        if cr.status_code != 200:
+                            continue
+                        cfg = cr.json().get("data", {})
+                        for key, val in cfg.items():
+                            if not isinstance(val, str):
+                                continue
+                            # Extract net bridge AND disk storage from
+                            # the same config response. Both are in scope for the
+                            # /networks endpoint that powers the topology view.
+                            if key.startswith("net") and key[3:].isdigit():
+                                bridge = None
+                                for part in val.split(","):
+                                    if part.startswith("bridge="):
+                                        bridge = part.split("=", 1)[1]
+                                        break
+                                if bridge:
+                                    vm_bridges.append({
+                                        "vmid": vmid,
+                                        "name": vm.get("name", ""),
+                                        "node": node,
+                                        "status": vm.get("status", "unknown"),
+                                        "type": vm.get("type", "qemu"),
+                                        "iface": key,
+                                        "bridge": bridge,
+                                    })
+                                continue
+                            # disk slots: scsi/virtio/sata/ide/unused/efidisk/tpmstate (qemu)
+                            # plus rootfs / mp* (lxc). 'cdrom' / 'none,...' values skipped.
+                            disk_prefixes = (
+                                "scsi",
+                                "virtio",
+                                "sata",
+                                "ide",
+                                "unused",
+                                "efidisk",
+                                "tpmstate",
+                                "mp",
+                                "rootfs",
+                            )
+                            matched = False
+                            for p in disk_prefixes:
+                                if key.startswith(p):
+                                    suffix = key[len(p) :]
+                                    if suffix == "" or suffix.isdigit():
+                                        matched = True
+                                    break
+                            if not matched:
+                                continue
+                            head = val.split(",", 1)[0].strip()
+                            if not head or head == "none" or head.startswith("none,"):
+                                continue
+                            if ":" not in head:
+                                continue
+                            storage_name = head.split(":", 1)[0].strip()
+                            if not storage_name or storage_name == "none":
+                                continue
+                            # Skip cdrom-only attachments to keep the
+                            # tier focused on actual VM disks. media=cdrom is the
+                            # PVE convention; we keep ISO storages off the diagram.
+                            if "media=cdrom" in val:
+                                continue
+                            vm_storages.append({
+                                "vmid": vmid,
+                                "name": vm.get("name", ""),
+                                "node": node,
+                                "status": vm.get("status", "unknown"),
+                                "type": vm.get("type", "qemu"),
+                                "slot": key,
+                                "storage": storage_name,
+                            })
+                    except Exception:
+                        pass
+
+                return node, net_data, vm_bridges, vm_storages
+
+            tasks = [lambda n=n: fetch_node(n) for n in online_nodes]
+            results = run_concurrent(tasks, timeout=15)
+
+            network_map = {}
+            storage_assignments = {}  # storage_name → list of {vmid, name, node, ...}
+            for res in results:
+                if not res:
+                    continue
+                node, ifaces, vm_bridges, vm_storages = res
+
+                for iface in ifaces:
+                    itype = iface.get("type", "")
+                    if itype not in ("bridge", "OVSBridge"):
+                        continue
+                    name = iface.get("iface", "")
+                    if not name:
+                        continue
+                    if name not in network_map:
+                        network_map[name] = {
+                            "name": name,
+                            "type": itype,
+                            "cidr": iface.get("cidr", ""),
+                            "address": iface.get("address", ""),
+                            "gateway": iface.get("gateway", ""),
+                            "bridge_ports": iface.get("bridge_ports", ""),
+                            "comments": iface.get("comments", ""),
+                            "autostart": iface.get("autostart", 0),
+                            "active": iface.get("active", 0),
+                            "nodes": [],
+                            "vms": [],
+                        }
+                    network_map[name]["nodes"].append(node)
+
+                for vb in vm_bridges:
+                    br = vb.pop("bridge")
+                    if br not in network_map:
+                        # bridge discovered from VM config only
+                        network_map[br] = {
+                            "name": br,
+                            "type": "bridge",
+                            "cidr": "",
+                            "address": "",
+                            "gateway": "",
+                            "bridge_ports": "",
+                            "comments": "",
+                            "autostart": 0,
+                            "active": 1,
+                            "nodes": [],
+                            "vms": [],
+                        }
+                    network_map[br]["vms"].append(vb)
+
+                for vs in vm_storages:
+                    sname = vs["storage"]
+                    if sname not in storage_assignments:
+                        storage_assignments[sname] = []
+                    storage_assignments[sname].append({
+                        "vmid": vs["vmid"],
+                        "name": vs["name"],
+                        "node": vs["node"],
+                        "status": vs["status"],
+                        "type": vs["type"],
+                        "slot": vs["slot"],
+                    })
+
+            result = {
+                "networks": sorted(network_map.values(), key=lambda n: n["name"]),
+                # Flat list, easier for frontend to index by storage name
+                "storage_assignments": [
+                    {"storage": s, "vms": storage_assignments[s]} for s in sorted(storage_assignments.keys())
+                ],
+            }
+            # Cache only the successful result (see TTL note above)
+            self._cluster_networks_cache = result
+            self._cluster_networks_cache_time = _now
+            return result
+        except Exception as e:
+            logging.error(f"get_cluster_networks failed: {e}")
+            return {"networks": [], "storage_assignments": []}
+
+    def get_iso_list(self, node: str, storage: str = None) -> List[Dict]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            host = self.host
+            isos = []
+            # Get all storage if not specified
+            storages = (
+                [storage]
+                if storage
+                else [s["storage"] for s in self.get_storage_list(node) if "iso" in s.get("content", "")]
+            )
+
+            for stor in storages:
+                url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/storage/{stor}/content"
+                response = self._create_session().get(url, params={"content": "iso"})
+
+                if response.status_code == 200:
+                    content = response.json()["data"]
+                    for item in content:
+                        item["storage"] = stor
+                        isos.append(item)
+
+            return isos
+        except Exception as e:
+            self.logger.error(f"Error getting ISO list: {e}")
+            return []
+
+    # ISO/Template sync across cluster nodes
+    # for iSCSI-only setups where file-level storage isn't shared
+    @staticmethod
+    def _storage_is_shared(storage):
+        """Return True when a Proxmox storage entry is marked shared."""
+        shared = storage.get("shared", 0) if isinstance(storage, dict) else 0
+        if isinstance(shared, bool):
+            return shared
+        if isinstance(shared, (int, float)):
+            return shared != 0
+        return str(shared).strip().lower() in ("1", "true", "yes", "on")
+
+    def _get_syncable_storage(self, node, storage_name, content_type="iso"):
+        """Find a non-shared storage that can participate in ISO/template sync."""
+        for storage in self.get_storage_list(node):
+            if storage.get("storage") != storage_name:
+                continue
+            if content_type not in storage.get("content", ""):
+                return None, f"Storage {storage_name} does not support {content_type}"
+            if self._storage_is_shared(storage):
+                return None, f"Storage {storage_name} is shared; ISO sync is only available for non-shared storage"
+            if not storage.get("active"):
+                return None, f"Storage {storage_name} is not active on {node}"
+            return storage, None
+        return None, f"Storage {storage_name} not found on {node}"
+
+    def get_content_sync_status(self, content_type="iso"):
+        """Build matrix of which ISOs/templates exist on which nodes"""
+        if not self.is_connected:
+            return {"nodes": [], "files": [], "matrix": {}}
+        try:
+            ns = self.get_node_status()
+            online_nodes = [n for n, d in ns.items() if d.get("status") == "online"]
+            host = self.host
+            # collect per-node content
+            node_files = {}
+            for node in online_nodes:
+                storages = [
+                    s
+                    for s in self.get_storage_list(node)
+                    if content_type in s.get("content", "") and s.get("active") and not self._storage_is_shared(s)
+                ]
+                files = []
+                for stor in storages:
+                    url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/storage/{stor['storage']}/content"
+                    r = self._create_session().get(url, params={"content": content_type}, timeout=10)
+                    if r.status_code == 200:
+                        for item in r.json().get("data", []):
+                            files.append({
+                                "volid": item.get("volid", ""),
+                                "name": item.get("volid", "").split("/")[-1]
+                                if "/" in item.get("volid", "")
+                                else item.get("volid", ""),
+                                "size": item.get("size", 0),
+                                "storage": stor["storage"],
+                            })
+                node_files[node] = files
+
+            # build deduplicated file list + matrix
+            all_names = {}
+            for _, files in node_files.items():
+                for f in files:
+                    key = f"{f['storage']}:{f['name']}"
+                    if key not in all_names:
+                        all_names[key] = {"name": f["name"], "storage": f["storage"], "size": f["size"]}
+            matrix = {}
+            for key in all_names:
+                matrix[key] = {}
+                for node in online_nodes:
+                    matrix[key][node] = any(f"{fi['storage']}:{fi['name']}" == key for fi in node_files.get(node, []))
+            return {
+                "nodes": online_nodes,
+                "files": list(all_names.values()),
+                "matrix": matrix,
+            }
+        except Exception as e:
+            self.logger.error(f"[SYNC] Error building sync status: {e}")
+            return {"nodes": [], "files": [], "matrix": {}}
+
+    def sync_content_to_nodes(self, source_node, storage, filename, content_type="iso", target_nodes=None):
+        """Copy ISO/template from source node to other nodes via SSH
+        Tries node-to-node scp (with sshpass) first, falls back to sftp relay
+        """
+        results = []
+        # (pentest CRIT, defense-in-depth) - filename is interpolated into
+        # SSH shell commands below; the API route already validates it, but fail closed
+        # here too in case another caller ever reaches this sink unvalidated.
+        from ProxmoxVEx.utils.sanitization import validate_content_filename
+
+        if not validate_content_filename(filename):
+            return [{"error": "Invalid filename (rejected by content-sync guard)"}]
+        if not self.is_connected:
+            return [{"error": "Not connected"}]
+
+        _, err = self._get_syncable_storage(source_node, storage, content_type)
+        if err:
+            return [{"error": err}]
+
+        ns = self.get_node_status()
+        online_nodes = [n for n, d in ns.items() if d.get("status") == "online" and n != source_node]
+        if target_nodes:
+            online_nodes = [n for n in online_nodes if n in target_nodes]
+        if not online_nodes:
+            return [{"error": "No target nodes available"}]
+
+        src_ip = self._get_node_ip(source_node) or source_node
+        src_path = self._resolve_storage_path(source_node, storage, content_type)
+        if not src_path:
+            return [{"error": f"Cannot resolve storage path on {source_node}"}]
+        src_file = f"{src_path}/{filename}"
+        self.logger.info(f"[SYNC] Source: {src_ip}:{src_file}")
+
+        ssh_user = getattr(self.config, "ssh_user", "") or "root"
+        ssh_pass = getattr(self.config, "ssh_password", None) or self.config.pass_
+
+        for tgt_node in online_nodes:
+            tgt_ip = self._get_node_ip(tgt_node) or tgt_node
+            _, err = self._get_syncable_storage(tgt_node, storage, content_type)
+            if err:
+                results.append({"node": tgt_node, "success": False, "error": err})
+                continue
+            tgt_path = self._resolve_storage_path(tgt_node, storage, content_type)
+            if not tgt_path:
+                results.append({"node": tgt_node, "success": False, "error": f"Storage {storage} not on {tgt_node}"})
+                continue
+            self.logger.info(f"[SYNC] Target: {tgt_node} ({tgt_ip}) path={tgt_path}")
+
+            # check if file already exists
+            try:
+                ssh_chk = self._ssh_connect(tgt_ip)
+                q_target = shlex.quote(f"{tgt_path}/{filename}")
+                _, out, _ = ssh_chk.exec_command(f"test -f {q_target} && echo EXISTS", timeout=10)  # nosec: B601 - path shlex-quoted
+                out.channel.recv_exit_status()
+                if "EXISTS" in out.read().decode(errors="replace"):
+                    results.append({"node": tgt_node, "success": True, "skipped": True})
+                    ssh_chk.close()
+                    continue
+                ssh_chk.close()
+            except Exception:
+                pass
+
+            # ensure target directory exists
+            try:
+                ssh_mk = self._ssh_connect(tgt_ip)
+                q_tgt_path = shlex.quote(tgt_path)
+                ssh_mk.exec_command(f"mkdir -p {q_tgt_path}", timeout=10)  # nosec: B601 - path shlex-quoted
+                ssh_mk.close()
+            except Exception:
+                pass
+
+            synced = False
+
+            # method 1: node-to-node scp with sshpass (most PVE nodes don't have keys to each other)
+            try:
+                ssh_src = self._ssh_connect(src_ip)
+                # try with sshpass if password available
+                if ssh_pass:
+                    escaped_pass = shlex.quote(ssh_pass)
+                    q_src = shlex.quote(src_file)
+                    q_dest = shlex.quote(f"{ssh_user}@{tgt_ip}:{tgt_path}/")
+                    scp_cmd = f"sshpass -p {escaped_pass} scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 {q_src} {q_dest}"
+                else:
+                    q_src = shlex.quote(src_file)
+                    q_dest = shlex.quote(f"{ssh_user}@{tgt_ip}:{tgt_path}/")
+                    scp_cmd = f"scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 {q_src} {q_dest}"
+                _, scp_out, scp_err = ssh_src.exec_command(scp_cmd, timeout=3600)  # nosec: B601 - source/dest shlex-quoted
+                rc = scp_out.channel.recv_exit_status()
+                ssh_src.close()
+                if rc == 0:
+                    synced = True
+                    self.logger.info(f"[SYNC] OK {filename} → {tgt_node} (SCP)")
+                    results.append({"node": tgt_node, "success": True, "method": "scp"})
+                else:
+                    err_msg = scp_err.read().decode(errors="replace")[:300]
+                    self.logger.debug(f"[SYNC] SCP failed {source_node}→{tgt_node}: {err_msg}")
+            except Exception as e:
+                self.logger.debug(f"[SYNC] SCP error: {e}")
+
+            # method 2: sftp relay through ProxmoxVEx
+            if not synced:
+                try:
+                    self.logger.info(f"[SYNC] SFTP relay: {src_ip}:{src_file} → {tgt_ip}:{tgt_path}/{filename}")
+                    ssh_s = self._ssh_connect(src_ip)
+                    ssh_t = self._ssh_connect(tgt_ip)
+                    sftp_s = ssh_s.open_sftp()
+                    sftp_t = ssh_t.open_sftp()
+                    # ensure dir on target via sftp
+                    try:
+                        sftp_t.stat(tgt_path)
+                    except Exception:
+                        sftp_t.mkdir(tgt_path)
+                    with sftp_s.open(src_file, "rb") as rf, sftp_t.open(f"{tgt_path}/{filename}", "wb") as wf:
+                        wf.set_pipelined(True)
+                        copied = 0
+                        while True:
+                            chunk = rf.read(4 * 1024 * 1024)
+                            if not chunk:
+                                break
+                            wf.write(chunk)
+                            copied += len(chunk)
+                    sftp_s.close()
+                    sftp_t.close()
+                    ssh_s.close()
+                    ssh_t.close()
+                    self.logger.info(f"[SYNC] OK {filename} → {tgt_node} (SFTP, {copied / (1024 * 1024):.0f} MB)")
+                    results.append({"node": tgt_node, "success": True, "method": "sftp"})
+                except Exception as e:
+                    self.logger.error(f"[SYNC] SFTP failed {tgt_node}: {e}")
+                    results.append({"node": tgt_node, "success": False, "error": str(e)})
+                    with contextlib.suppress(BaseException):
+                        ssh_s.close()
+                    with contextlib.suppress(BaseException):
+                        ssh_t.close()
+
+        # store result for UI polling
+        if not hasattr(self, "_sync_last_result"):
+            self._sync_last_result = {}
+        self._sync_last_result = {
+            "timestamp": datetime.now().isoformat(),
+            "filename": filename,
+            "results": results,
+            "ok": sum(1 for r in results if r.get("success")),
+            "failed": sum(1 for r in results if not r.get("success")),
+        }
+        return results
+
+    def _resolve_storage_path(self, node, storage, content_type="iso"):
+        """Get filesystem path for a storage's ISO/template directory on a node"""
+        try:
+            node_ip = self._get_node_ip(node) or node
+            ssh = self._ssh_connect(node_ip)
+            # use pvesm to get the base path
+            subdir = "template/iso" if content_type == "iso" else "template/cache"
+            # (#481 port) - shlex.quote on storage to block shell injection
+            cmd = f"pvesm path {shlex.quote(storage)}:{content_type}/dummy.file 2>/dev/null || echo '/var/lib/vz/{subdir}/dummy.file'"
+            _, out, _ = ssh.exec_command(cmd, timeout=10)  # nosec: B601 - storage and subdir sanitized
+            out.channel.recv_exit_status()
+            full_path = out.read().decode(errors="replace").strip()
+            ssh.close()
+            # strip the dummy filename to get directory
+            if full_path:
+                import os
+
+                return os.path.dirname(full_path)
+        except Exception as e:
+            self.logger.debug(f"[SYNC] Cannot resolve path for {storage} on {node}: {e}")
+        return None
+
+    # Resource Pools
+    def get_pools(self) -> List[Dict]:
+        """Get all resource pools from Proxmox"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/pools"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting pools: {e}")
+            return []
+
+    def get_pool_members(self, pool_id: str) -> Dict:
+        """Get pool details including members"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {}
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/pools/{pool_id}"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", {})
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error getting pool members: {e}")
+            return {}
+
+    def get_vm_pool(self, vmid: int, vm_type: str = "qemu") -> str | None:
+        """Get the pool a VM belongs to (if any)"""
+        pools = self.get_pools()
+        for pool in pools:
+            pool_data = self.get_pool_members(pool["poolid"])
+            members = pool_data.get("members", [])
+            for member in members:
+                if member.get("vmid") == vmid and member.get("type") == vm_type:
+                    return pool["poolid"]
+        return None
+
+    # Pool CRUD, was missing entirely somehow
+    def create_pool(self, poolid, comment=""):
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Not connected"}
+        host = self.host
+        try:
+            payload = {"poolid": poolid}
+            if comment:
+                payload["comment"] = comment
+            resp = self._api_post(f"https://{host}:{self.api_port}/api2/json/pools", data=payload)
+            if resp.status_code == 200:
+                return {"success": True}
+            # proxmox gives us the error in 'errors' or just the body
+            err = resp.json().get("errors", resp.text) if resp.text else resp.status_code
+            return {"success": False, "error": f"PVE {resp.status_code}: {err}"}
+        except Exception as e:
+            self.logger.error(f"create_pool: {e}")
+            return {"success": False, "error": str(e)}
+
+    def update_pool(self, poolid, comment="", members_to_add=None, members_to_remove=None):
+        """Update pool comment and/or members. Proxmox API is a bit weird here
+        adding and removing members are separate PUT calls with 'delete' flag."""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Not connected"}
+        host = self.host
+        url = f"https://{host}:{self.api_port}/api2/json/pools/{poolid}"
+        try:
+            data = {}
+            if comment is not None:
+                data["comment"] = comment
+            if members_to_add:
+                vms = [str(m) for m in members_to_add if isinstance(m, int) or str(m).isdigit()]
+                storages = [m for m in members_to_add if not str(m).isdigit()]
+                if vms:
+                    data["vms"] = ",".join(vms)
+                if storages:
+                    data["storage"] = ",".join(storages)
+            if members_to_remove:
+                data["delete"] = 1
+                vms = [str(m) for m in members_to_remove if isinstance(m, int) or str(m).isdigit()]
+                storages = [m for m in members_to_remove if not str(m).isdigit()]
+                if vms:
+                    data["vms"] = ",".join(vms)
+                if storages:
+                    data["storage"] = ",".join(storages)
+            resp = self._api_put(url, data=data)
+            if resp.status_code == 200:
+                return {"success": True}
+            return {"success": False, "error": f"PVE {resp.status_code}"}
+        except Exception as e:
+            self.logger.error(f"update_pool({poolid}): {e}")
+            return {"success": False, "error": str(e)}
+
+    def delete_pool(self, poolid):
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Not connected"}
+        try:
+            host = self.host
+            base = f"https://{host}:{self.api_port}/api2/json/pools/{poolid}"
+            # (#555 follow-up) - PVE refuses to delete a non-empty pool
+            # ("pool 'X' is not empty (contains VM ...)") and the API surfaced that as a
+            # bare 'PVE 500'. Un-pool any members first (the VMs themselves are untouched),
+            # so deleting a pool works the way operators expect.
+            try:
+                members = (self.get_pool_members(poolid) or {}).get("members", []) or []
+                member_ids = [str(m.get("vmid")) for m in members if m.get("vmid") is not None]
+                if member_ids:
+                    self._api_put(base, data={"vms": ",".join(member_ids), "delete": 1})
+            except Exception as e:
+                self.logger.warning(f"delete_pool({poolid}): member cleanup failed: {e}")
+            resp = self._api_delete(base)
+            if resp.status_code == 200:
+                return {"success": True}
+            return {"success": False, "error": f"PVE {resp.status_code}: {(resp.text or '').strip()[:200]}"}
+        except Exception as e:
+            self.logger.error(f"delete_pool({poolid}): {e}")
+            return {"success": False, "error": str(e)}
+
+    def add_disk(self, node: str, vmid: int, vm_type: str, disk_config: Dict) -> Dict[str, Any]:
+        """Add a new disk to VM or container
+
+        This was a pain to get right - Proxmox disk strings are weird
+        Added bus type detection for iothread/ssd support
+        Fixed to use PUT instead of POST for config updates
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            storage = disk_config.get("storage", "local-lvm")
+            size = str(disk_config.get("size", "32")).replace("G", "").replace("g", "")
+            disk_id = disk_config.get("disk_id", "scsi1")
+
+            # Determine bus type from disk_id (e.g., "scsi0" -> "scsi")
+            bus_type = "".join(c for c in disk_id if c.isalpha())
+            # Iothread only works with virtio-scsi controller
+            supports_iothread = bus_type in ["scsi", "virtio"]
+            # Ssd emulation supported for scsi, virtio, sata (NOT ide - tried it, breaks)
+            supports_ssd = bus_type in ["scsi", "virtio", "sata"]
+
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+
+                # Build disk string - format is storage:size (size in GB without unit)
+                disk_str = f"{storage}:{size}"
+
+                # Pass through explicit disk format. PVE 9.1 added
+                # qcow2 support on LVM/LVM-thin in addition to file storages, so we
+                # let the caller pick. Block-only stores (zfs/rbd/iscsi) only accept
+                # 'raw' but PVE returns a clear error on mismatch — we don't need
+                # to guard it here.
+                disk_format = (disk_config.get("format") or "").strip().lower()
+                if disk_format and disk_format != "auto":
+                    disk_str += f",format={disk_format}"
+
+                # Add optional parameters (only if supported by bus type)
+                if disk_config.get("cache"):
+                    disk_str += f",cache={disk_config['cache']}"
+                # Only add iothread for scsi/virtio
+                if disk_config.get("iothread") and supports_iothread:
+                    disk_str += ",iothread=1"
+                # Only add ssd for scsi/virtio/sata (not ide)
+                if disk_config.get("ssd") and supports_ssd:
+                    disk_str += ",ssd=1"
+                if disk_config.get("discard"):
+                    disk_str += ",discard=on"
+                if not disk_config.get("backup"):
+                    disk_str += ",backup=0"
+
+                data = {disk_id: disk_str}
+
+            else:  # LXC
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+                # For LXC mountpoints
+                mp_str = f"{storage}:{size}"
+                if disk_config.get("mountpoint"):
+                    mp_str += f",mp={disk_config['mountpoint']}"
+                if not disk_config.get("backup"):
+                    mp_str += ",backup=0"
+
+                data = {disk_id: mp_str}
+
+            # Use PUT for config updates (not POST)
+            response = self._api_put(url, data=data)
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Added disk {disk_id} to {vm_type}/{vmid}")
+                return {"success": True, "message": f"Disk {disk_id} added"}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def remove_disk(
+        self, node: str, vmid: int, vm_type: str, disk_id: str, delete_data: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Remove disk from VM.
+        If delete_data=False: Only detach (disk becomes unused)
+        If delete_data=True: Detach AND delete the volume physically
+
+        Fixed - after detach, disk becomes 'unused0' etc., so we need to delete that
+        Now auto-cleans boot order BEFORE removing disk to prevent errors
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            # FIRST get current config and clean boot order if needed
+            config_result = self.get_vm_config(node, vmid, vm_type)
+            volume_path = None
+
+            if config_result.get("success"):
+                parsed_config = config_result.get("config", {})
+                raw_config = parsed_config.get("raw", {})
+
+                # Check if disk is in boot order and remove it BEFORE deleting the disk
+                old_boot = raw_config.get("boot", "")
+                if old_boot and disk_id in old_boot and "order=" in old_boot:
+                    try:
+                        # Parse boot order (format: order=scsi0;ide2;net0)
+                        order_part = old_boot.split("order=")[1]
+                        # Handle potential trailing options after boot order
+                        if " " in order_part:
+                            order_part = order_part.split(" ")[0]
+                        parts = [p.strip() for p in order_part.split(";") if p.strip()]
+                        new_parts = [p for p in parts if p != disk_id]
+
+                        if new_parts != parts:  # Boot order changed
+                            if new_parts:
+                                new_boot = "order=" + ";".join(new_parts)
+                            else:
+                                new_boot = "order=net0" if vm_type == "qemu" else ""
+
+                            # Update boot order BEFORE removing disk
+                            if vm_type == "qemu":
+                                boot_url = (
+                                    f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+                                )
+                            else:
+                                boot_url = (
+                                    f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+                                )
+
+                            boot_response = self._api_put(boot_url, data={"boot": new_boot})
+                            if boot_response.status_code == 200:
+                                self.logger.info(f"[DISK] Updated boot order before removing {disk_id}: {new_boot}")
+                            else:
+                                self.logger.warning(f"[DISK] Failed to update boot order: {boot_response.text}")
+                    except Exception as e:
+                        self.logger.warning(f"[DISK] Error updating boot order: {e}")
+
+                # Get volume path for delete_data
+                if delete_data:
+                    disk_config = raw_config.get(disk_id, "")
+                    self.logger.info(f"[DEBUG] delete_data=True, disk_id={disk_id}, disk_config={disk_config}")
+                    if disk_config and ":" in str(disk_config):
+                        volume_path = disk_config.split(",")[0]
+                        self.logger.info(f"[DEBUG] volume_path={volume_path}")
+
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            # Now detach the disk from VM config
+            data = {"delete": disk_id}
+            response = self._api_put(url, data=data)
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Detached disk {disk_id} from {vm_type}/{vmid}")
+
+                # If delete_data is True, find the unused slot and delete it
+                if delete_data and volume_path:
+                    try:
+                        import time
+
+                        time.sleep(2)  # Wait for Proxmox to update config (was 0.8s, increased for reliability)
+
+                        # Get updated config to find the unused slot with our volume
+                        new_config = self.get_vm_config(node, vmid, vm_type)
+                        if new_config.get("success"):
+                            # Structure is new_config['config']['raw']
+                            parsed_config = new_config.get("config", {})
+                            raw_config = parsed_config.get("raw", {})
+
+                            # Find the unused slot containing our volume
+                            unused_slot = None
+                            for key, value in raw_config.items():
+                                if key.startswith("unused") and volume_path in str(value):
+                                    unused_slot = key
+                                    self.logger.info(f"[DEBUG] Found {volume_path} in {key}={value}")
+                                    break
+
+                            if unused_slot:
+                                # Delete the unused slot - this removes the volume
+                                delete_data_req = {"delete": unused_slot}
+                                delete_response = self._api_put(url, data=delete_data_req)
+                                if delete_response.status_code == 200:
+                                    self.logger.info(f"[OK] Deleted volume via {unused_slot}")
+                                    return {"success": True, "message": f"Disk {disk_id} removed and deleted"}
+                                else:
+                                    self.logger.warning(
+                                        f"[WARN] Failed to delete {unused_slot}: {delete_response.text}"
+                                    )
+                            else:
+                                self.logger.warning(
+                                    f"[WARN] Could not find {volume_path} in unused slots. Raw config keys: {list(raw_config.keys())}"
+                                )
+                                # Volume not found in unused - try direct storage API delete
+                                storage_name = volume_path.split(":")[0] if ":" in volume_path else None
+                                if storage_name:
+                                    import urllib.parse
+
+                                    encoded_volid = urllib.parse.quote(volume_path, safe="")
+                                    delete_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/storage/{storage_name}/content/{encoded_volid}"
+                                    delete_response = self._api_delete(delete_url)
+                                    if delete_response.status_code == 200:
+                                        self.logger.info(f"[OK] Deleted volume {volume_path} via storage API")
+                                        return {"success": True, "message": f"Disk {disk_id} removed and deleted"}
+                                    else:
+                                        self.logger.warning(f"[WARN] Storage API delete failed: {delete_response.text}")
+
+                        return {"success": True, "message": f"Disk {disk_id} detached (volume may still exist)"}
+                    except Exception as del_err:
+                        self.logger.warning(f"[WARN] Could not delete volume: {del_err}")
+                        return {"success": True, "message": f"Disk {disk_id} detached (volume deletion failed)"}
+                elif delete_data and not volume_path:
+                    self.logger.warning(
+                        "[WARN] delete_data=True but volume_path is None - could not extract volume path from config"
+                    )
+
+                return {"success": True, "message": f"Disk {disk_id} detached"}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def move_disk(
+        self, node: str, vmid: int, vm_type: str, disk_id: str, target_storage: str, delete_original: bool = True
+    ) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        # Block move if disk has active efficient snapshot
+        try:
+            db = get_db()
+            existing = db.get_efficient_snapshots(self.id, vmid)
+            for snap in existing:
+                if snap["status"] in ("invalidated", "error"):
+                    continue
+                for d in snap["disks"]:
+                    if d["disk_key"] == disk_id:
+                        return {
+                            "success": False,
+                            "error": f"Disk has active efficient snapshot '{snap['snapname']}', delete it first",
+                        }
+        except Exception as e:
+            self.logger.warning(f"Could not check efficient snapshots for VM {vmid}: {e}")
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/move_disk"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/move_volume"
+
+            data = {"disk": disk_id, "storage": target_storage, "delete": 1 if delete_original else 0}
+
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                task_id = response.json().get("data")
+                self.logger.info(f"[OK] Moving disk {disk_id} to {target_storage} (Task: {task_id})")
+                return {"success": True, "message": "Disk move started", "task": task_id}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_cdrom(self, node: str, vmid: int, iso_path: str = None, drive: str = "ide2") -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+
+            # Mount ISO or eject to none
+            data = {drive: f"{iso_path},media=cdrom"} if iso_path else {drive: "none,media=cdrom"}
+
+            response = self._api_put(url, data=data)
+
+            if response.status_code == 200:
+                action = "mounted" if iso_path else "ejected"
+                self.logger.info(f"[OK] CD-ROM {action} for VM {vmid}")
+                return {"success": True, "message": f"CD-ROM {action}"}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def add_network(self, node: str, vmid: int, vm_type: str, net_config: Dict) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            net_id = net_config.get("net_id", "net1")
+
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+
+                # Build network string: model=XX:XX:XX:XX:XX:XX,bridge=vmbr0,...
+                model = net_config.get("model", "virtio")
+                parts = [model]
+
+                if net_config.get("macaddr"):
+                    parts[0] = f"{model}={net_config['macaddr']}"
+
+                if net_config.get("bridge"):
+                    parts.append(f"bridge={net_config['bridge']}")
+                if net_config.get("tag"):
+                    parts.append(f"tag={net_config['tag']}")
+                if net_config.get("firewall"):
+                    parts.append("firewall=1")
+                if net_config.get("rate"):
+                    parts.append(f"rate={net_config['rate']}")
+                if net_config.get("queues"):
+                    parts.append(f"queues={net_config['queues']}")
+                if net_config.get("mtu"):
+                    parts.append(f"mtu={net_config['mtu']}")
+
+                net_str = ",".join(parts)
+
+            else:  # LXC
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+                parts = []
+                if net_config.get("name"):
+                    parts.append(f"name={net_config['name']}")
+                if net_config.get("bridge"):
+                    parts.append(f"bridge={net_config['bridge']}")
+                if net_config.get("hwaddr"):
+                    parts.append(f"hwaddr={net_config['hwaddr']}")
+                if net_config.get("ip"):
+                    parts.append(f"ip={net_config['ip']}")
+                if net_config.get("gw"):
+                    parts.append(f"gw={net_config['gw']}")
+                if net_config.get("ip6"):
+                    parts.append(f"ip6={net_config['ip6']}")
+                if net_config.get("gw6"):
+                    parts.append(f"gw6={net_config['gw6']}")
+                if net_config.get("tag"):
+                    parts.append(f"tag={net_config['tag']}")
+                if net_config.get("firewall"):
+                    parts.append("firewall=1")
+                if net_config.get("rate"):
+                    parts.append(f"rate={net_config['rate']}")
+                if net_config.get("mtu"):
+                    parts.append(f"mtu={net_config['mtu']}")
+
+                net_str = ",".join(parts)
+
+            data = {net_id: net_str}
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Added network {net_id} to {vm_type}/{vmid}")
+                return {"success": True, "message": f"Network {net_id} added"}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def update_network(self, node: str, vmid: int, vm_type: str, net_id: str, net_config: Dict) -> Dict[str, Any]:
+        """Update network configuration
+
+        Supports all Proxmox network options including:
+        - link_down (disconnect simulation)
+        - queues (multiqueue for VirtIO)
+        - rate limit, MTU, VLAN tag
+        """
+        # Same as add but uses PUT
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+
+                model = net_config.get("model", "virtio")
+                parts = [model]
+
+                if net_config.get("macaddr"):
+                    parts[0] = f"{model}={net_config['macaddr']}"
+
+                if net_config.get("bridge"):
+                    parts.append(f"bridge={net_config['bridge']}")
+                if net_config.get("tag"):
+                    parts.append(f"tag={net_config['tag']}")
+                if net_config.get("firewall"):
+                    parts.append("firewall=1")
+                if net_config.get("rate"):
+                    parts.append(f"rate={net_config['rate']}")
+                if net_config.get("queues"):
+                    parts.append(f"queues={net_config['queues']}")
+                if net_config.get("mtu"):
+                    parts.append(f"mtu={net_config['mtu']}")
+                # Link_down=1 simulates unplugged cable
+                if net_config.get("link_down"):
+                    parts.append("link_down=1")
+
+                net_str = ",".join(parts)
+
+            else:  # LXC
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+                parts = []
+                if net_config.get("name"):
+                    parts.append(f"name={net_config['name']}")
+                if net_config.get("bridge"):
+                    parts.append(f"bridge={net_config['bridge']}")
+                if net_config.get("hwaddr"):
+                    parts.append(f"hwaddr={net_config['hwaddr']}")
+                if net_config.get("ip"):
+                    parts.append(f"ip={net_config['ip']}")
+                if net_config.get("gw"):
+                    parts.append(f"gw={net_config['gw']}")
+                if net_config.get("ip6"):
+                    parts.append(f"ip6={net_config['ip6']}")
+                if net_config.get("gw6"):
+                    parts.append(f"gw6={net_config['gw6']}")
+                if net_config.get("tag"):
+                    parts.append(f"tag={net_config['tag']}")
+                if net_config.get("firewall"):
+                    parts.append("firewall=1")
+                if net_config.get("rate"):
+                    parts.append(f"rate={net_config['rate']}")
+                if net_config.get("mtu"):
+                    parts.append(f"mtu={net_config['mtu']}")
+
+                net_str = ",".join(parts)
+
+            data = {net_id: net_str}
+            response = self._api_put(url, data=data)
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Updated network {net_id} on {vm_type}/{vmid}")
+                return {"success": True, "message": f"Network {net_id} updated"}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def remove_network(self, node: str, vmid: int, vm_type: str, net_id: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            if vm_type == "qemu":
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            else:
+                url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+
+            data = {"delete": net_id}
+            response = self._api_put(url, data=data)
+
+            if response.status_code == 200:
+                self.logger.info(f"[OK] Removed network {net_id} from {vm_type}/{vmid}")
+                return {"success": True, "message": f"Network {net_id} removed"}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def toggle_network_link(self, node: str, vmid: int, net_id: str, link_down: bool) -> Dict[str, Any]:
+        """Toggle network link_down state (cable unplug simulation)
+
+        This is hot-pluggable on QEMU - no VM restart needed!
+        Useful for testing failover scenarios or isolating VMs temporarily.
+
+        The trick is to get the current net config, then modify just the link_down part
+        while keeping everything else (bridge, mac, model, etc.) intact.
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+
+            # First get current network config
+            config_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            config_response = self._api_get(config_url)
+
+            if config_response.status_code != 200:
+                return {"success": False, "error": "Could not get VM config"}
+
+            vm_config = config_response.json().get("data", {})
+            current_net = vm_config.get(net_id, "")
+
+            if not current_net:
+                return {"success": False, "error": f"Network {net_id} not found"}
+
+            # Parse current network string (e.g. "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1")
+            # and modify link_down parameter
+            parts = current_net.split(",")
+            new_parts = []
+            found_link_down = False
+
+            for part in parts:
+                if part.startswith("link_down="):
+                    found_link_down = True
+                    if link_down:
+                        new_parts.append("link_down=1")
+                    # If link_down=False, we just don't add it (remove from config)
+                else:
+                    new_parts.append(part)
+
+            # Add link_down=1 if not found and we want it
+            if link_down and not found_link_down:
+                new_parts.append("link_down=1")
+
+            new_net_config = ",".join(new_parts)
+
+            # Update the network config
+            update_url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+            response = self._api_put(update_url, data={net_id: new_net_config})
+
+            if response.status_code == 200:
+                action = "disconnected" if link_down else "connected"
+                self.logger.info(f"[OK] Network {net_id} {action} on QEMU/{vmid}")
+                return {"success": True, "message": f"Network {net_id} {action}"}
+            else:
+                return {"success": False, "error": response.text}
+
+        except Exception as e:
+            self.logger.error(f"[ERROR] Toggle network link failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    # PVE 9.2 added /cluster/cpu-models for admin-defined custom
+    # CPU profiles (see manager.cluster.cpu-models in pve-manager 9.2). We try
+    # to fetch + append on connect; on older clusters the endpoint 404s and
+    # the static list is returned unchanged.
+    _STATIC_CPU_TYPES = [
+        "host",
+        "kvm64",
+        "kvm32",
+        "qemu64",
+        "qemu32",
+        "max",
+        "x86-64-v2",
+        "x86-64-v2-AES",
+        "x86-64-v3",
+        "x86-64-v4",
+        "Broadwell",
+        "Broadwell-IBRS",
+        "Broadwell-noTSX",
+        "Broadwell-noTSX-IBRS",
+        "Cascadelake-Server",
+        "Cascadelake-Server-noTSX",
+        "Cascadelake-Server-v2",
+        "Conroe",
+        "Cooperlake",
+        "Cooperlake-v2",
+        "EPYC",
+        "EPYC-IBPB",
+        "EPYC-Milan",
+        "EPYC-Rome",
+        "EPYC-v3",
+        "Haswell",
+        "Haswell-IBRS",
+        "Haswell-noTSX",
+        "Haswell-noTSX-IBRS",
+        "Icelake-Client",
+        "Icelake-Client-noTSX",
+        "Icelake-Server",
+        "Icelake-Server-noTSX",
+        "IvyBridge",
+        "IvyBridge-IBRS",
+        "Nehalem",
+        "Nehalem-IBRS",
+        "Opteron_G1",
+        "Opteron_G2",
+        "Opteron_G3",
+        "Opteron_G4",
+        "Opteron_G5",
+        "Penryn",
+        "SandyBridge",
+        "SandyBridge-IBRS",
+        "SapphireRapids",
+        "Skylake-Client",
+        "Skylake-Client-IBRS",
+        "Skylake-Server",
+        "Skylake-Server-IBRS",
+        "Skylake-Server-noTSX-IBRS",
+        "Westmere",
+        "Westmere-IBRS",
+        "athlon",
+        "core2duo",
+        "coreduo",
+        "n270",
+        "pentium",
+        "pentium2",
+        "pentium3",
+        "phenom",
+    ]
+
+    def get_cpu_types(self) -> List[str]:
+        """Returns the list of CPU model names ProxmoxVEx offers in the VM create
+        form. Strategy:
+          1) Live fetch from /nodes/{n}/capabilities/qemu/cpu on the first
+             reachable online node. This endpoint has existed since PVE 7.x
+             and is architecture-aware (the node's host arch restricts what
+             shows up — e.g. EPYC entries only on AMD nodes). Returns rows
+             with {name, vendor, custom} — we keep names verbatim, including
+             custom-* models the admin defined.
+          2) Fall back to the static 61-entry list on any error or when no
+             node is reachable. Same shape that ProxmoxVEx has been returning
+             since forever, so callers don't see breakage.
+
+        Was hardcoded to the static list; replaced with the live
+        endpoint after we confirmed via live probe on PVE 9.2.2 that
+        /cluster/cpu-models (the supposed 9.2 endpoint per the early research)
+        does not exist. The per-node capabilities endpoint is the right place.
+
+        2026-05-30 - output is sorted now: `host` first, then `max`, then
+        alphabetical (case-insensitive). PVE returns the raw enum order which
+        starts host/kvm64/kvm32/qemu64/… and feels arbitrary once vendor models
+        get mixed in. Keeping host pinned at the top because that's the default
+        we set on every new VM and operators expect to find it first.
+        """
+        live = self._fetch_pve_cpu_types()
+        return self._sort_cpu_types(live if live else list(self._STATIC_CPU_TYPES))
+
+    @staticmethod
+    def _sort_cpu_types(types):
+        """host first, max second, the rest alphabetical (case-insensitive)."""
+        if not types:
+            return []
+        # dedupe preserving first occurrence (live + custom can repeat)
+        seen, ordered = set(), []
+        for t in types:
+            if t and t not in seen:
+                seen.add(t)
+                ordered.append(t)
+        head = []
+        rest = []
+        for t in ordered:
+            if t == "host":
+                head.insert(0, t)
+            elif t == "max":
+                head.append(t) if "host" in head else head.insert(0, t)
+            else:
+                rest.append(t)
+        # 'host' always first if present; 'max' next if present
+        head_sorted = []
+        if "host" in head:
+            head_sorted.append("host")
+        if "max" in head:
+            head_sorted.append("max")
+        rest.sort(key=str.casefold)
+        return head_sorted + rest
+
+    def _fetch_pve_cpu_types(self) -> List[str]:
+        """GET /nodes/{n}/capabilities/qemu/cpu on the first online node. Returns
+        a list of name strings (PVE shape: [{name, vendor, custom}, ...]).
+        Empty list on error so the caller falls back to the static list."""
+        try:
+            nodes_url = f"https://{self.host}:{self.api_port}/api2/json/nodes"
+            nresp = self._create_session().get(nodes_url, timeout=self.per_node_timeout)
+            if nresp.status_code != 200:
+                return []
+            nodes = nresp.json().get("data") or []
+            online = next(
+                (
+                    n.get("node")
+                    for n in nodes
+                    if n.get("node") and n.get("status") == "online" and not self._is_node_blocked(n.get("node"))[0]
+                ),
+                None,
+            )
+            if not online:
+                return []
+            cpu_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{online}/capabilities/qemu/cpu"
+            r = self._create_session().get(cpu_url, timeout=self.per_node_timeout)
+            if r.status_code != 200:
+                return []
+            data = r.json().get("data") or []
+            # Dedupe + keep PVE's order (which is sensible: x86-64-v2 first, then
+            # named profiles, then custom-* last). Empty names skipped defensively.
+            seen = set()
+            out = []
+            for entry in data:
+                name = entry.get("name") or ""
+                if name and name not in seen:
+                    seen.add(name)
+                    out.append(name)
+            return out
+        except Exception as e:
+            self.logger.debug(f"[CPU] live fetch failed ({e}) — falling back to static list")
+            return []
+
+    # PVE version tuple cache. Used by feature-gates that decide
+    # whether to send 9.2+ -only fields. Cached on the manager instance; the
+    # cluster gets reconnected if the version changes anyway.
+    def get_pve_version_tuple(self):
+        """Returns (major, minor) tuple from /api2/json/version, e.g. (9, 2). None on error."""
+        cached = getattr(self, "_pve_version_cache", None)
+        if cached is not None:
+            return cached
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/version"
+            resp = self._create_session().get(url, timeout=5)
+            if resp.status_code != 200:
+                self._pve_version_cache = None
+                return None
+            data = resp.json().get("data") or {}
+            ver = str(data.get("release") or data.get("version") or "")
+            # release shapes: "9.2-1", "9.2.0", "9.1-13"
+            import re
+
+            m = re.match(r"(\d+)[.\-](\d+)", ver)
+            if not m:
+                self._pve_version_cache = None
+                return None
+            tup = (int(m.group(1)), int(m.group(2)))
+            self._pve_version_cache = tup
+            return tup
+        except Exception:
+            self._pve_version_cache = None
+            return None
+
+    def get_scsi_controllers(self) -> List[Dict]:
+
+        return [
+            {"value": "virtio-scsi-pci", "label": "VirtIO SCSI"},
+            {"value": "virtio-scsi-single", "label": "VirtIO SCSI Single"},
+            {"value": "lsi", "label": "LSI 53C895A"},
+            {"value": "lsi53c810", "label": "LSI 53C810"},
+            {"value": "megasas", "label": "MegaRAID SAS 8708EM2"},
+            {"value": "pvscsi", "label": "VMware PVSCSI"},
+        ]
+
+    def get_network_models(self) -> List[Dict]:
+
+        return [
+            {"value": "virtio", "label": "VirtIO (paravirtualized)"},
+            {"value": "e1000", "label": "Intel E1000"},
+            {"value": "e1000e", "label": "Intel E1000E"},
+            {"value": "vmxnet3", "label": "VMware vmxnet3"},
+            {"value": "rtl8139", "label": "Realtek RTL8139"},
+            {"value": "ne2k_pci", "label": "NE2000 PCI"},
+            {"value": "pcnet", "label": "AMD PCnet"},
+        ]
+
+    def get_disk_bus_types(self) -> List[Dict]:
+
+        return [
+            {"value": "scsi", "label": "SCSI", "max": 30},
+            {"value": "virtio", "label": "VirtIO Block", "max": 15},
+            {"value": "sata", "label": "SATA", "max": 5},
+            {"value": "ide", "label": "IDE", "max": 3},
+        ]
+
+    def get_cache_modes(self) -> List[Dict]:
+
+        return [
+            {"value": "", "label": "Default (No cache)"},
+            {"value": "none", "label": "No cache"},
+            {"value": "writethrough", "label": "Write through"},
+            {"value": "writeback", "label": "Write back"},
+            {"value": "unsafe", "label": "Write back (unsafe)"},
+            {"value": "directsync", "label": "Direct sync"},
+        ]
+
+    def get_machine_types(self) -> List[Dict]:
+        """Get available QEMU machine types
+
+        Q35 is recommended for modern systems (PCIe native)
+        i440fx is the legacy fallback for older guests
+        Updated Jun 2026 — added QEMU 11 (pve-qemu-kvm 11.0) types, newest on top
+        """
+        return [
+            {"value": "", "label": "Default"},
+            # q35 versions (modern, PCIe native)
+            {"value": "q35", "label": "q35 (Latest)"},
+            {"value": "pc-q35-11.0+pve1", "label": "q35 11.0+pve1"},
+            {"value": "pc-q35-11.0", "label": "q35 11.0"},
+            {"value": "pc-q35-10.1", "label": "q35 10.1"},
+            {"value": "pc-q35-10.0+pve1", "label": "q35 10.0+pve1"},
+            {"value": "pc-q35-10.0", "label": "q35 10.0"},
+            {"value": "pc-q35-9.2+pve1", "label": "q35 9.2+pve1"},
+            {"value": "pc-q35-9.2", "label": "q35 9.2"},
+            {"value": "pc-q35-9.1", "label": "q35 9.1"},
+            {"value": "pc-q35-9.0", "label": "q35 9.0"},
+            {"value": "pc-q35-8.2", "label": "q35 8.2"},
+            {"value": "pc-q35-8.1", "label": "q35 8.1"},
+            {"value": "pc-q35-8.0", "label": "q35 8.0"},
+            {"value": "pc-q35-7.2", "label": "q35 7.2"},
+            {"value": "pc-q35-7.1", "label": "q35 7.1"},
+            {"value": "pc-q35-7.0", "label": "q35 7.0"},
+            {"value": "pc-q35-6.2", "label": "q35 6.2"},
+            {"value": "pc-q35-6.1", "label": "q35 6.1"},
+            {"value": "pc-q35-6.0", "label": "q35 6.0"},
+            {"value": "pc-q35-5.2", "label": "q35 5.2"},
+            {"value": "pc-q35-5.1", "label": "q35 5.1"},
+            {"value": "pc-q35-5.0", "label": "q35 5.0"},
+            {"value": "pc-q35-4.2", "label": "q35 4.2"},
+            {"value": "pc-q35-4.1", "label": "q35 4.1"},
+            {"value": "pc-q35-4.0", "label": "q35 4.0"},
+            {"value": "pc-q35-3.1", "label": "q35 3.1"},
+            {"value": "pc-q35-3.0", "label": "q35 3.0"},
+            {"value": "pc-q35-2.12", "label": "q35 2.12"},
+            {"value": "pc-q35-2.11", "label": "q35 2.11"},
+            {"value": "pc-q35-2.10", "label": "q35 2.10"},
+            # i440fx versions (legacy PCI)
+            {"value": "i440fx", "label": "i440fx (Latest)"},
+            {"value": "pc-i440fx-11.0+pve1", "label": "i440fx 11.0+pve1"},
+            {"value": "pc-i440fx-11.0", "label": "i440fx 11.0"},
+            {"value": "pc-i440fx-10.1", "label": "i440fx 10.1"},
+            {"value": "pc-i440fx-10.0+pve1", "label": "i440fx 10.0+pve1"},
+            {"value": "pc-i440fx-10.0", "label": "i440fx 10.0"},
+            {"value": "pc-i440fx-9.2+pve1", "label": "i440fx 9.2+pve1"},
+            {"value": "pc-i440fx-9.2", "label": "i440fx 9.2"},
+            {"value": "pc-i440fx-9.1", "label": "i440fx 9.1"},
+            {"value": "pc-i440fx-9.0", "label": "i440fx 9.0"},
+            {"value": "pc-i440fx-8.2", "label": "i440fx 8.2"},
+            {"value": "pc-i440fx-8.1", "label": "i440fx 8.1"},
+            {"value": "pc-i440fx-8.0", "label": "i440fx 8.0"},
+            {"value": "pc-i440fx-7.2", "label": "i440fx 7.2"},
+            {"value": "pc-i440fx-7.1", "label": "i440fx 7.1"},
+            {"value": "pc-i440fx-7.0", "label": "i440fx 7.0"},
+            {"value": "pc-i440fx-6.2", "label": "i440fx 6.2"},
+            {"value": "pc-i440fx-6.1", "label": "i440fx 6.1"},
+            {"value": "pc-i440fx-6.0", "label": "i440fx 6.0"},
+            {"value": "pc-i440fx-5.2", "label": "i440fx 5.2"},
+            {"value": "pc-i440fx-5.1", "label": "i440fx 5.1"},
+            {"value": "pc-i440fx-5.0", "label": "i440fx 5.0"},
+            {"value": "pc-i440fx-4.2", "label": "i440fx 4.2"},
+            {"value": "pc-i440fx-4.1", "label": "i440fx 4.1"},
+            {"value": "pc-i440fx-4.0", "label": "i440fx 4.0"},
+            {"value": "pc-i440fx-3.1", "label": "i440fx 3.1"},
+            {"value": "pc-i440fx-3.0", "label": "i440fx 3.0"},
+            {"value": "pc-i440fx-2.12", "label": "i440fx 2.12"},
+            {"value": "pc-i440fx-2.11", "label": "i440fx 2.11"},
+            {"value": "pc-i440fx-2.10", "label": "i440fx 2.10"},
+        ]
+
+    # ==================== NODE MANAGEMENT METHODS ====================
+
+    def get_node_summary(self, node: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {}
+
+        try:
+            # Get node status
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/status"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                data = response.json().get("data", {})
+
+                # Get PVE version
+                version_url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/version"
+                version_response = self._create_session().get(version_url, timeout=15)
+                version_data = {}
+                if version_response.status_code == 200:
+                    version_data = version_response.json().get("data", {})
+
+                return {
+                    "node": node,
+                    "status": "online",
+                    "uptime": data.get("uptime", 0),
+                    "cpu": data.get("cpu", 0),
+                    "cpuinfo": data.get("cpuinfo", {}),
+                    "memory": {
+                        "total": data.get("memory", {}).get("total", 0),
+                        "used": data.get("memory", {}).get("used", 0),
+                        "free": data.get("memory", {}).get("free", 0),
+                    },
+                    "swap": {
+                        "total": data.get("swap", {}).get("total", 0),
+                        "used": data.get("swap", {}).get("used", 0),
+                        "free": data.get("swap", {}).get("free", 0),
+                    },
+                    "rootfs": {
+                        "total": data.get("rootfs", {}).get("total", 0),
+                        "used": data.get("rootfs", {}).get("used", 0),
+                        "free": data.get("rootfs", {}).get("free", 0),
+                    },
+                    "loadavg": data.get("loadavg", [0, 0, 0]),
+                    "kversion": data.get("kversion", ""),
+                    "pveversion": version_data.get("version", ""),
+                    # Apr 2026: normalize ksm so the Summary card can always show a number.
+                    # PVE returns {shared: N} (bytes). When pressure is low, shared=0 -- still
+                    # useful to surface so users know KSM is configured.
+                    "ksm": {"shared": int((data.get("ksm") or {}).get("shared") or 0)},
+                    "maintenance_mode": node in self.nodes_in_maintenance,
+                }
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error getting node summary: {e}")
+            return {}
+
+    def get_node_rrddata(self, node: str, timeframe: str = "hour") -> Dict[str, Any]:
+        """Get node performance metrics (RRD data) for charts"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect to Proxmox"}
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/rrddata"
+
+            response = self._create_session().get(url, params={"timeframe": timeframe})
+
+            if response.status_code == 200:
+                rrd_data = response.json().get("data", [])
+
+                # Process and format the data for charts
+                formatted_data: Dict[str, Any] = {
+                    "timeframe": timeframe,
+                    "node": node,
+                    "metrics": {
+                        "cpu": [],
+                        "memory": [],
+                        "swap": [],
+                        "iowait": [],
+                        "loadavg": [],
+                        "net_in": [],
+                        "net_out": [],
+                        "rootfs": [],
+                    },
+                    "timestamps": [],
+                }
+
+                # Check for pressure stall data (PSI)
+                pressure_keys = [
+                    "pressurecpusome",
+                    "pressurecpufull",
+                    "pressurememorysome",
+                    "pressurememoryfull",
+                    "pressureiosome",
+                    "pressureiofull",
+                ]
+                active_pressure_keys = []
+
+                # Check first valid point to determine available metrics
+                if rrd_data:
+                    first_point = next((p for p in rrd_data if p), None)
+                    if first_point:
+                        for k in pressure_keys:
+                            if k in first_point:
+                                active_pressure_keys.append(k)
+                                formatted_data["metrics"][k] = []
+
+                for point in rrd_data:
+                    if not point:
+                        continue
+
+                    timestamp = point.get("time", 0)
+                    formatted_data["timestamps"].append(timestamp)
+
+                    # CPU usage (0-1 -> 0-100%)
+                    cpu = point.get("cpu", 0)
+                    formatted_data["metrics"]["cpu"].append(round((cpu or 0) * 100, 2))
+
+                    # IO Wait
+                    iowait = point.get("iowait", 0)
+                    formatted_data["metrics"]["iowait"].append(round((iowait or 0) * 100, 2))
+
+                    # Memory usage
+                    memused = point.get("memused", 0)
+                    memtotal = point.get("memtotal", 1)
+                    mem_percent = ((memused or 0) / (memtotal or 1)) * 100
+                    formatted_data["metrics"]["memory"].append(round(mem_percent, 2))
+
+                    # Swap usage
+                    swapused = point.get("swapused", 0)
+                    swaptotal = point.get("swaptotal", 1)
+                    swap_percent = (swapused or 0) / swaptotal * 100 if swaptotal and swaptotal > 0 else 0
+                    formatted_data["metrics"]["swap"].append(round(swap_percent, 2))
+
+                    # Load average
+                    loadavg = point.get("loadavg", 0)
+                    formatted_data["metrics"]["loadavg"].append(round(loadavg or 0, 2))
+
+                    # Network I/O (bytes/s)
+                    netin = point.get("netin", 0)
+                    netout = point.get("netout", 0)
+                    formatted_data["metrics"]["net_in"].append(round((netin or 0) / 1024, 2))  # KB/s
+                    formatted_data["metrics"]["net_out"].append(round((netout or 0) / 1024, 2))  # KB/s
+
+                    # Root FS usage
+                    rootused = point.get("rootused", 0)
+                    roottotal = point.get("roottotal", 1)
+                    rootfs_percent = (rootused or 0) / roottotal * 100 if roottotal and roottotal > 0 else 0
+                    formatted_data["metrics"]["rootfs"].append(round(rootfs_percent, 2))
+
+                    # Pressure Stall (PSI)
+                    for k in active_pressure_keys:
+                        formatted_data["metrics"][k].append(point.get(k, 0) or 0)
+
+                return formatted_data
+            return {"error": "Failed to get RRD data"}
+        except Exception as e:
+            self.logger.error(f"Error getting node RRD data: {e}")
+            return {"error": str(e)}
+
+    def get_node_network_config(self, node: str) -> List[Dict]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting network config: {e}")
+            return []
+
+    def update_node_network(self, node: str, iface: str, config: Dict) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network/{iface}"
+            response = self._api_put(url, data=config)
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Network updated"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def create_node_network(self, node: str, iface: str, iface_type: str, config: Dict) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network"
+            data = {"iface": iface, "type": iface_type, **config}
+            # Remove empty values
+            data = {k: v for k, v in data.items() if v is not None and v != ""}
+
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "message": f"Interface {iface} created"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def delete_node_network(self, node: str, iface: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network/{iface}"
+            response = self._api_delete(url)
+
+            if response.status_code == 200:
+                return {"success": True, "message": f"Interface {iface} deleted"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def apply_node_network(self, node: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network"
+            response = self._create_session().put(url, timeout=15)
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Network changes applied"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def revert_node_network(self, node: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/network"
+            response = self._api_delete(url)
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Network changes reverted"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_dns(self, node: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/dns"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", {})
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error getting DNS config: {e}")
+            return {}
+
+    def update_node_dns(self, node: str, dns_config: Dict) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/dns"
+            response = self._api_put(url, data=dns_config)
+
+            if response.status_code == 200:
+                return {"success": True, "message": "DNS updated"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_hosts(self, node: str) -> str:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return ""
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/hosts"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", {}).get("data", "")
+            return ""
+        except Exception as e:
+            self.logger.error(f"Error getting hosts: {e}")
+            return ""
+
+    def update_node_hosts(self, node: str, hosts_content: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/hosts"
+            response = self._api_post(url, data={"data": hosts_content})
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Hosts updated"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_time(self, node: str) -> Dict[str, Any]:
+
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/time"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", {})
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error getting time: {e}")
+            return {}
+
+    def update_node_time(self, node: str, timezone: str) -> Dict[str, Any]:
+        """Update node timezone"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/time"
+            response = self._api_put(url, data={"timezone": timezone})
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Timezone updated"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_syslog(self, node: str, start: int = 0, limit: int = 500, since: int = 0) -> List[str]:
+        """Get node system log - returns newest entries first"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/syslog"
+            params = {"limit": limit}
+            if since:
+                params["since"] = since
+            response = self._create_session().get(url, params=params)
+
+            if response.status_code == 200:
+                data = response.json().get("data", [])
+                # Reverse to get newest first, then return
+                lines = [line.get("t", "") for line in data]
+                return list(reversed(lines))
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting syslog: {e}")
+            return []
+
+    def get_node_certificates(self, node: str) -> List[Dict]:
+        """Get node certificates"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/certificates/info"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting certificates: {e}")
+            return []
+
+    def renew_node_certificate(self, node: str, force: bool = False) -> Dict[str, Any]:
+        """Renew node certificate using ACME"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/certificates/acme/certificate"
+            data = {"force": 1} if force else {}
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "task": response.json().get("data")}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def upload_node_certificate(
+        self, node: str, certificates: str, key: str, restart: bool = True, force: bool = False
+    ) -> Dict[str, Any]:
+        """Upload custom certificate to node"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/certificates/custom"
+            data = {
+                "certificates": certificates,
+                "key": key,
+                "restart": 1 if restart else 0,
+                "force": 1 if force else 0,
+            }
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Certificate uploaded successfully"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def delete_node_certificate(self, node: str, restart: bool = True) -> Dict[str, Any]:
+        """Delete custom certificate from node (reverts to self-signed)"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/certificates/custom"
+            params = {"restart": 1 if restart else 0}
+            response = self._create_session().delete(url, params=params)
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Certificate deleted"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_disks(self, node: str) -> List[Dict]:
+        """Get physical disks on node"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/list"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting disks: {e}")
+            return []
+
+    def get_node_disk_smart(self, node: str, disk: str) -> Dict[str, Any]:
+        """Get SMART data for a disk"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/smart"
+            response = self._create_session().get(url, params={"disk": disk})
+
+            if response.status_code == 200:
+                return response.json().get("data", {})
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error getting SMART data: {e}")
+            return {}
+
+    def get_node_lvm(self, node: str) -> List[Dict]:
+        """Get LVM volume groups"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/lvm"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting LVM: {e}")
+            return []
+
+    def create_node_lvm(self, node: str, device: str, name: str, add_storage: bool = True) -> Dict[str, Any]:
+        """Create LVM volume group"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/lvm"
+            data = {"device": device, "name": name, "add_storage": 1 if add_storage else 0}
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "task": response.json().get("data")}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_sensors(self, node: str) -> Dict[str, Any]:
+        # Bare-metal sensors via `sensors -j` (lm-sensors JSON).
+        # Returns a flattened list of measurements:
+        #   [{chip, label, kind: 'temp'|'fan'|'volt', value, max, crit, alarm}]
+        # On VMs / hosts without lm-sensors installed the command fails or
+        # returns empty — surfaces as graceful empty list.
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"error": "cluster not connected"}
+        ip = self._get_node_ip(node)
+        if not ip:
+            return {"error": f"no SSH-reachable IP for node {node}"}
+        user = getattr(self.config, "ssh_user", None) or "root"
+
+        raw = self._ssh_run_command_output(ip, user, "sensors -j 2>/dev/null", timeout=8)
+        if not raw or not raw.strip():
+            # Surface missing/unparseable sensors as "unavailable" so the UI
+            # gets a 200, not a 502, while the metrics collector still backs off.
+            return {
+                "sensors": [],
+                "count": 0,
+                "unavailable": "sensors command unavailable or empty (lm-sensors not installed?)",
+            }
+
+        import json as _json
+
+        try:
+            data = _json.loads(raw)
+        except Exception as e:
+            return {"sensors": [], "count": 0, "unavailable": f"sensors JSON parse failed: {e}"}
+
+        # Flatten the {chip: {sensor: {temp1_input: X, ...}}} structure.
+        # lm-sensors keys follow `tempN_input`, `tempN_max`, `tempN_crit`, `tempN_alarm`
+        # plus `fanN_input` and `inN_input` (voltage).
+        out = []
+        for chip, blob in (data or {}).items():
+            if not isinstance(blob, dict):
+                continue
+            for label, sub in blob.items():
+                if label == "Adapter" or not isinstance(sub, dict):
+                    continue
+                # find the *_input key + its siblings
+                input_key = None
+                for k in sub:
+                    if k.endswith("_input"):
+                        input_key = k
+                        break
+                if not input_key:
+                    continue
+                prefix = input_key.rsplit("_", 1)[0]  # "temp1", "fan1", "in0"
+                kind = (
+                    "temp"
+                    if prefix.startswith("temp")
+                    else ("fan" if prefix.startswith("fan") else ("volt" if prefix.startswith("in") else "other"))
+                )
+                value = sub.get(input_key)
+                row = {
+                    "chip": chip,
+                    "label": label,
+                    "kind": kind,
+                    "value": value,
+                    "max": sub.get(f"{prefix}_max"),
+                    "crit": sub.get(f"{prefix}_crit"),
+                    "alarm": bool(sub.get(f"{prefix}_alarm") or 0),
+                }
+                out.append(row)
+        return {"sensors": out, "count": len(out)}
+
+    def get_cached_node_temp(self, node: str, max_age: float = 900):
+        """#601 — last cached hottest-sensor temperature (°C) for a node, or None if
+        missing/stale. Populated by the 5-min metrics collector (see background/
+        metrics.py); read by the alert loop so temperature alerts never SSH per-tick."""
+        import time as _t
+
+        with self._node_temp_lock:
+            ent = self._node_temp_cache.get(node)
+        if not ent:
+            return None
+        if max_age and (_t.time() - ent.get("ts", 0)) > max_age:
+            return None
+        return ent.get("temp")
+
+    def get_node_cluster_health(self, node: str) -> Dict[str, Any]:
+        # SSH-side cluster health: corosync ring status,
+        # pvecm quorum + per-service uptime. PVE's REST `/cluster/status`
+        # gives the high-level "are we quorate" answer but not ring latency,
+        # service uptime, or per-ring health. operators chasing a flapping
+        # cluster want all three on one page.
+        #
+        # 2026-05-31 (F5) - parallelised: 7 SSH calls × 8s timeout used to
+        # serialise into ~56s worst-case blocking on one gevent worker. Now
+        # all 7 run as greenlets via run_concurrent_dict; total wall-time
+        # capped at 12s (timeout below).
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"error": "cluster not connected"}
+        ip = self._get_node_ip(node)
+        if not ip:
+            return {"error": f"no SSH-reachable IP for node {node}"}
+        user = getattr(self.config, "ssh_user", None) or "root"
+
+        import shlex
+
+        from ProxmoxVEx.utils.concurrent import run_concurrent_dict
+
+        # 2026-05-31 (D1) - SERVICES is a hardcoded allow-list today but if
+        # this list ever moves into config or runtime-derivation, an attacker
+        # who can write a service-name would have RCE on the PVE node via the
+        # f-string into a shell-evaluated SSH command. shlex.quote() makes the
+        # path future-proof regardless.
+        SERVICES = ["pveproxy", "pvedaemon", "pve-cluster", "corosync", "pvestatd"]
+        tasks: Dict[str, Any] = {
+            "cfg": (lambda: self._ssh_run_command_output(ip, user, "corosync-cfgtool -s 2>&1", timeout=8)),
+            "pvecm": (lambda: self._ssh_run_command_output(ip, user, "pvecm status 2>&1", timeout=8)),
+        }
+        for svc in SERVICES:
+            # closure-bind svc explicitly — late-binding bites here otherwise
+            quoted = shlex.quote(svc)
+            tasks[f"svc:{svc}"] = lambda q=quoted: self._ssh_run_command_output(
+                ip, user, f"systemctl show -p ActiveState,SubState,ActiveEnterTimestamp,Result {q} 2>&1", timeout=8
+            )
+        results = run_concurrent_dict(tasks, timeout=12)
+
+        out: Dict[str, Any] = {"corosync": None, "pvecm": None, "services": []}
+
+        # corosync-cfgtool -s : ring status
+        cfg = results.get("cfg")
+        if cfg:
+            rings: List[Dict[str, Any]] = []
+            cur: Optional[Dict[str, Any]] = None
+            for line in cfg.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("LINK ID"):
+                    if cur:
+                        rings.append(cur)
+                    cur = {"raw": [line]}
+                    with contextlib.suppress(Exception):
+                        cur["id"] = int(line.split()[2])
+                elif cur is not None:
+                    cur["raw"].append(line)
+                    low = line.lower()
+                    if "addr" in low and "=" in line:
+                        cur["address"] = line.split("=", 1)[1].strip()
+                    elif "status" in low and "=" in line:
+                        # Corosync-cfgtool uses `key = value`, not colon
+                        cur["status"] = line.split("=", 1)[1].strip()
+                    elif "nodes" in low and "=" in line:
+                        with contextlib.suppress(Exception):
+                            cur["nodes"] = int(line.split("=", 1)[1].strip())
+            if cur:
+                rings.append(cur)
+            out["corosync"] = {"rings": rings}
+
+        # pvecm status: quorum + votes (parallel result)
+        pvecm = results.get("pvecm")
+        if pvecm:
+            info = {}
+            for line in pvecm.splitlines():
+                low = line.lower()
+                if "quorate" in low and ":" in line:
+                    info["quorate"] = line.split(":", 1)[1].strip()
+                elif "expected votes" in low and ":" in line:
+                    with contextlib.suppress(Exception):
+                        info["expected_votes"] = int(line.split(":", 1)[1].strip())
+                elif "total votes" in low and ":" in line:
+                    with contextlib.suppress(Exception):
+                        info["total_votes"] = int(line.split(":", 1)[1].strip())
+                elif "highest expected" in low and ":" in line:
+                    with contextlib.suppress(Exception):
+                        info["highest_expected"] = int(line.split(":", 1)[1].strip())
+                elif "cluster name" in low and ":" in line:
+                    info["cluster_name"] = line.split(":", 1)[1].strip()
+                elif "config version" in low and ":" in line:
+                    with contextlib.suppress(Exception):
+                        info["config_version"] = int(line.split(":", 1)[1].strip())
+                elif low.strip() == "nodes:" or "membership information" in low:
+                    pass
+            out["pvecm"] = info
+
+        # systemctl per-service state for the cluster-critical units (parallel results)
+        for svc in SERVICES:
+            out_text = results.get(f"svc:{svc}")
+            row = {"name": svc, "active": None, "sub": None, "since": None, "result": None}
+            if out_text:
+                for line in out_text.splitlines():
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        if k == "ActiveState":
+                            row["active"] = v
+                        elif k == "SubState":
+                            row["sub"] = v
+                        elif k == "ActiveEnterTimestamp":
+                            row["since"] = v
+                        elif k == "Result":
+                            row["result"] = v
+            out["services"].append(row)
+
+        # 2026-05-31 - if SSH wasn't reachable, every call returns None
+        # and we used to surface that as 5 question-mark service cards which
+        # is just visual noise. Signal it explicitly so the UI can render a
+        # single "credentials not configured" message instead.
+        out["ssh_unavailable"] = (
+            out["corosync"] is None and out["pvecm"] is None and all(s.get("active") is None for s in out["services"])
+        )
+
+        return out
+
+    def get_node_netstats(self, node: str) -> Dict[str, Any]:
+        # Per-NIC error/drop counters. PVE API has aggregate
+        # netin/netout in /rrddata but never per-NIC errors, which is the
+        # bit operators actually need when chasing a flapping uplink. We
+        # SSH'd it anyway for syslog so adding /proc/net/dev costs nothing.
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"error": "cluster not connected"}
+
+        ip = self._get_node_ip(node)
+        if not ip:
+            return {"error": f"no SSH-reachable IP for node {node}"}
+
+        user = getattr(self.config, "ssh_user", None) or "root"
+        output = self._ssh_run_command_output(ip, user, "cat /proc/net/dev", timeout=10)
+        if not output:
+            return {"error": "SSH read failed (auth, timeout, or empty)"}
+
+        # /proc/net/dev format:
+        #   Inter-|   Receive                                                |  Transmit
+        #    face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+        #     eth0:  1234  5  0  0  ...
+        ifaces = []
+        cols = [
+            "rx_bytes",
+            "rx_packets",
+            "rx_errs",
+            "rx_drop",
+            "rx_fifo",
+            "rx_frame",
+            "rx_compressed",
+            "rx_multicast",
+            "tx_bytes",
+            "tx_packets",
+            "tx_errs",
+            "tx_drop",
+            "tx_fifo",
+            "tx_colls",
+            "tx_carrier",
+            "tx_compressed",
+        ]
+        for line in output.splitlines():
+            if ":" not in line or "Inter-" in line or "face" in line[:6]:
+                continue
+            name, _, rest = line.partition(":")
+            parts = rest.split()
+            if len(parts) < 16:
+                continue
+            row: Dict[str, Any] = {"iface": name.strip()}
+            for k, v in zip(cols, parts):
+                try:
+                    row[k] = int(v)
+                except (TypeError, ValueError):
+                    row[k] = 0
+            ifaces.append(row)
+        return {"interfaces": ifaces, "count": len(ifaces)}
+
+    def get_node_cpu_cores(self, node: str) -> Dict[str, Any]:
+        """Get per-core CPU usage from /proc/stat via SSH.
+
+        Reads /proc/stat twice (0.5s apart) and computes per-core
+        utilisation from the delta.  Returns a dict with per-core
+        percentages keyed by core index ("cpu0", "cpu1", …) and an
+        "aggregate" key for the overall CPU line.
+
+        Aug 2026 – added so the UI can show a per-core CPU overlay
+        on the Performance Metrics chart.
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"error": "cluster not connected"}
+
+        ip = self._get_node_ip(node)
+        if not ip:
+            return {"error": f"no SSH-reachable IP for node {node}"}
+
+        user = getattr(self.config, "ssh_user", None) or ""
+        if not user:
+            user = (getattr(self.config, "user", "") or "root").split("@")[0]
+        ssh_key = getattr(self.config, "ssh_key", "") or ""
+        ssh_password = getattr(self.config, "pass_", "") or ""
+        ssh_port = int(getattr(self.config, "ssh_port", 22) or 22)
+
+        # Two samples 0.5s apart so we can compute delta-based usage
+        cmd = "cat /proc/stat; sleep 0.5; echo '---SPLIT---'; cat /proc/stat"
+        output = None
+        if ssh_key:
+            output = self._ssh_run_command_with_key_output(ip, user, cmd, ssh_key, timeout=15, port=ssh_port)
+        if output is None:
+            output = self._ssh_run_command_output(ip, user, cmd, timeout=15, port=ssh_port)
+        if output is None and ssh_password:
+            output = self._ssh_run_command_with_password_output(ip, user, cmd, ssh_password, timeout=15, port=ssh_port)
+        if output is None:
+            return {
+                "error": f"SSH to {node}@{ip} failed. Check cluster SSH user/key/password, ssh_port (current: {ssh_port}), and that the host is reachable."
+            }
+
+        parts = output.split("---SPLIT---")
+        if len(parts) != 2:
+            return {"error": "unexpected /proc/stat output"}
+
+        def _parse_stat(text):
+            cores = {}
+            for line in text.strip().splitlines():
+                if not line.startswith("cpu"):
+                    continue
+                tokens = line.split()
+                name = tokens[0]  # 'cpu' or 'cpu0', 'cpu1', …
+                vals = [int(t) for t in tokens[1:8]]  # user nice system idle iowait irq softirq
+                cores[name] = vals
+            return cores
+
+        s1 = _parse_stat(parts[0])
+        s2 = _parse_stat(parts[1])
+
+        result: Dict[str, Any] = {"cores": {}}
+        for name in sorted(s2.keys()):
+            if name not in s1:
+                continue
+            v1, v2 = s1[name], s2[name]
+            idle1 = v1[3] + v1[4]  # idle + iowait
+            idle2 = v2[3] + v2[4]
+            total1 = sum(v1)
+            total2 = sum(v2)
+            d_total = total2 - total1
+            d_idle = idle2 - idle1
+            usage = round((d_total - d_idle) / d_total * 100, 2) if d_total > 0 else 0.0
+            key = "aggregate" if name == "cpu" else name
+            result["cores"][key] = usage
+
+        result["core_count"] = len(result["cores"]) - (1 if "aggregate" in result["cores"] else 0)
+        return result
+
+    def get_node_lvmthin(self, node: str) -> List[Dict]:
+        """Get LVM-Thin pools"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/lvmthin"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting LVM-Thin: {e}")
+            return []
+
+    def create_node_lvmthin(self, node: str, device: str, name: str, add_storage: bool = True) -> Dict[str, Any]:
+        """Create LVM-Thin pool"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/lvmthin"
+            data = {"device": device, "name": name, "add_storage": 1 if add_storage else 0}
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "task": response.json().get("data")}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_zfs(self, node: str) -> List[Dict]:
+        """Get ZFS pools"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/zfs"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting ZFS: {e}")
+            return []
+
+    def create_node_zfs(
+        self,
+        node: str,
+        name: str,
+        devices: list,
+        raidlevel: str = "single",
+        compression: str = "on",
+        ashift: int = 12,
+        add_storage: bool = True,
+    ) -> Dict[str, Any]:
+        """create ZFS pool on node. Dec 2025: added compression + ashift support"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/zfs"
+
+            # devices must be comma-separated string for Proxmox API
+            devices_str = " ".join(devices) if isinstance(devices, list) else devices
+
+            data = {
+                "name": name,
+                "devices": devices_str,
+                "raidlevel": raidlevel,
+                "compression": compression,
+                "ashift": ashift,
+                "add_storage": 1 if add_storage else 0,
+            }
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "task": response.json().get("data")}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_directory_storage(self, node: str) -> List[Dict]:
+        """Get directory storage locations"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/directory"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting directory storage: {e}")
+            return []
+
+    def create_node_directory(
+        self, node: str, device: str, name: str, filesystem: str = "ext4", add_storage: bool = True
+    ) -> Dict[str, Any]:
+        """Create directory storage"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/directory"
+            data = {"device": device, "name": name, "filesystem": filesystem, "add_storage": 1 if add_storage else 0}
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "task": response.json().get("data")}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def init_disk_gpt(self, node: str, disk: str, uuid: str | None = None) -> Dict[str, Any]:
+        """Initialize disk with GPT partition table"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/initgpt"
+            data = {"disk": disk}
+            if uuid:
+                data["uuid"] = uuid
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "task": response.json().get("data")}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def wipe_disk(self, node: str, disk: str) -> Dict[str, Any]:
+        """Wipe disk (remove partition table)"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/disks/wipedisk"
+            response = self._api_post(url, data={"disk": disk})
+
+            if response.status_code == 200:
+                return {"success": True, "task": response.json().get("data")}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_replication(self, node: str) -> List[Dict]:
+        """Get replication jobs for node"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/replication"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting replication: {e}")
+            return []
+
+    def get_node_tasks(self, node: str, start: int = 0, limit: int = 50, errors: bool = False) -> List[Dict]:
+        """Get task history for node"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/tasks"
+            params = {"start": start, "limit": limit}
+            if errors:
+                params["errors"] = 1
+            response = self._create_session().get(url, params=params)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting tasks: {e}")
+            return []
+
+    def get_node_task_log(self, node: str, upid: str, start: int = 0, limit: int = 500) -> List[str]:
+        """Get log for a specific task"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return []
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/tasks/{upid}/log"
+            response = self._create_session().get(url, params={"start": start, "limit": limit})
+
+            if response.status_code == 200:
+                data = response.json().get("data", [])
+                return [line.get("t", "") for line in data]
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting task log: {e}")
+            return []
+
+    def get_node_subscription(self, node: str) -> Dict[str, Any]:
+        """Get node subscription status"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/subscription"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", {})
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error getting subscription: {e}")
+            return {}
+
+    def update_node_subscription(self, node: str, key: str) -> Dict[str, Any]:
+        """Update subscription key"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/subscription"
+            response = self._api_put(url, data={"key": key})
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Subscription updated"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def check_node_subscription(self, node: str, force: bool = False) -> Dict[str, Any]:
+        """Refresh node subscription status"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/subscription"
+            data = {"force": 1} if force else {}
+            response = self._api_post(url, data=data)
+
+            if response.status_code == 200:
+                return {"success": True, "data": response.json().get("data")}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def delete_node_subscription(self, node: str) -> Dict[str, Any]:
+        """Delete subscription key"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/subscription"
+            response = self._api_delete(url)
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Subscription removed"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_options(self, node: str) -> Dict[str, Any]:
+        """Get node options (from datacenter)"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {}
+
+        try:
+            # Node options are part of datacenter config for that node
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/config"
+            response = self._api_get(url)
+
+            if response.status_code == 200:
+                return response.json().get("data", {})
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error getting node options: {e}")
+            return {}
+
+    def update_node_options(self, node: str, options: Dict) -> Dict[str, Any]:
+        """Update node options"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/config"
+            response = self._api_put(url, data=options)
+
+            if response.status_code == 200:
+                return {"success": True, "message": "Options updated"}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_node_apt_updates(self, node: str) -> List[Dict]:
+        """Get available APT updates
+
+        Raises exception on failure instead of returning []
+        so the caller can distinguish 'no updates' from 'check failed'
+        """
+        if not self.is_connected and not self.connect_to_proxmox():
+            raise ConnectionError("Not connected to cluster")
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/apt/update"
+            response = self._create_session().get(url, timeout=15)
+
+            if response.status_code == 200:
+                return response.json().get("data", [])
+            # Don't silently return [] - let the caller know it failed
+            raise Exception(f"API returned {response.status_code}")
+        except ConnectionError:
+            raise
+        except Exception as e:
+            self.logger.error(f"Error getting APT updates for {node}: {e}")
+            raise
+
+    def refresh_node_apt(self, node: str) -> Dict[str, Any]:
+        """Refresh APT package database"""
+        if not self.is_connected and not self.connect_to_proxmox():
+            return {"success": False, "error": "Could not connect"}
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/nodes/{node}/apt/update"
+            response = self._create_session().post(url, timeout=15)
+
+            if response.status_code == 200:
+                return {"success": True, "task": response.json().get("data")}
+            return {"success": False, "error": response.text}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_timezones(self) -> List[str]:
+        """Get list of available timezones"""
+        return [
+            "UTC",
+            "Europe/Berlin",
+            "Europe/Vienna",
+            "Europe/Zurich",
+            "Europe/London",
+            "Europe/Paris",
+            "Europe/Amsterdam",
+            "Europe/Brussels",
+            "Europe/Rome",
+            "Europe/Madrid",
+            "Europe/Warsaw",
+            "Europe/Prague",
+            "Europe/Budapest",
+            "Europe/Stockholm",
+            "Europe/Helsinki",
+            "Europe/Athens",
+            "Europe/Moscow",
+            "America/New_York",
+            "America/Chicago",
+            "America/Denver",
+            "America/Los_Angeles",
+            "America/Toronto",
+            "America/Vancouver",
+            "America/Sao_Paulo",
+            "America/Mexico_City",
+            "Asia/Tokyo",
+            "Asia/Shanghai",
+            "Asia/Hong_Kong",
+            "Asia/Singapore",
+            "Asia/Seoul",
+            "Asia/Dubai",
+            "Asia/Kolkata",
+            "Asia/Bangkok",
+            "Asia/Jakarta",
+            "Australia/Sydney",
+            "Australia/Melbourne",
+            "Australia/Perth",
+            "Pacific/Auckland",
+            "Pacific/Fiji",
+            "Africa/Cairo",
+            "Africa/Johannesburg",
+            "Africa/Lagos",
+        ]
+
+    # ==================== END NODE MANAGEMENT METHODS ====================
+
+    def run_balance_check(self, force=False):
+        """
+        Run a single balance check iteration
+
+        This is the main loadbalancer logic - runs every check_interval seconds
+        1. Get node scores (CPU + RAM weighted)
+        2. If difference > threshold, find a VM to migrate
+        3. Move smallest suitable VM from loaded -> less loaded node
+
+        Now supports up to 3 migrations per cycle for larger clusters.
+        After each migration, scores are re-evaluated to avoid over-correcting.
+        Number of migrations scales with score difference and cluster size.
+        """
+        try:
+            self.logger.info("=" * 60)
+            self.logger.info(f"Starting balance check for cluster: {self.config.name}")
+            self.logger.info(
+                f"Settings: Migration Threshold={self.config.migration_threshold}%, Check Interval={self.config.check_interval}s, Dry Run={self.config.dry_run}"
+            )
+
+            # Get node status
+            node_status = self.get_node_status()
+            if not node_status:
+                self.logger.warning("Could not get node status")
+                return
+
+            # Log nodes in maintenance
+            maintenance_nodes = [n for n, d in node_status.items() if d.get("maintenance_mode")]
+            if maintenance_nodes:
+                self.logger.info(f"[MAINT] Nodes in maintenance: {', '.join(maintenance_nodes)}")
+
+            # Calculate max migrations per cycle based on cluster size and score diff
+            # Small clusters (2-3 nodes): max 1 migration
+            # Medium clusters (4-6 nodes): max 2 migrations
+            # Large clusters (7+ nodes): max 3 migrations
+            config_excluded = getattr(self.config, "excluded_nodes", []) or []
+            active_node_count = sum(
+                1
+                for n, d in node_status.items()
+                if d["status"] == "online" and not d.get("maintenance_mode", False) and n not in config_excluded
+            )
+
+            if active_node_count >= 7:
+                max_migrations = 3
+            elif active_node_count >= 4:
+                max_migrations = 2
+            else:
+                max_migrations = 1
+
+            self.logger.info(f"Active nodes: {active_node_count}, Max migrations per cycle: {max_migrations}")
+
+            migrations_done = 0
+            already_migrated_vmids = []  # Track migrated VMs to avoid picking same one
+
+            for migration_round in range(max_migrations):
+                # Re-fetch node status after each migration (scores changed!)
+                if migration_round > 0:
+                    self.logger.info(f"--- Re-evaluating balance (round {migration_round + 1}/{max_migrations}) ---")
+                    node_status = self.get_node_status()
+                    if not node_status:
+                        break
+
+                # Check if balancing is needed
+                needs_balance, source_node, target_node = self.check_balance_needed(node_status)
+
+                if not needs_balance:
+                    if migration_round == 0:
+                        pass  # Normal - already logged in check_balance_needed
+                    else:
+                        self.logger.info(f"[OK] Cluster balanced after {migrations_done} migration(s)")
+                    break
+
+                if not force and not self.config.auto_migrate:
+                    break
+
+                # Find migration candidate, excluding already migrated VMs
+                vm = self.find_migration_candidate(
+                    source_node, target_node, exclude_vmids=already_migrated_vmids, node_status=node_status
+                )
+
+                if vm:
+                    vmid = vm.get("vmid")
+                    vm_name = vm.get("name", "unnamed")
+
+                    if max_migrations > 1:
+                        self.logger.info(
+                            f"[{migration_round + 1}/{max_migrations}] Migrating {vm_name} (VMID {vmid}): {source_node} → {target_node}"
+                        )
+
+                    success = self.migrate_vm(vm, target_node)
+
+                    if success:
+                        migrations_done += 1
+                        already_migrated_vmids.append(vmid)
+                        self._vm_migration_cooldown[vmid] = time.time()  # Cooldown to prevent ping-pong
+                    else:
+                        self.logger.warning(f"Migration failed for {vm_name}, stopping further migrations this cycle")
+                        break
+                else:
+                    self.logger.info("No suitable VM found for migration")
+                    break
+
+            if migrations_done > 1:
+                self.logger.info(f"[SUMMARY] Completed {migrations_done} migration(s) in this cycle")
+
+            # Predictive load balancing
+            # Even if cluster looks balanced RIGHT NOW, check if any node is trending towards overload
+            predictive_on = getattr(self.config, "predictive_balancing", False)
+            if predictive_on and migrations_done == 0 and self.config.auto_migrate and not self.config.dry_run:
+                try:
+                    getattr(self.config, "predictive_threshold", 75)
+                    for nname, ndata in (node_status or {}).items():
+                        if ndata.get("status") != "online" or ndata.get("maintenance_mode"):
+                            continue
+                        ps = self._compute_predictive_score(nname)
+                        if ps["trend"] == "critical" and ps["confidence"] >= 0.6:
+                            self.logger.warning(
+                                f"[PREDICTIVE] Node {nname} trending critical (score={ps['score']}, confidence={ps['confidence']:.0%}) — triggering preemptive migration"
+                            )
+                            # find least loaded node as target
+                            scores = [
+                                (n, d["score"])
+                                for n, d in node_status.items()
+                                if d.get("status") == "online"
+                                and not d.get("maintenance_mode")
+                                and n != nname
+                                and n not in (getattr(self.config, "excluded_nodes", []) or [])
+                            ]
+                            if not scores:
+                                continue
+                            scores.sort(key=lambda x: x[1])
+                            tgt = scores[0][0]
+                            vm = self.find_migration_candidate(nname, tgt, exclude_vmids=already_migrated_vmids)
+                            if vm:
+                                self.logger.info(
+                                    f"[PREDICTIVE] Migrating {vm.get('name', '')} (VMID {vm.get('vmid')}): {nname} → {tgt}"
+                                )
+                                if self.migrate_vm(vm, tgt):
+                                    migrations_done += 1
+                                    self._vm_migration_cooldown[vm.get("vmid")] = time.time()
+                                    break  # one predictive migration per cycle max
+                except Exception as e:
+                    self.logger.error(f"[PREDICTIVE] Error: {e}")
+
+            # Proactive anti-affinity enforcement (Issue
+            # Even if cluster is balanced, fix any anti-affinity violations
+            if self.config.auto_migrate and not self.config.dry_run:
+                try:
+                    affinity_migrations = self._enforce_affinity_rules(node_status)
+                    migrations_done += affinity_migrations
+                except Exception as e:
+                    self.logger.error(f"Error in affinity enforcement: {e}")
+
+            self.last_run = datetime.now()
+            self.logger.info(f"Balance check completed at {self.last_run}")
+            self.logger.info("=" * 60)
+
+        except Exception as e:
+            self.logger.error(f"Error in balance check: {e}")
+
+    def daemon_loop(self):
+        """Main daemon loop"""
+        self.logger.info(f"ProxmoxVEx daemon started for cluster: {self.config.name}")
+
+        # Initial connection with auto-discovery
+        if not self.connect_to_proxmox():
+            self.logger.error("Initial connection failed, will retry...")
+
+        while not self.stop_event.is_set():
+            if self.config.enabled:
+                # Check connection and reconnect if needed
+                if not self._check_connection():
+                    self.logger.warning("Connection lost, attempting reconnect...")
+                    self.session = None
+                    if self.connect_to_proxmox():
+                        self.logger.info("Reconnected successfully")
+                    else:
+                        self.logger.error("Reconnect failed, will retry next cycle")
+
+                self.run_balance_check()
+            else:
+                # Even when disabled, still verify connection for UI status
+                # Just less frequently - only every 5th cycle
+                self._disabled_check_counter += 1
+
+                if self._disabled_check_counter >= 5:
+                    self._disabled_check_counter = 0
+                    if not self._check_connection():
+                        # Try to reconnect silently
+                        self.session = None
+                        self.connect_to_proxmox()
+
+                self.logger.debug("ProxmoxVEx is disabled, skipping check")
+
+            # Wait for next interval or stop signal
+            self.stop_event.wait(self.config.check_interval)
+
+        self.logger.info(f"ProxmoxVEx daemon stopped for cluster: {self.config.name}")
+
+    def _check_connection(self) -> bool:
+        """Check if connection to Proxmox is still alive"""
+        if not self.is_connected:
+            return False
+
+        try:
+            host = self.host
+            url = f"https://{host}:{self.api_port}/api2/json/version"
+            response = self._create_session().get(url, timeout=5)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    # =====================================================
+    # CVE / PACKAGE VULNERABILITY SCANNER
+    # SSH-based node security scanning
+    # =====================================================
+
+    def _ssh_node_output(self, node_name, cmd, timeout=60):
+        """Run command on a node, tries all available SSH auth methods.
+        Returns stdout string or None.
+
+        2026-04-24: For non-root SSH users (common: ProxmoxVEx@pam with NOPASSWD sudo)
+        we wrap the command via base64 → `sudo bash`. A naive `sudo {cmd}` prefix breaks
+        anything with shell redirects / heredocs: `sudo cat > /etc/foo` opens the redirect
+        in the non-privileged shell, cat gets root but the file write is done pre-sudo
+        and fails with Permission denied. The base64 path preserves the full command
+        intact and hands it to a root bash.
+        """
+        node_ip = self._get_node_ip(node_name)
+        if not node_ip:
+            return None
+
+        ssh_user = (self.config.user or "root").split("@")[0]
+        # Sudo wrap is handled inside the _ssh_run_command_* helpers so we don't
+        # double-wrap when the call chain goes through multiple layers.
+
+        ssh_key = getattr(self.config, "ssh_key", "")
+        if ssh_key:
+            out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cmd, ssh_key, timeout=timeout)
+            if out is not None:
+                return out
+
+        out = self._ssh_run_command_output(node_ip, ssh_user, cmd, timeout=timeout)
+        if out is not None:
+            return out
+
+        if self.config.pass_:
+            out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, self.config.pass_, timeout=timeout)
+            if out is not None:
+                return out
+
+        return None
+
+    def scan_node_packages(self, node_name):
+        """Scan node for CVEs and outdated packages via SSH.
+
+        Uses debsecan for real CVE-to-package mapping if available,
+        falls back to apt-get upgrade simulation otherwise.
+        """
+        # One big command block to avoid multiple SSH roundtrips
+        scan_cmd = (
+            "echo '---OS---' && cat /etc/os-release 2>/dev/null | grep -E '^(PRETTY_NAME|VERSION_ID)=' ; "
+            "echo '---KERNEL---' && uname -r ; "
+            "echo '---PVE---' && pveversion 2>/dev/null || echo 'N/A' ; "
+            "echo '---REBOOT---' && test -f /var/run/reboot-required && echo 'yes' || echo 'no' ; "
+            "echo '---DEBSECAN---' && "
+            "if test -x /usr/bin/debsecan || command -v debsecan >/dev/null 2>&1; then "
+            "  SUITE=$(lsb_release -cs 2>/dev/null || grep VERSION_CODENAME /etc/os-release 2>/dev/null | cut -d= -f2 || echo bookworm); "
+            "  RESULT=$(debsecan --suite $SUITE --only-fixed 2>/dev/null | head -500); "
+            '  if [ -z "$RESULT" ] && [ "$SUITE" = "trixie" ]; then '
+            "    RESULT=$(debsecan --suite bookworm --only-fixed 2>/dev/null | head -500); "
+            "  fi; "
+            '  if [ -z "$RESULT" ]; then '
+            "    RESULT=$(debsecan --suite $SUITE 2>/dev/null | head -500); "
+            "  fi; "
+            '  if [ -z "$RESULT" ]; then echo \'NO_RESULTS\'; else echo "$RESULT"; fi; '
+            "else echo 'NOT_INSTALLED'; fi ; "
+            "echo '---UPDATES---' && apt-get -s dist-upgrade 2>/dev/null | grep '^Inst' ; "
+            "echo '---END---'"
+        )
+
+        output = self._ssh_node_output(node_name, scan_cmd, timeout=120)
+        if not output:
+            return {"error": "SSH connection failed", "node": node_name}
+
+        result = {
+            "node": node_name,
+            "timestamp": datetime.now().isoformat(),
+            "os": "",
+            "kernel": "",
+            "pve_version": "",
+            "reboot_required": False,
+            "debsecan_available": False,
+            "cves": [],  # real CVE entries from debsecan
+            "packages": [],  # pending updates from apt
+            "cve_count": 0,
+            "security_count": 0,
+            "total_count": 0,
+        }
+
+        section = None
+        for line in output.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("---") and line.endswith("---"):
+                section = line.strip("-")
+                continue
+
+            if section == "OS":
+                if line.startswith("PRETTY_NAME="):
+                    result["os"] = line.split("=", 1)[1].strip('"')
+            elif section == "KERNEL":
+                if line and not line.startswith("---"):
+                    result["kernel"] = line
+            elif section == "PVE":
+                if line and line != "N/A":
+                    result["pve_version"] = line
+            elif section == "REBOOT":
+                result["reboot_required"] = line.strip() == "yes"
+            elif section == "DEBSECAN":
+                if line == "NOT_INSTALLED":
+                    result["debsecan_available"] = False
+                elif line.startswith("CVE-"):
+                    result["debsecan_available"] = True
+                    # default format: "CVE-2024-1234 package urgency (status info)"
+                    # e.g. "CVE-2023-31484 perl low (LTS: 5.36.0-7+deb12u2)"
+                    cve_parts = line.split()
+                    if len(cve_parts) >= 3:
+                        cve_id = cve_parts[0]
+                        pkg_name = cve_parts[1]
+                        urgency_raw = cve_parts[2].lower()
+                        # rest is status info in parens
+                        status = " ".join(cve_parts[3:]).strip("()")
+
+                        urgency = "medium"
+                        if urgency_raw in ("high", "medium**"):
+                            urgency = "high"
+                        elif urgency_raw in ("low", "unimportant"):
+                            urgency = "low"
+
+                        if not any(c["cve"] == cve_id and c["package"] == pkg_name for c in result["cves"]):
+                            result["cves"].append({
+                                "cve": cve_id,
+                                "package": pkg_name,
+                                "urgency": urgency,
+                                "status": status,
+                            })
+            elif section == "UPDATES" and line.startswith("Inst "):
+                parts = line.split(" ", 2)
+                pkg = parts[1] if len(parts) > 1 else "?"
+                rest = parts[2] if len(parts) > 2 else ""
+
+                current_ver = ""
+                new_ver = ""
+                source = ""
+                is_security = "security" in rest.lower()
+
+                if "[" in rest and "]" in rest:
+                    current_ver = rest[rest.index("[") + 1 : rest.index("]")]
+                if "(" in rest and ")" in rest:
+                    paren = rest[rest.index("(") + 1 : rest.index(")")]
+                    pp = paren.split(" ", 1)
+                    new_ver = pp[0]
+                    source = pp[1] if len(pp) > 1 else ""
+
+                severity = (
+                    "critical"
+                    if is_security
+                    and any(k in pkg for k in ("kernel", "openssl", "libssl", "openssh", "sudo", "glibc", "libc6"))
+                    else "security"
+                    if is_security
+                    else "normal"
+                )
+
+                result["packages"].append({
+                    "name": pkg,
+                    "current": current_ver,
+                    "available": new_ver,
+                    "source": source,
+                    "security": is_security,
+                    "severity": severity,
+                })
+
+        # Track CVE history + determine fix type
+        try:
+            from ProxmoxVEx.core.db import get_db
+
+            db = get_db()
+            available_updates = {p["name"] for p in result["packages"]}
+            active_cve_ids = set()
+            for cve in result["cves"]:
+                db.upsert_cve(self.id, node_name, cve["cve"], cve.get("package", ""), cve.get("urgency", "medium"))
+                active_cve_ids.add(cve["cve"])
+                first_seen = db.get_cve_first_seen(self.id, node_name, cve["cve"])
+                cve["first_seen"] = first_seen
+                # fix type heuristic
+                pkg = cve.get("package", "")
+                if pkg.startswith("pve-") or pkg.startswith("proxmox-"):
+                    cve["fix_type"] = "apt" if pkg in available_updates else "pve_upgrade"
+                else:
+                    cve["fix_type"] = "apt" if pkg in available_updates else "none"
+            db.mark_cves_resolved(self.id, node_name, active_cve_ids)
+        except Exception as e:
+            self.logger.warning(f"[CVE] History tracking error: {e}")
+
+        result["cve_count"] = len(result["cves"])
+        result["total_count"] = len(result["packages"])
+        result["security_count"] = sum(1 for p in result["packages"] if p["security"])
+        return result
+
+    # CIS hardening checks - Mar 2026
+    # each key maps to a shell snippet that returns 0 if already hardened
+    CIS_CHECKS = {
+        "fs_modules": {
+            "check": "[ -f /etc/modprobe.d/cis-disable-modules.conf ] && echo OK || echo FAIL",
+            "verbose_check": """if [ -f /etc/modprobe.d/cis-disable-modules.conf ]; then echo "file exists: $(wc -l < /etc/modprobe.d/cis-disable-modules.conf) lines"; grep -c '^blacklist\\|^install' /etc/modprobe.d/cis-disable-modules.conf | awk '{print \"blacklisted modules: \"$1}' ; else echo "file missing: /etc/modprobe.d/cis-disable-modules.conf"; fi""",
+            "apply": """cat > /etc/modprobe.d/cis-disable-modules.conf << 'MODEOF'
+# CIS 1.1.1 & 3.2: Disable unused kernel modules
+install cramfs /bin/false
+blacklist cramfs
+install freevxfs /bin/false
+blacklist freevxfs
+install hfs /bin/false
+blacklist hfs
+install hfsplus /bin/false
+blacklist hfsplus
+install jffs2 /bin/false
+blacklist jffs2
+install atm /bin/false
+blacklist atm
+install can /bin/false
+blacklist can
+install dccp /bin/false
+blacklist dccp
+install sctp /bin/false
+blacklist sctp
+install rds /bin/false
+blacklist rds
+install tipc /bin/false
+blacklist tipc
+MODEOF
+echo DONE""",
+        },
+        "core_dumps": {
+            "check": """[ -f /etc/systemd/coredump.conf.d/disable-coredump.conf ] && \
+grep -q 'hard core 0' /etc/security/limits.conf 2>/dev/null && echo OK || echo FAIL""",
+            "apply": """mkdir -p /etc/systemd/coredump.conf.d
+cat > /etc/systemd/coredump.conf.d/disable-coredump.conf << 'CDEOF'
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+CDEOF
+if ! grep -q 'hard core 0' /etc/security/limits.conf 2>/dev/null; then
+  echo '* hard core 0' >> /etc/security/limits.conf
+fi
+echo DONE""",
+        },
+        "mount_options": {
+            "check": """mount | grep ' /dev/shm ' | grep -q noexec && echo OK || echo FAIL""",
+            "apply": """# only secure /dev/shm unconditionally - /tmp /var/tmp need separate partitions
+if ! grep -q '/dev/shm.*noexec' /etc/fstab; then
+  sed -i '/\\/dev\\/shm/d' /etc/fstab
+  echo 'tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0' >> /etc/fstab
+fi
+mount -o remount /dev/shm 2>/dev/null
+# only touch /tmp if it's a separate partition
+if mount | grep -q 'on /tmp type'; then
+  if ! grep -q '/tmp.*noexec' /etc/fstab; then
+    sed -i 's|\\(/tmp.*defaults\\)|\\1,nodev,nosuid,noexec|' /etc/fstab
+    mount -o remount /tmp 2>/dev/null
+  fi
+fi
+echo DONE""",
+        },
+        "cron_hardening": {
+            "check": """stat -c '%a' /etc/crontab 2>/dev/null | grep -q '700' && \
+[ ! -f /etc/cron.deny ] && echo OK || echo FAIL""",
+            "apply": """chmod 700 /etc/crontab
+chmod 700 /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.monthly /etc/cron.weekly 2>/dev/null
+rm -f /etc/cron.deny /etc/at.deny
+echo 'root' > /etc/cron.allow
+echo 'root' > /etc/at.allow
+chmod 640 /etc/cron.allow /etc/at.allow
+chown root:root /etc/cron.allow /etc/at.allow
+echo DONE""",
+        },
+        "net_protocols": {
+            # merged into fs_modules, check kept for backwards compat
+            "check": "[ -f /etc/modprobe.d/cis-disable-modules.conf ] && echo OK || echo FAIL",
+            "apply": """# included in fs_modules control
+echo DONE""",
+        },
+        "journald": {
+            "check": """grep -q '^SystemMaxUse' /etc/systemd/journald.conf.d/99-cis-hardening.conf 2>/dev/null && echo OK || echo FAIL""",
+            "verbose_check": """grep -hE '^(Storage|SystemMaxUse|SystemKeepFree)' /etc/systemd/journald.conf.d/99-cis-hardening.conf 2>/dev/null || echo '  (no ProxmoxVEx journald config)' ; echo '--- current journal usage ---' ; journalctl --disk-usage 2>/dev/null""",
+            "apply": """mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-cis-hardening.conf << 'JDEOF'
+[Journal]
+Storage=persistent
+Compress=yes
+ForwardToSyslog=no
+# #595 - cap journald so a hardened node (auditd/acct = chatty) can't fill
+# /var/log. systemd's default is 10% of the fs, up to 4G — unbounded for us.
+# Lower this on hosts that back /var/log with a small log2ram/zram.
+SystemMaxUse=512M
+SystemKeepFree=64M
+JDEOF
+systemctl restart systemd-journald
+echo DONE""",
+        },
+        "ssh_perms": {
+            "check": """[ "$(stat -c '%a' /etc/ssh/sshd_config 2>/dev/null)" = "600" ] && echo OK || echo FAIL""",
+            "verbose_check": """stat -c 'sshd_config: mode=%a owner=%U:%G' /etc/ssh/sshd_config 2>/dev/null ; for f in /etc/ssh/ssh_host_*_key ; do [ -f "$f" ] && stat -c '%n: mode=%a owner=%U:%G' "$f" ; done""",
+            "apply": """chmod 600 /etc/ssh/sshd_config
+chown root:root /etc/ssh/sshd_config
+chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null
+chown root:root /etc/ssh/ssh_host_*_key 2>/dev/null
+chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null
+chown root:root /etc/ssh/ssh_host_*_key.pub 2>/dev/null
+echo DONE""",
+        },
+        "ssh_crypto": {
+            "check": """grep -q 'CIS SSH Cryptographic Hardening' /etc/ssh/sshd_config 2>/dev/null && echo OK || echo FAIL""",
+            "verbose_check": """grep -E '^(Ciphers|KexAlgorithms|MACs|GSSAPIAuthentication|HostbasedAuthentication|IgnoreRhosts|PermitUserEnvironment|Banner) ' /etc/ssh/sshd_config 2>/dev/null || echo '(no hardening directives found)'""",
+            "apply": """cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.cis
+# remove existing crypto directives to avoid conflicts
+sed -i -e '/^Ciphers /d' -e '/^KexAlgorithms /d' -e '/^MACs /d' \
+  -e '/^GSSAPIAuthentication /d' -e '/^HostbasedAuthentication /d' \
+  -e '/^IgnoreRhosts /d' -e '/^PermitUserEnvironment /d' \
+  -e '/^Banner /d' /etc/ssh/sshd_config
+cat >> /etc/ssh/sshd_config << 'SSHEOF'
+
+# CIS SSH Cryptographic Hardening (5.1.4-5.1.22) - applied by ProxmoxVEx
+Ciphers aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+GSSAPIAuthentication no
+HostbasedAuthentication no
+IgnoreRhosts yes
+PermitUserEnvironment no
+Banner /etc/issue.net
+SSHEOF
+if sshd -t 2>/dev/null; then
+  systemctl restart sshd
+else
+  cp /etc/ssh/sshd_config.bak.cis /etc/ssh/sshd_config
+  systemctl restart sshd
+fi
+echo DONE""",
+            "backup_files": ["/etc/ssh/sshd_config"],
+            "rollback_post": "sshd -t 2>/dev/null && (systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null) || true",
+        },
+        # #433 - SSH access hardening (key-only root, auth tries, idle timeout).
+        # PermitRootLogin=prohibit-password, NOT 'no': PVE manages its nodes as
+        # root@pam, so key-based root must keep working; we also leave
+        # PasswordAuthentication alone for the same lockout reason. Rollback (#386)
+        # restores the pre-apply sshd_config via backup_files.
+        "sshd_hardening": {
+            "check": """grep -qiE '^[[:space:]]*PermitRootLogin[[:space:]]+(no|prohibit-password)' /etc/ssh/sshd_config 2>/dev/null && grep -qiE '^[[:space:]]*MaxAuthTries[[:space:]]+[1-4]([[:space:]]|$)' /etc/ssh/sshd_config 2>/dev/null && grep -qiE '^[[:space:]]*X11Forwarding[[:space:]]+no' /etc/ssh/sshd_config 2>/dev/null && echo OK || echo FAIL""",
+            "verbose_check": """grep -iE '^[[:space:]]*(PermitRootLogin|MaxAuthTries|X11Forwarding|ClientAliveInterval|ClientAliveCountMax|LoginGraceTime|AllowTcpForwarding|PermitEmptyPasswords)' /etc/ssh/sshd_config 2>/dev/null || echo '(no access-hardening directives found)'""",
+            "apply": """cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.cis-sshd
+sed -i -E -e '/^[[:space:]]*PermitRootLogin[[:space:]]/Id' -e '/^[[:space:]]*MaxAuthTries[[:space:]]/Id' -e '/^[[:space:]]*X11Forwarding[[:space:]]/Id' -e '/^[[:space:]]*ClientAliveInterval[[:space:]]/Id' -e '/^[[:space:]]*ClientAliveCountMax[[:space:]]/Id' -e '/^[[:space:]]*LoginGraceTime[[:space:]]/Id' -e '/^[[:space:]]*AllowTcpForwarding[[:space:]]/Id' -e '/^[[:space:]]*PermitEmptyPasswords[[:space:]]/Id' /etc/ssh/sshd_config
+cat >> /etc/ssh/sshd_config << 'SSHDHEOF'
+
+# CIS SSH access hardening (#433) - applied by ProxmoxVEx
+PermitRootLogin prohibit-password
+MaxAuthTries 4
+X11Forwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 3
+LoginGraceTime 60
+AllowTcpForwarding no
+PermitEmptyPasswords no
+SSHDHEOF
+if sshd -t 2>/dev/null; then
+  systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+else
+  cp /etc/ssh/sshd_config.bak.cis-sshd /etc/ssh/sshd_config
+  systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+fi
+echo DONE""",
+            "backup_files": ["/etc/ssh/sshd_config"],
+            "rollback_post": "sshd -t 2>/dev/null && (systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null) || true",
+        },
+        # #434 - strip the `nullok` flag (PAM accepting empty passwords) from
+        # every /etc/pam.d file. Rollback (#386) restores the common-* files.
+        "pam_nullok_removal": {
+            "check": """grep -rlE 'nullok' /etc/pam.d/ >/dev/null 2>&1 && echo FAIL || echo OK""",
+            "verbose_check": """grep -rlE 'nullok' /etc/pam.d/ 2>/dev/null || echo '(no nullok flags in /etc/pam.d)'""",
+            "apply": """for pf in $(grep -rlE 'nullok' /etc/pam.d/ 2>/dev/null); do
+  cp -p "$pf" "${pf}.bak.cis-nullok"
+  sed -i -E 's/[[:space:]]nullok([[:space:]]|$)/ /g' "$pf"
+done
+echo DONE""",
+            "backup_files": ["/etc/pam.d/common-auth", "/etc/pam.d/common-password", "/etc/pam.d/common-account"],
+        },
+        "pam_faillock": {
+            "check": """[ -f /etc/security/faillock.conf.d/cis-faillock.conf ] && echo OK || echo FAIL""",
+            # Service-user-aware. Locking out the ProxmoxVEx service account
+            # would lock ProxmoxVEx out of the node it manages, so we ALWAYS exempt
+            # `root` and `ProxmoxVEx` (hardcoded). Operator may add more accounts via
+            # the optional service_user param (comma-separated).
+            "apply_template": True,
+            "apply": """mkdir -p /etc/security/faillock.conf.d
+cat > /etc/security/faillock.conf.d/cis-faillock.conf << 'FLEOF'
+# CIS 5.3.3.1: Account lockout - 5 attempts, 10 min unlock
+deny = 5
+unlock_time = 600
+fail_interval = 900
+even_deny_root = false
+dir = /var/run/faillock
+FLEOF
+# ProxmoxVEx managed: hardcoded `root ProxmoxVEx` always exempt + optional extra accounts.
+# pam_faillock has no native exempt-list, but `pam_succeed_if user in <list>`
+# placed before the faillock module skips it for matching users.
+EXTRA_USERS="{service_user}"
+USER_LIST="root ProxmoxVEx"
+[ -n "$EXTRA_USERS" ] && USER_LIST="$USER_LIST $(echo "$EXTRA_USERS" | tr ',' ' ')"
+# Insert pam_succeed_if line in common-auth + common-account before pam_faillock
+# (idempotent — re-applies overwrite the line, marker-checked)
+for f in /etc/pam.d/common-auth /etc/pam.d/common-account; do
+  [ -f "$f" ] || continue
+  # remove old ProxmoxVEx line if any (idempotent re-apply with new user-list)
+  sed -i '/# ProxmoxVEx: service-user faillock exempt/d' "$f"
+  cp "$f" "${{f}}.bak.cis-svcexempt" 2>/dev/null || true
+  LINE='auth     [success=1 default=ignore]  pam_succeed_if.so user in '"$USER_LIST"'  # ProxmoxVEx: service-user faillock exempt'
+  [ "$f" = /etc/pam.d/common-account ] && LINE=$(echo "$LINE" | sed 's/^auth/account/')
+  sed -i "1i $LINE" "$f"
+done
+echo DONE""",
+            "defaults": {"service_user": ""},
+        },
+        "pw_history": {
+            "check": """grep -q 'pam_pwhistory.so' /etc/pam.d/common-password 2>/dev/null && echo OK || echo FAIL""",
+            # Bugfix: do NOT use_authtok unless pam_pwquality.so is already
+            # in the stack ahead of us. Without a prior module to set the authtok the
+            # `passwd` command dies with "Authentication token manipulation error" because
+            # pwhistory is asked to use a token that nobody set. Reported by While
+            # testing CIS hardening on PVE 9.
+            "apply": """if ! grep -q pam_pwhistory /etc/pam.d/common-password 2>/dev/null; then
+  if grep -q 'pam_unix.so' /etc/pam.d/common-password 2>/dev/null; then
+    cp /etc/pam.d/common-password /etc/pam.d/common-password.bak.cis
+    if grep -q 'pam_pwquality.so' /etc/pam.d/common-password 2>/dev/null; then
+      PWHIST_LINE='password    required    pam_pwhistory.so remember=24 use_authtok'
+    else
+      # No pwquality yet — let pwhistory prompt itself instead of expecting a chained token.
+      PWHIST_LINE='password    required    pam_pwhistory.so remember=24'
+    fi
+    sed -i "/pam_unix.so/i $PWHIST_LINE" /etc/pam.d/common-password
+    # rollback if file ended up empty (sed misbehavior on weird locales etc.)
+    if [ ! -s /etc/pam.d/common-password ]; then
+      cp /etc/pam.d/common-password.bak.cis /etc/pam.d/common-password
+    fi
+  fi
+fi
+echo DONE""",
+        },
+        "shell_timeout": {
+            "check": """grep -q 'TMOUT=900' /etc/profile.d/cis-timeout.sh 2>/dev/null && echo OK || echo FAIL""",
+            "apply": """cat > /etc/profile.d/cis-timeout.sh << 'TMEOF'
+# CIS 5.4.3.2 - shell timeout
+TMOUT=900
+readonly TMOUT
+export TMOUT
+TMEOF
+chmod 644 /etc/profile.d/cis-timeout.sh
+echo DONE""",
+        },
+        "file_perms": {
+            "check": """[ "$(stat -c '%a' /etc/shadow 2>/dev/null)" = "640" ] && \
+[ "$(stat -c '%a' /etc/passwd 2>/dev/null)" = "644" ] && echo OK || echo FAIL""",
+            "verbose_check": """for f in /etc/passwd /etc/shadow /etc/group /etc/gshadow ; do [ -e "$f" ] && stat -c '%n: mode=%a owner=%U:%G' "$f" ; done""",
+            "apply": """chmod 644 /etc/passwd /etc/group
+chmod 640 /etc/shadow /etc/gshadow
+chown root:root /etc/passwd /etc/group
+chown root:shadow /etc/shadow /etc/gshadow
+chmod 644 /etc/passwd- /etc/group- 2>/dev/null
+chmod 640 /etc/shadow- /etc/gshadow- 2>/dev/null
+echo DONE""",
+        },
+        # ---- Lynis recommendations - --
+        "backup_dns": {
+            "check": """ns_count=$(grep -c '^nameserver' /etc/resolv.conf 2>/dev/null); [ "$ns_count" -ge 2 ] && echo OK || echo FAIL""",
+            # Configurable - dns1/dns2 get replaced by apply_node_hardening
+            "apply_template": True,
+            "apply": """if ! grep -q '{dns1}' /etc/resolv.conf && [ "$(grep -c '^nameserver' /etc/resolv.conf)" -lt 2 ]; then
+echo 'nameserver {dns1}' >> /etc/resolv.conf
+fi
+if ! grep -q '{dns2}' /etc/resolv.conf && [ "$(grep -c '^nameserver' /etc/resolv.conf)" -lt 3 ]; then
+echo 'nameserver {dns2}' >> /etc/resolv.conf
+fi
+echo DONE""",
+            "defaults": {"dns1": "1.1.1.1", "dns2": "9.9.9.9"},
+        },
+        "postfix_banner": {
+            "check": """if command -v postconf >/dev/null 2>&1; then
+postconf smtpd_banner 2>/dev/null | grep -qi 'Postfix' && echo FAIL || echo OK
+else echo OK; fi""",
+            "apply": """if command -v postconf >/dev/null 2>&1; then
+postconf -e 'smtpd_banner = $myhostname ESMTP'
+systemctl reload postfix 2>/dev/null
+fi
+echo DONE""",
+        },
+        "pw_hash_rounds": {
+            "check": """grep -q '^SHA_CRYPT_MIN_ROUNDS' /etc/login.defs 2>/dev/null && echo OK || echo FAIL""",
+            "apply": """if ! grep -q '^SHA_CRYPT_MIN_ROUNDS' /etc/login.defs; then
+cat >> /etc/login.defs << 'HASHEOF'
+
+# Lynis AUTH-9230: Password hashing rounds
+SHA_CRYPT_MIN_ROUNDS 5000
+SHA_CRYPT_MAX_ROUNDS 500000
+HASHEOF
+fi
+echo DONE""",
+        },
+        "pw_quality": {
+            # Also add pam_pwquality.so to the PAM stack. Previous version
+            # only installed the package + wrote pwquality.conf which did nothing because
+            # the module was never wired into common-password. Insert BEFORE pam_pwhistory
+            # if it's already there (so pwquality runs first → sets authtok → pwhistory
+            # uses_authtok), else before pam_unix.
+            "check": """dpkg -l libpam-pwquality 2>/dev/null | grep -q '^ii' && grep -q 'pam_pwquality.so' /etc/pam.d/common-password 2>/dev/null && echo OK || echo FAIL""",
+            "apply": """apt-get install -y libpam-pwquality >/dev/null 2>&1
+cat > /etc/security/pwquality.conf << 'PWEOF'
+# Lynis AUTH-9262: Password quality requirements
+minlen = 12
+dcredit = -1
+ucredit = -1
+lcredit = -1
+ocredit = -1
+minclass = 3
+maxrepeat = 3
+gecoscheck = 1
+dictcheck = 1
+PWEOF
+if ! grep -q 'pam_pwquality.so' /etc/pam.d/common-password 2>/dev/null; then
+  if grep -q 'pam_unix.so' /etc/pam.d/common-password 2>/dev/null; then
+    cp /etc/pam.d/common-password /etc/pam.d/common-password.bak.cis-pwq
+    if grep -q 'pam_pwhistory.so' /etc/pam.d/common-password 2>/dev/null; then
+      sed -i '/pam_pwhistory.so/i password    requisite    pam_pwquality.so retry=3' /etc/pam.d/common-password
+    else
+      sed -i '/pam_unix.so/i password    requisite    pam_pwquality.so retry=3' /etc/pam.d/common-password
+    fi
+    if [ ! -s /etc/pam.d/common-password ]; then
+      cp /etc/pam.d/common-password.bak.cis-pwq /etc/pam.d/common-password
+    fi
+  fi
+fi
+echo DONE""",
+        },
+        # Recovery control for PAM password stack. Detects the
+        # `pam_pwhistory.so use_authtok` without prior `pam_pwquality.so` situation
+        # (causes "Authentication token manipulation error" on every passwd call),
+        # repairs by either inserting pam_pwquality before pwhistory or stripping
+        # use_authtok if libpam-pwquality isn't installed. Idempotent — re-running
+        # on a healthy system is a no-op.
+        "pam_password_repair": {
+            # IMPORTANT: this check runs as part of a composite
+            # `{ check1; }; { check2; }; ...` chain. Brace groups share the parent
+            # shell's process, so a stray `exit 0` here would terminate ALL
+            # subsequent control checks. Use elif chain instead — no exits.
+            "check": """COMMON=/etc/pam.d/common-password
+if [ ! -f "$COMMON" ]; then
+  echo OK
+elif ! grep -q 'pam_pwhistory.so' "$COMMON" 2>/dev/null; then
+  echo OK
+elif ! grep 'pam_pwhistory.so' "$COMMON" | grep -q 'use_authtok'; then
+  echo OK
+elif awk '/pam_pwquality.so/{q=NR} /pam_pwhistory.so/{h=NR} END{exit !(q && q<h)}' "$COMMON"; then
+  echo OK
+else
+  echo FAIL
+fi""",
+            "verbose_check": """COMMON=/etc/pam.d/common-password
+echo '--- /etc/pam.d/common-password (password-stack lines) ---'
+grep -nE 'password\\s+(required|requisite|sufficient|optional)' "$COMMON" 2>/dev/null || echo '(no password lines found)'
+echo '--- libpam-pwquality status ---'
+dpkg -l libpam-pwquality 2>/dev/null | tail -1 || echo '(not installed)'""",
+            "apply": """COMMON=/etc/pam.d/common-password
+if [ ! -f "$COMMON" ]; then
+  echo "(no $COMMON — nothing to repair)"
+  echo DONE; exit 0
+fi
+if ! grep -q 'pam_pwhistory.so' "$COMMON" 2>/dev/null; then
+  echo "(pam_pwhistory not configured — nothing to repair)"
+  echo DONE; exit 0
+fi
+# already healthy?
+if awk '/pam_pwquality.so/{q=NR} /pam_pwhistory.so/{h=NR} END{exit !(q && q<h)}' "$COMMON"; then
+  if grep 'pam_pwhistory.so' "$COMMON" | grep -q 'use_authtok'; then
+    echo "(pam stack healthy: pwquality > pwhistory)"
+    echo DONE; exit 0
+  fi
+fi
+# also healthy if pwhistory has no use_authtok (it prompts itself, no chain needed)
+if ! grep 'pam_pwhistory.so' "$COMMON" | grep -q 'use_authtok'; then
+  echo "(pam stack healthy: pwhistory standalone, no use_authtok)"
+  echo DONE; exit 0
+fi
+TS=$(date +%s)
+cp "$COMMON" "$COMMON.bak.repair-$TS"
+# Prefer wiring in pwquality if the package is installed, else strip use_authtok.
+if dpkg -l libpam-pwquality 2>/dev/null | grep -q '^ii'; then
+  # remove any malformed pwquality line first
+  sed -i '/pam_pwquality.so/d' "$COMMON"
+  # insert pwquality requisite line right BEFORE the pwhistory line
+  sed -i '/pam_pwhistory.so/i password    requisite    pam_pwquality.so retry=3' "$COMMON"
+  echo "added pam_pwquality.so before pam_pwhistory.so (backup: $COMMON.bak.repair-$TS)"
+else
+  # no pwquality package — strip use_authtok so pwhistory prompts itself
+  sed -i 's| use_authtok||g' "$COMMON"
+  echo "removed use_authtok from pam_pwhistory.so (libpam-pwquality not installed) (backup: $COMMON.bak.repair-$TS)"
+fi
+# safety: empty file? roll back
+if [ ! -s "$COMMON" ]; then
+  cp "$COMMON.bak.repair-$TS" "$COMMON"
+  echo "ROLLED BACK — file was emptied by sed"
+  exit 1
+fi
+echo DONE""",
+        },
+        "pw_aging": {
+            "check": """grep -q '^PASS_MAX_DAYS.*365' /etc/login.defs 2>/dev/null && echo OK || echo FAIL""",
+            # `root` and `ProxmoxVEx` are ALWAYS exempted (hardcoded).
+            # Optional service_user param adds more comma-separated accounts.
+            "apply_template": True,
+            "apply": """sed -i 's/^PASS_MAX_DAYS.*/PASS_MAX_DAYS   365/' /etc/login.defs
+sed -i 's/^PASS_MIN_DAYS.*/PASS_MIN_DAYS   1/' /etc/login.defs
+sed -i 's/^PASS_WARN_AGE.*/PASS_WARN_AGE   30/' /etc/login.defs
+# Hardcoded exemptions: root + ProxmoxVEx (ProxmoxVEx service account)
+for u in root ProxmoxVEx $(echo "{service_user}" | tr ',' ' '); do
+  [ -z "$u" ] && continue
+  if id "$u" >/dev/null 2>&1; then
+    chage -M -1 "$u" 2>/dev/null
+    chage -m 0 "$u" 2>/dev/null
+    echo "  exempted: $u"
+  fi
+done
+echo DONE""",
+            "defaults": {"service_user": ""},
+        },
+        "default_umask": {
+            "check": """(grep -q 'UMASK.*027' /etc/login.defs 2>/dev/null || grep -q 'umask 027' /etc/profile 2>/dev/null) && echo OK || echo FAIL""",
+            "apply": """if grep -q '^UMASK' /etc/login.defs 2>/dev/null; then
+  sed -i 's/^UMASK.*/UMASK           027/' /etc/login.defs
+else
+  echo 'UMASK           027' >> /etc/login.defs
+fi
+if ! grep -q '^umask 027' /etc/profile; then
+  echo 'umask 027' >> /etc/profile
+fi
+echo DONE""",
+        },
+        "pkg_cleanup": {
+            "check": """dpkg -l | grep -q '^rc' && echo FAIL || echo OK""",
+            "apply": """dpkg -l | grep '^rc' | awk '{print $2}' | xargs -r dpkg --purge 2>/dev/null
+apt-get autoremove -y 2>/dev/null
+apt-get autoclean -y 2>/dev/null
+echo DONE""",
+        },
+        "debsums": {
+            "check": """command -v debsums >/dev/null 2>&1 && echo OK || echo FAIL""",
+            "apply": """apt-get install -y debsums >/dev/null 2>&1
+echo DONE""",
+        },
+        "login_banners": {
+            "check": """[ -s /etc/issue ] && grep -qi 'authorized' /etc/issue 2>/dev/null && echo OK || echo FAIL""",
+            "apply": """BANNER='***************************************************************************
+                           AUTHORIZED ACCESS ONLY
+
+This system is for authorized use only. All activities are monitored and
+logged. Unauthorized access will be prosecuted to the fullest extent of law.
+***************************************************************************'
+echo "$BANNER" > /etc/issue
+echo "$BANNER" > /etc/issue.net
+echo DONE""",
+        },
+        "file_integrity": {
+            "check": """command -v aide >/dev/null 2>&1 && echo OK || echo FAIL""",
+            "apply": """DEBIAN_FRONTEND=noninteractive apt-get install -y aide aide-common >/dev/null 2>&1
+aideinit 2>/dev/null &
+echo DONE""",
+        },
+        "process_acct": {
+            "check": """command -v lastcomm >/dev/null 2>&1 && [ -f /etc/logrotate.d/ProxmoxVEx-acct ] && echo OK || echo FAIL""",
+            "verbose_check": """command -v lastcomm >/dev/null 2>&1 && echo 'acct: installed' || echo 'acct: missing' ; ls -lh /var/log/account/pacct 2>/dev/null || echo '  (no pacct yet)' ; [ -f /etc/logrotate.d/ProxmoxVEx-acct ] && echo 'pacct rotation: configured' || echo 'pacct rotation: NOT configured'""",
+            "apply": """apt-get install -y acct >/dev/null 2>&1
+systemctl enable acct 2>/dev/null; systemctl start acct 2>/dev/null
+# #595 - bound process accounting. /var/log/account/pacct is a live binary file the
+# kernel writes to, so we can't copytruncate it; rotate by renaming + re-pointing accton
+# at a fresh file in postrotate. size-triggered so a busy host can't fill /var/log.
+mkdir -p /etc/logrotate.d
+cat > /etc/logrotate.d/ProxmoxVEx-acct << 'LREOF'
+/var/log/account/pacct {
+    missingok
+    notifempty
+    size 50M
+    rotate 7
+    compress
+    delaycompress
+    postrotate
+        [ -x /usr/sbin/accton ] && /usr/sbin/accton /var/log/account/pacct >/dev/null 2>&1 || true
+    endscript
+}
+LREOF
+echo DONE""",
+        },
+        "sysstat": {
+            "check": """command -v sar >/dev/null 2>&1 && echo OK || echo FAIL""",
+            "apply": """apt-get install -y sysstat >/dev/null 2>&1
+sed -i 's/ENABLED="false"/ENABLED="true"/' /etc/default/sysstat 2>/dev/null
+systemctl enable sysstat 2>/dev/null; systemctl start sysstat 2>/dev/null
+echo DONE""",
+        },
+        "usb_storage": {
+            "check": """[ -f /etc/modprobe.d/disable-storage.conf ] && echo OK || echo FAIL""",
+            "apply": """cat > /etc/modprobe.d/disable-storage.conf << 'USBEOF'
+# Lynis USB-1000/STRG-1846: Disable USB and Firewire storage
+install usb-storage /bin/true
+install firewire-core /bin/true
+install firewire-ohci /bin/true
+install firewire-sbp2 /bin/true
+USBEOF
+rmmod usb-storage 2>/dev/null; rmmod firewire-core 2>/dev/null
+echo DONE""",
+        },
+        "restrict_compilers": {
+            "check": """if command -v gcc >/dev/null 2>&1; then
+stat -c '%a' $(which gcc) 2>/dev/null | grep -qE '(750|700)' && echo OK || echo FAIL
+else echo OK; fi""",
+            "apply": """chmod 750 /usr/bin/gcc* 2>/dev/null
+chmod 750 /usr/bin/g++* 2>/dev/null
+chmod 750 /usr/bin/cc 2>/dev/null
+chmod 750 /usr/bin/c++ 2>/dev/null
+chmod 750 /usr/bin/make 2>/dev/null
+echo DONE""",
+        },
+        "apt_show_versions": {
+            "check": """command -v apt-show-versions >/dev/null 2>&1 && echo OK || echo FAIL""",
+            "apply": """apt-get install -y apt-show-versions >/dev/null 2>&1
+echo DONE""",
+        },
+        "pam_tmpdir": {
+            "check": """dpkg -l libpam-tmpdir 2>/dev/null | grep -q '^ii' && echo OK || echo FAIL""",
+            "apply": """apt-get install -y libpam-tmpdir >/dev/null 2>&1
+echo DONE""",
+        },
+        # ---- STIG (DoD) controls - --
+        "session_limit": {
+            "check": """grep -q 'maxlogins' /etc/security/limits.conf 2>/dev/null && echo OK || echo FAIL""",
+            # `root` and `ProxmoxVEx` always unlimited (hardcoded).
+            # ProxmoxVEx parallel-SSH (Phase 1) easily uses 8+ concurrent sessions
+            # per cluster op; 10-session cap would intermittently fail.
+            "apply_template": True,
+            "apply": """sed -i '/maxlogins/d' /etc/security/limits.conf 2>/dev/null
+cat >> /etc/security/limits.conf << 'SLEOF'
+
+# STIG UBTU-24-200000: Limit concurrent sessions
+* hard maxlogins 10
+# Always exempted - system + ProxmoxVEx service account
+root hard maxlogins -1
+ProxmoxVEx hard maxlogins -1
+SLEOF
+# Optional extra service accounts
+for u in $(echo "{service_user}" | tr ',' ' '); do
+  [ -z "$u" ] && continue
+  if id "$u" >/dev/null 2>&1; then
+    echo "$u hard maxlogins -1" >> /etc/security/limits.conf
+    echo "  exempted: $u"
+  fi
+done
+echo DONE""",
+            "defaults": {"service_user": ""},
+        },
+        "inactive_accounts": {
+            "check": """command -v useradd >/dev/null 2>&1 && \
+useradd -D 2>/dev/null | grep -q 'INACTIVE=35' && echo OK || echo FAIL""",
+            # `root` and `ProxmoxVEx` ALWAYS exempted (hardcoded).
+            # Whether SSH-only logins count toward `lastlog` varies by Linux flavour;
+            # better to be defensive and not auto-disable ProxmoxVEx's own access.
+            "apply_template": True,
+            "apply": """useradd -D -f 35
+# Hardcoded exemptions
+SKIP_LIST="root|ProxmoxVEx"
+for u in root ProxmoxVEx; do
+  id "$u" >/dev/null 2>&1 && chage -I -1 "$u" 2>/dev/null
+done
+# Optional extra accounts
+for u in $(echo "{service_user}" | tr ',' ' '); do
+  [ -z "$u" ] && continue
+  if id "$u" >/dev/null 2>&1; then
+    chage -I -1 "$u" 2>/dev/null && echo "  exempted: $u"
+    SKIP_LIST="$SKIP_LIST|$u"
+  fi
+done
+# Apply to regular users only — skip service accounts
+for user in $(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd); do
+  echo "$user" | grep -qwE "^($SKIP_LIST)$" && continue
+  chage -I 35 "$user" 2>/dev/null
+done
+echo DONE""",
+            "defaults": {"service_user": ""},
+        },
+        "remove_legacy_svcs": {
+            "check": """dpkg -l telnet rsh-server rsh-client talk ntalk nis 2>/dev/null | grep -q '^ii' && echo FAIL || echo OK""",
+            "apply": """for pkg in telnet telnetd rsh-server rsh-client talk ntalk nis; do
+  dpkg -l "$pkg" 2>/dev/null | grep -q '^ii' && apt-get remove --purge -y "$pkg" 2>/dev/null
+done
+echo DONE""",
+        },
+        "audit_boot": {
+            "check": """(grep -q 'audit=1' /proc/cmdline || grep -q 'audit=1' /etc/default/grub) && echo OK || echo FAIL""",
+            "apply": """apt-get install -y auditd >/dev/null 2>&1
+if ! grep -q 'audit=1' /etc/default/grub; then
+  CURRENT=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub | cut -d'"' -f2)
+  NEW_PARAMS=$(echo "$CURRENT audit=1" | tr -s ' ')
+  sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\\"$NEW_PARAMS\\"|" /etc/default/grub
+  update-grub 2>/dev/null
+fi
+systemctl enable auditd 2>/dev/null; systemctl start auditd 2>/dev/null
+echo DONE""",
+        },
+        "audit_rules": {
+            "check": """[ -f /etc/audit/rules.d/50-stig-extended.rules ] && echo OK || echo FAIL""",
+            "apply": """apt-get install -y auditd >/dev/null 2>&1
+cat > /etc/audit/rules.d/50-stig-extended.rules << 'AUEOF'
+## STIG Extended Audit Rules - deployed by ProxmoxVEx
+# buffer + failure mode
+-b 8192
+-f 1
+# privileged command execution
+-a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k execpriv
+-a always,exit -F arch=b32 -S execve -C uid!=euid -F euid=0 -k execpriv
+# specific privileged commands
+-a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/bin/su -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/bin/passwd -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/bin/chsh -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/bin/newgrp -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/usermod -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/useradd -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/userdel -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/groupadd -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+-a always,exit -F path=/usr/sbin/groupmod -F perm=x -F auid>=1000 -F auid!=unset -k priv_cmd
+# permission changes
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b32 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b64 -S chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b32 -S chown,fchown,lchown,fchownat -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b64 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+-a always,exit -F arch=b32 -S setxattr,lsetxattr,fsetxattr,removexattr,lremovexattr,fremovexattr -F auid>=1000 -F auid!=unset -k perm_mod
+# account and identity files
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/security/opasswd -p wa -k identity
+# PAM and auth config
+-w /etc/pam.d/ -p wa -k pam_config
+-w /etc/login.defs -p wa -k pam_config
+-w /etc/security/limits.conf -p wa -k pam_config
+# login/logout events
+-w /var/log/faillog -p wa -k logins
+-w /var/log/lastlog -p wa -k logins
+-w /var/log/wtmp -p wa -k logins
+-w /var/log/btmp -p wa -k logins
+# cron changes
+-w /etc/cron.d/ -p wa -k cron
+-w /etc/cron.daily/ -p wa -k cron
+-w /etc/crontab -p wa -k cron
+-w /var/spool/cron/ -p wa -k cron
+# kernel module loading
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k modules
+-a always,exit -F arch=b32 -S init_module,finit_module,delete_module -k modules
+-w /sbin/insmod -p x -k modules
+-w /sbin/modprobe -p x -k modules
+-w /sbin/rmmod -p x -k modules
+-w /etc/modprobe.d/ -p wa -k modules
+# network config
+-a always,exit -F arch=b64 -S sethostname,setdomainname -k network_config
+-a always,exit -F arch=b32 -S sethostname,setdomainname -k network_config
+-w /etc/hosts -p wa -k network_config
+-w /etc/network/ -p wa -k network_config
+-w /etc/resolv.conf -p wa -k network_config
+# sudoers
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+# SSH config
+-w /etc/ssh/sshd_config -p wa -k sshd_config
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd_config
+# time changes
+-a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time_change
+-a always,exit -F arch=b32 -S adjtimex,settimeofday,clock_settime -k time_change
+-w /etc/localtime -p wa -k time_change
+# proxmox config monitoring
+-w /etc/pve/ -p wa -k proxmox_config
+-w /etc/corosync/ -p wa -k proxmox_cluster
+AUEOF
+augenrules --load 2>/dev/null
+echo DONE""",
+        },
+        "aide_audit_protect": {
+            "check": """grep -q 'STIG.*Audit tool integrity' /etc/aide/aide.conf 2>/dev/null && echo OK || \
+[ -f /etc/aide/aide.conf.d/99_stig_audit ] && echo OK || echo FAIL""",
+            "apply": """if [ -f /etc/aide/aide.conf ]; then
+  if ! grep -q 'STIG.*Audit tool integrity' /etc/aide/aide.conf 2>/dev/null; then
+    cat >> /etc/aide/aide.conf << 'AEOF'
+
+# STIG: Audit tool integrity monitoring
+/usr/sbin/auditctl p+i+n+u+g+s+b+acl+xattrs+sha512
+/usr/sbin/auditd p+i+n+u+g+s+b+acl+xattrs+sha512
+/usr/sbin/ausearch p+i+n+u+g+s+b+acl+xattrs+sha512
+/usr/sbin/aureport p+i+n+u+g+s+b+acl+xattrs+sha512
+/usr/sbin/autrace p+i+n+u+g+s+b+acl+xattrs+sha512
+/usr/sbin/augenrules p+i+n+u+g+s+b+acl+xattrs+sha512
+AEOF
+  fi
+fi
+echo DONE""",
+        },
+        "mem_protection": {
+            "check": """GRUB_LINE=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub 2>/dev/null)
+(grep -q 'init_on_alloc=1' /proc/cmdline || echo "$GRUB_LINE" | grep -q 'init_on_alloc=1') && \
+(grep -q 'init_on_free=1' /proc/cmdline || echo "$GRUB_LINE" | grep -q 'init_on_free=1') && echo OK || echo FAIL""",
+            "apply": """CURRENT=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT' /etc/default/grub | cut -d'"' -f2)
+PARAMS_ADD=""
+for p in init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1 slab_nomerge; do
+  echo "$CURRENT" | grep -q "$p" || PARAMS_ADD="$PARAMS_ADD $p"
+done
+if [ -n "$PARAMS_ADD" ]; then
+  NEW_PARAMS=$(echo "$CURRENT$PARAMS_ADD" | tr -s ' ')
+  sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\\"$NEW_PARAMS\\"|" /etc/default/grub
+  update-grub 2>/dev/null
+fi
+echo DONE""",
+        },
+        "audit_immutable": {
+            "check": """grep -q '^-e 2' /etc/audit/rules.d/99-finalize.rules 2>/dev/null && echo OK || echo FAIL""",
+            "apply": """cat > /etc/audit/rules.d/99-finalize.rules << 'IMEOF'
+# STIG V-270832 (UBTU-24) / CIS audit-config immutability: Make audit configuration immutable (-e 2)
+# This MUST be the last rule loaded - requires reboot to change
+-e 2
+IMEOF
+echo DONE""",
+        },
+        # --- ProxmoxVEx Recommendations ---
+        "apparmor": {
+            "check": """systemctl is-active apparmor 2>/dev/null | grep -q active && echo OK || echo FAIL""",
+            "verbose_check": """systemctl is-active apparmor 2>/dev/null || echo 'not active' ; if command -v aa-status >/dev/null 2>&1 ; then aa-status --profiled 2>/dev/null | sed 's/^/profiles loaded: /' ; fi""",
+            "apply": """apt-get install -y apparmor apparmor-utils >/dev/null 2>&1
+systemctl enable --now apparmor 2>/dev/null || true
+aa-enforce /etc/apparmor.d/* 2>/dev/null || true
+echo DONE""",
+        },
+        "disable_services": {
+            "check": """FOUND=0
+for s in bluetooth cups avahi-daemon; do
+  systemctl is-active --quiet $s 2>/dev/null && FOUND=1
+done
+[ $FOUND -eq 0 ] && echo OK || echo FAIL""",
+            "apply": """for s in bluetooth cups avahi-daemon; do
+  if systemctl is-active --quiet $s 2>/dev/null; then
+    systemctl disable --now $s 2>/dev/null || true
+  fi
+done
+echo DONE""",
+        },
+        "sysctl_hardening": {
+            "check": """grep -q 'net.ipv4.conf.all.rp_filter = 1' /etc/sysctl.d/99-ProxmoxVEx-hardening.conf 2>/dev/null && echo OK || echo FAIL""",
+            "verbose_check": """if [ -f /etc/sysctl.d/99-ProxmoxVEx-hardening.conf ]; then echo 'file exists:' ; grep -E '^[a-z]' /etc/sysctl.d/99-ProxmoxVEx-hardening.conf 2>/dev/null | head -10 ; echo '...' ; else echo 'file missing' ; fi ; echo '---live kernel values---' ; for k in net.ipv4.conf.all.rp_filter net.ipv4.tcp_syncookies kernel.randomize_va_space kernel.kptr_restrict ; do v=$(sysctl -n $k 2>/dev/null) ; echo "$k = $v" ; done""",
+            "apply": """cat > /etc/sysctl.d/99-ProxmoxVEx-hardening.conf << 'SYSEOF'
+# ProxmoxVEx Security Hardening - sysctl parameters
+
+# IP Spoofing protection
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Ignore ICMP redirects
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+
+# Disable source routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+
+# Don't send redirects
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# Log Martian packets
+net.ipv4.conf.all.log_martians = 1
+
+# SYN flood protection
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_syn_retries = 5
+
+# ASLR
+kernel.randomize_va_space = 2
+
+# Restrict dmesg
+kernel.dmesg_restrict = 1
+
+# Hide kernel pointers
+kernel.kptr_restrict = 2
+
+# Disable magic SysRq
+kernel.sysrq = 0
+
+# Hardlink/Symlink protection
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+
+# ptrace restriction
+kernel.yama.ptrace_scope = 1
+
+# Core dump protection for SUID
+fs.suid_dumpable = 0
+SYSEOF
+sysctl --system >/dev/null 2>&1
+echo DONE""",
+        },
+        "auditd_service": {
+            "check": """systemctl is-active auditd 2>/dev/null | grep -q active && grep -qE '^max_log_file_action *= *ROTATE' /etc/audit/auditd.conf 2>/dev/null && echo OK || echo FAIL""",
+            "verbose_check": """systemctl is-active auditd 2>/dev/null || echo 'not active' ; grep -hE '^(max_log_file|num_logs|max_log_file_action) ' /etc/audit/auditd.conf 2>/dev/null || echo '  (no log bounds set)' ; if command -v auditctl >/dev/null 2>&1 ; then auditctl -s 2>/dev/null | grep -E 'enabled|pid|rate' | head -5 ; auditctl -l 2>/dev/null | wc -l | awk '{print \"active rules: \"$1}' ; fi""",
+            "apply": """apt-get install -y auditd audispd-plugins >/dev/null 2>&1
+# #595 - bound auditd's own log growth so audit.log can't sprawl on /var/log.
+# ~50MB x 10 = 500MB ceiling, then rotate. idempotent: replace-or-append each key.
+if [ -f /etc/audit/auditd.conf ]; then
+  for kv in "max_log_file = 50" "num_logs = 10" "max_log_file_action = ROTATE"; do
+    key=$(echo "$kv" | cut -d' ' -f1)
+    if grep -qE "^#? *${key} *=" /etc/audit/auditd.conf; then
+      sed -i -E "s|^#? *${key} *=.*|${kv}|" /etc/audit/auditd.conf
+    else
+      echo "$kv" >> /etc/audit/auditd.conf
+    fi
+  done
+fi
+systemctl enable --now auditd 2>/dev/null
+# reload config (HUP) if running; fall back to restart. service auditd reload is the
+# supported path on Debian where systemctl restart auditd is masked.
+service auditd reload 2>/dev/null || systemctl kill -s HUP auditd 2>/dev/null || systemctl restart auditd 2>/dev/null || true
+echo DONE""",
+        },
+        # Fail2ban for sshd + Proxmox Web-UI login failures.
+        # Default policy: 5 retries in 10min → 24h ban. Idempotent: the marker file
+        # `/etc/fail2ban/jail.d/ProxmoxVEx-pve.conf` gates re-application, so apply is
+        # safe to run repeatedly.
+        "pve_fail2ban": {
+            "check": """systemctl is-active fail2ban 2>/dev/null | grep -q active && [ -f /etc/fail2ban/jail.d/ProxmoxVEx-pve.conf ] && echo OK || echo FAIL""",
+            "verbose_check": """echo '---host---' ; echo "Debian: $(cat /etc/debian_version 2>/dev/null)" ; pveversion 2>/dev/null | head -1 ; echo '---fail2ban---' ; systemctl is-active fail2ban 2>/dev/null || echo 'service inactive' ; fail2ban-client --version 2>/dev/null | head -1 ; echo '---banaction in our jail---' ; grep -E '^banaction' /etc/fail2ban/jail.d/ProxmoxVEx-pve.conf 2>/dev/null || echo '  (no ProxmoxVEx-pve.conf)' ; echo '---jails---' ; fail2ban-client status 2>/dev/null | grep 'Jail list' || echo 'no jails' ; echo '---banned (summary)---' ; for j in $(fail2ban-client status 2>/dev/null | awk -F: '/Jail list/ {print $2}' | tr ',' ' ') ; do n=$(fail2ban-client status $j 2>/dev/null | awk '/Currently banned/ {print $NF}') ; echo "$j: ${n:-0} banned" ; done""",
+            # Works on both PVE 8 (Debian 12 / fail2ban 0.11) and
+            # PVE 9 (Debian 13 / fail2ban 1.0+). Key decisions:
+            #   1. systemd backend everywhere — neither PVE 8 nor PVE 9 ships
+            #      /var/log/daemon.log by default; both log pveproxy/pvedaemon
+            #      to journald. Old config pointing at the file silently failed.
+            #   2. banaction picked by Debian major: D12 -> iptables-multiport
+            #      (works alongside pve-firewall iptables-nft compat), D13+ ->
+            #      nftables-multiport (native nft, no legacy compat layer needed).
+            #   3. NO `update-alternatives --set iptables iptables-legacy`
+            #      that breaks pve-firewall on D13 and is unnecessary on D12.
+            #   4. failregex covers pvedaemon AND pveproxy, login_failed AND
+            #      authentication failure variants seen across both versions.
+            "apply": """set -e
+echo '[fail2ban] apt-get update + install...'
+apt-get update -qq 2>&1 | tail -3 || true
+DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban python3-systemd >/dev/null 2>&1 || {
+  echo 'INSTALL FAILED'; apt-get install -y fail2ban 2>&1 | tail -10; exit 1; }
+
+# Detect Debian major version for banaction selection.
+# /etc/debian_version on D12 = "12.x", D13 = "13.x" or "trixie/sid" during transition.
+DEB_VER=$(cut -d. -f1 /etc/debian_version 2>/dev/null)
+case "$DEB_VER" in
+  13|14|15) BANACTION=nftables-multiport ;;
+  *)        BANACTION=iptables-multiport ;;
+esac
+PVE_VER=$(pveversion 2>/dev/null | head -1 | awk -F/ '{print $2}' | cut -d. -f1)
+echo "[fail2ban] detected: Debian=$DEB_VER, Proxmox=${PVE_VER:-?}, banaction=$BANACTION"
+
+echo '[fail2ban] writing filter + jail config...'
+cat > /etc/fail2ban/filter.d/proxmox.conf << 'F2BFILTER'
+# ProxmoxVEx managed — matches pvedaemon/pveproxy auth failures via journald.
+# Patterns observed on PVE 8 and PVE 9:
+#   pvedaemon[12345]: authentication failure; rhost=1.2.3.4 user=root@pam msg=...
+#   pveproxy[12345]: authentication failure; rhost=1.2.3.4 ...
+#   pvedaemon[12345]: <IP>: ... 401 ... - - login failed
+[Definition]
+failregex = ^.* (pvedaemon|pveproxy)\\[\\d+\\]: authentication failure; rhost=<HOST>.*$
+            ^.* pvedaemon\\[\\d+\\]: <HOST>: \\S+ - .* 401\\s+\\S+\\s+- - login failed.*$
+ignoreregex =
+journalmatch = _COMM=pvedaemon
+              + _COMM=pveproxy
+F2BFILTER
+
+cat > /etc/fail2ban/jail.d/ProxmoxVEx-pve.conf << F2BJAIL
+# ProxmoxVEx managed — do not hand-edit; re-apply the CIS control to update
+# Generated for: Debian $DEB_VER, Proxmox ${PVE_VER:-?}, banaction=$BANACTION
+[DEFAULT]
+bantime   = 86400
+findtime  = 600
+maxretry  = 5
+banaction = $BANACTION
+backend   = systemd
+
+[sshd]
+enabled  = true
+port     = ssh
+backend  = systemd
+
+[proxmox]
+enabled  = true
+port     = https,http,8006
+filter   = proxmox
+backend  = systemd
+maxretry = 5
+findtime = 600
+bantime  = 86400
+F2BJAIL
+
+echo '[fail2ban] enable + restart...'
+systemctl enable fail2ban >/dev/null 2>&1 || true
+if ! systemctl restart fail2ban 2>/tmp/f2b.err; then
+  echo 'RESTART FAILED'; cat /tmp/f2b.err; journalctl -u fail2ban -n 30 --no-pager 2>/dev/null; exit 1
+fi
+
+# Give it a moment to load jails, then verify both jails are up
+sleep 3
+if ! fail2ban-client ping >/dev/null 2>&1; then
+  echo 'PING FAILED'; journalctl -u fail2ban -n 30 --no-pager 2>/dev/null; exit 1
+fi
+status=$(fail2ban-client status 2>&1)
+echo "$status" | grep -q 'sshd' || { echo "SSHD JAIL MISSING:"; echo "$status"; exit 1; }
+echo "$status" | grep -q 'proxmox' || { echo "PROXMOX JAIL MISSING:"; echo "$status"; exit 1; }
+echo DONE""",
+        },
+    }
+
+    # Hardening profiles. Tags which controls belong to which profile.
+    # cis-l1 = baseline (default, all 40 controls), cis-l2 = stricter, vs-nfd = BSI VS-NfD
+    # (Proxmox-safe subset + extra BSI-specific informational checks).
+    #
+    # IMPORTANT: vs-nfd intentionally EXCLUDES controls that risk breaking Proxmox:
+    #   - usb_storage (admins need USB)
+    #   - restrict_compilers (breaks package builds)
+    #   - remove_legacy_svcs (rpcbind/postfix needed for NFS / cron mail)
+    #   - disable_services (Proxmox-relevant services controlled by user)
+    #   - audit_immutable (requires reboot, surprises users)
+    # SSH crypto + kernel modules are in vs-nfd but operator must opt in per-control via
+    # the existing apply UI — not auto-applied.
+    _HARDENING_PROFILES = {
+        "cis-l1": None,  # None = all CIS_CHECKS (default behaviour)
+        "cis-l2": None,  # alias for now — same surface as cis-l1, kept for future split
+        "vs-nfd": {
+            # Proxmox-safe subset of existing CIS controls
+            "fs_modules",
+            "core_dumps",
+            "mount_options",
+            "cron_hardening",
+            "journald",
+            "ssh_perms",
+            "ssh_crypto",
+            "pam_faillock",
+            "pw_history",
+            "shell_timeout",
+            "file_perms",
+            "pw_hash_rounds",
+            "pw_quality",
+            "pw_aging",
+            "default_umask",
+            "pkg_cleanup",
+            "debsums",
+            "login_banners",
+            "file_integrity",
+            "process_acct",
+            "sysstat",
+            "pam_tmpdir",
+            "session_limit",
+            "inactive_accounts",
+            "audit_boot",
+            "audit_rules",
+            "aide_audit_protect",
+            "mem_protection",
+            "apparmor",
+            "sysctl_hardening",
+            "auditd_service",
+            # Plus VS-NfD extras (defined below in _VSNFD_EXTRA_CHECKS)
+            "vsnfd_disk_encryption",
+            "vsnfd_audit_retention",
+            "vsnfd_journald_size",
+            "vsnfd_secure_boot",
+            "vsnfd_kernel_lockdown",
+            "vsnfd_password_min_12",
+        },
+        # Extra framework profiles (mirror what the Compliance Dashboard uses)
+        # so Harden PVE Node UI can filter by the same lens. Pragmatic mappings, NOT formal.
+        # Updated to be more complete — was previously too conservative (#review)
+        "bsi": {
+            # IT-Grundschutz ORP/SYS/CON Bausteine that map to OS-level technical controls
+            "fs_modules",
+            "core_dumps",
+            "mount_options",
+            "cron_hardening",
+            "journald",
+            "ssh_perms",
+            "ssh_crypto",
+            "pam_faillock",
+            "pw_history",
+            "pw_quality",
+            "pw_aging",
+            "pw_hash_rounds",
+            "file_perms",
+            "login_banners",
+            "file_integrity",
+            "process_acct",
+            "session_limit",
+            "inactive_accounts",
+            "shell_timeout",
+            "default_umask",
+            "pam_tmpdir",
+            "audit_boot",
+            "audit_rules",
+            "aide_audit_protect",
+            "mem_protection",
+            "apparmor",
+            "sysctl_hardening",
+            "auditd_service",
+        },
+        "iso": {
+            # ISO 27001:2022 Annex A — A.5 (org), A.8 (technical) — software-implementable subset
+            "ssh_perms",
+            "ssh_crypto",
+            "pam_faillock",
+            "pw_history",
+            "pw_quality",
+            "pw_aging",
+            "pw_hash_rounds",
+            "file_perms",
+            "login_banners",
+            "file_integrity",
+            "process_acct",
+            "audit_boot",
+            "audit_rules",
+            "aide_audit_protect",
+            "audit_immutable",
+            "session_limit",
+            "inactive_accounts",
+            "shell_timeout",
+            "core_dumps",
+            "mount_options",
+            "mem_protection",
+            "apparmor",
+            "journald",
+            "default_umask",
+            "cron_hardening",
+            "auditd_service",
+            "sysctl_hardening",
+        },
+        "nis2": {
+            # NIS2 Art. 21 + KRITIS technical/organisational measures — broader than I had
+            "ssh_perms",
+            "ssh_crypto",
+            "pam_faillock",
+            "pw_history",
+            "pw_quality",
+            "pw_aging",
+            "file_perms",
+            "login_banners",
+            "file_integrity",
+            "process_acct",
+            "audit_boot",
+            "audit_rules",
+            "aide_audit_protect",
+            "audit_immutable",
+            "session_limit",
+            "inactive_accounts",
+            "mem_protection",
+            "apparmor",
+            "sysctl_hardening",
+            "auditd_service",
+            "journald",
+            "mount_options",
+        },
+        # French frameworks. Diffusion Restreinte (II 901) + RGS both
+        # reference ANSSI-BP-028 v2.0 as the Linux-hardening baseline; scope = the
+        # real checks BP-028 covers. BP-028 defers OpenSSH to a separate ANSSI note,
+        # so ssh_perms/ssh_crypto are intentionally NOT in this run-scope.
+        "dr": {
+            "fs_modules",
+            "core_dumps",
+            "mount_options",
+            "journald",
+            "pam_faillock",
+            "pw_history",
+            "pw_quality",
+            "pw_aging",
+            "pw_hash_rounds",
+            "file_perms",
+            "file_integrity",
+            "inactive_accounts",
+            "default_umask",
+            "audit_boot",
+            "audit_rules",
+            "aide_audit_protect",
+            "audit_immutable",
+            "mem_protection",
+            "apparmor",
+            "sysctl_hardening",
+            "auditd_service",
+            "pkg_cleanup",
+            "vsnfd_secure_boot",
+            "vsnfd_journald_size",
+            "vsnfd_password_min_12",
+        },
+        "rgs": {
+            "fs_modules",
+            "core_dumps",
+            "mount_options",
+            "journald",
+            "pam_faillock",
+            "pw_history",
+            "pw_quality",
+            "pw_aging",
+            "pw_hash_rounds",
+            "file_perms",
+            "file_integrity",
+            "inactive_accounts",
+            "default_umask",
+            "audit_boot",
+            "audit_rules",
+            "aide_audit_protect",
+            "audit_immutable",
+            "mem_protection",
+            "apparmor",
+            "sysctl_hardening",
+            "auditd_service",
+            "pkg_cleanup",
+            "vsnfd_secure_boot",
+            "vsnfd_journald_size",
+            "vsnfd_password_min_12",
+        },
+        "cmmc1": {
+            # CMMC Level 1 (FAR 52.204-21) — 17 basic safeguarding controls, software-side
+            "ssh_perms",
+            "pam_faillock",
+            "pw_history",
+            "pw_quality",
+            "pw_aging",
+            "file_perms",
+            "login_banners",
+            "debsums",
+            "file_integrity",
+            "audit_boot",
+            "audit_rules",
+            "sysctl_hardening",
+            "auditd_service",
+            "mem_protection",
+            "apparmor",
+        },
+        "cmmc2": {
+            "fs_modules",
+            "core_dumps",
+            "mount_options",
+            "journald",
+            "ssh_perms",
+            "ssh_crypto",
+            "pam_faillock",
+            "pw_history",
+            "pw_quality",
+            "pw_aging",
+            "pw_hash_rounds",
+            "file_perms",
+            "session_limit",
+            "inactive_accounts",
+            "shell_timeout",
+            "file_integrity",
+            "process_acct",
+            "audit_boot",
+            "audit_rules",
+            "aide_audit_protect",
+            "sysctl_hardening",
+            "mem_protection",
+            "apparmor",
+            "auditd_service",
+            "debsums",
+            "pkg_cleanup",
+        },
+        "nist53": {
+            "ssh_perms",
+            "ssh_crypto",
+            "pam_faillock",
+            "pw_history",
+            "pw_quality",
+            "pw_aging",
+            "pw_hash_rounds",
+            "file_perms",
+            "session_limit",
+            "inactive_accounts",
+            "file_integrity",
+            "process_acct",
+            "audit_boot",
+            "audit_rules",
+            "aide_audit_protect",
+            "sysctl_hardening",
+            "mem_protection",
+            "apparmor",
+            "auditd_service",
+            "debsums",
+            "journald",
+            "pkg_cleanup",
+            "login_banners",
+            "default_umask",
+        },
+        "stig": {
+            "fs_modules",
+            "core_dumps",
+            "ssh_perms",
+            "ssh_crypto",
+            "pam_faillock",
+            "pw_history",
+            "pw_quality",
+            "file_perms",
+            "login_banners",
+            "file_integrity",
+            "audit_boot",
+            "audit_rules",
+            "aide_audit_protect",
+            "audit_immutable",
+            "mem_protection",
+            "sysctl_hardening",
+            "auditd_service",
+        },
+    }
+
+    # VS-NfD specific informational checks. ALL audit-only - apply is a
+    # no-op that prints DONE so the existing apply API doesn't blow up. Operator must
+    # configure these manually after reading the evidence (BSI Grundschutz expects
+    # documented operator decision per environment).
+    _VSNFD_EXTRA_CHECKS = {
+        "vsnfd_disk_encryption": {
+            "check": """if lsblk -o NAME,FSTYPE,TYPE 2>/dev/null | grep -qE 'crypto_LUKS|zfs.*encrypt'; then echo OK; else echo FAIL; fi""",
+            "verbose_check": """echo '--- block devices ---'; lsblk -o NAME,FSTYPE,SIZE,MOUNTPOINT 2>/dev/null | head -20; echo '--- LUKS ---'; lsblk -o NAME,FSTYPE 2>/dev/null | grep -i luks || echo '  (no LUKS volumes found)'; echo '--- ZFS encryption ---'; zfs get encryption 2>/dev/null | grep -v 'off' | head -5 || echo '  (no encrypted ZFS datasets)'; """,
+            "apply": "echo 'INFORMATIONAL: configure disk encryption manually per BSI guidance'; echo DONE",
+        },
+        "vsnfd_audit_retention": {
+            "check": """RETENTION=$(grep -h '^MaxRetentionSec' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' '); if [ -n "$RETENTION" ]; then case "$RETENTION" in *month|*M) NUM=${RETENTION%[mM]*}; [ "$NUM" -ge 6 ] && echo OK || echo FAIL ;; *year|*Y) echo OK ;; *week|*w) NUM=${RETENTION%[wW]*}; [ "$NUM" -ge 26 ] && echo OK || echo FAIL ;; *day|*d) NUM=${RETENTION%[dD]*}; [ "$NUM" -ge 180 ] && echo OK || echo FAIL ;; *[!0-9]*) echo FAIL ;; *) [ "$RETENTION" -ge 15552000 ] && echo OK || echo FAIL ;; esac; else echo FAIL; fi""",
+            "verbose_check": """echo '--- journald retention configuration ---'; grep -h 'MaxRetentionSec\\|SystemMaxUse\\|Storage' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null || echo '  (no MaxRetentionSec configured)'; echo '--- current journal size ---'; journalctl --disk-usage 2>/dev/null""",
+            "apply": "echo 'INFORMATIONAL: set MaxRetentionSec=6month (or higher) in /etc/systemd/journald.conf manually'; echo DONE",
+        },
+        "vsnfd_journald_size": {
+            "check": """SIZE=$(grep -h '^SystemMaxUse' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null | tail -1 | awk -F= '{print $2}' | tr -d ' '); if [ -n "$SIZE" ]; then case "$SIZE" in *G|*g) NUM=${SIZE%[gG]*}; [ "$NUM" -ge 1 ] && echo OK || echo FAIL ;; *) echo FAIL ;; esac; else echo FAIL; fi""",
+            "verbose_check": """grep -h 'SystemMaxUse\\|RuntimeMaxUse' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf 2>/dev/null || echo '  (no SystemMaxUse configured, journald uses 10% of /var/log/journal partition default)'""",
+            "apply": "echo 'INFORMATIONAL: set SystemMaxUse=1G or larger in /etc/systemd/journald.conf manually'; echo DONE",
+        },
+        "vsnfd_secure_boot": {
+            "check": """if [ -d /sys/firmware/efi ]; then if mokutil --sb-state 2>/dev/null | grep -qi 'enabled'; then echo OK; else echo FAIL; fi; else echo FAIL; fi""",
+            "verbose_check": """echo '--- EFI status ---'; [ -d /sys/firmware/efi ] && echo 'EFI: yes' || echo 'EFI: no (legacy BIOS)'; echo '--- Secure Boot ---'; mokutil --sb-state 2>/dev/null || echo '  (mokutil not available)'; echo '--- TPM ---'; ls /dev/tpm* 2>/dev/null || echo '  (no TPM device)' """,
+            "apply": "echo 'INFORMATIONAL: enable Secure Boot in firmware (UEFI) — host re-installation may be required'; echo DONE",
+        },
+        "vsnfd_kernel_lockdown": {
+            "check": """LD=$(cat /sys/kernel/security/lockdown 2>/dev/null | tr -d ' '); echo "$LD" | grep -qE '\\[integrity\\]|\\[confidentiality\\]' && echo OK || echo FAIL""",
+            "verbose_check": """echo '--- kernel lockdown ---'; cat /sys/kernel/security/lockdown 2>/dev/null || echo '  (lockdown not available — kernel built without CONFIG_SECURITY_LOCKDOWN_LSM)'""",
+            "apply": "echo 'INFORMATIONAL: kernel lockdown is set at boot via cmdline (lockdown=integrity) or by Secure Boot. Cannot toggle live.'; echo DONE",
+        },
+        "vsnfd_password_min_12": {
+            "check": """grep -h 'minlen\\s*=' /etc/security/pwquality.conf /etc/security/pwquality.conf.d/*.conf 2>/dev/null | grep -oE 'minlen\\s*=\\s*[0-9]+' | tail -1 | awk -F= '{print $2}' | awk '{if ($1+0 >= 12) print "OK"; else print "FAIL"}' """,
+            "verbose_check": """echo '--- pwquality configuration ---'; grep -h 'minlen\\|minclass\\|dcredit\\|ucredit\\|lcredit\\|ocredit' /etc/security/pwquality.conf /etc/security/pwquality.conf.d/*.conf 2>/dev/null || echo '  (no pwquality settings found — install libpam-pwquality)'""",
+            "apply": "echo 'INFORMATIONAL: BSI requires minlen=12+. Use pw_quality CIS control with custom params or edit /etc/security/pwquality.conf manually.'; echo DONE",
+        },
+    }
+
+    def _profile_control_set(self, profile):
+        """Return the set of control_ids active for a given profile.
+
+        None / unknown profile → all CIS_CHECKS (backwards-compatible).
+        vs-nfd → curated subset + BSI extras.
+        """
+        if not profile:
+            return None  # signal: all controls
+        members = self._HARDENING_PROFILES.get(profile)
+        if members is None:
+            return None
+        return set(members)
+
+    def _all_hardening_controls(self):
+        """Merged dict of CIS_CHECKS + VS-NfD extras (id → control)."""
+        merged = dict(self.CIS_CHECKS)
+        merged.update(self._VSNFD_EXTRA_CHECKS)
+        return merged
+
+    def check_node_hardening(self, node_name, verbose=False, profile=None):
+        """Check CIS hardening status for a node via SSH.
+
+        verbose=False (default): returns {control_id: bool}
+        verbose=True: returns {control_id: {'status': bool, 'evidence': str, 'command': str}}
+                      — used for audit reports (#322). Also runs the per-control 'verbose_check'
+                      command if defined, otherwise falls back to the raw check output.
+        profile=None / 'cis-l1' / 'cis-l2': all CIS controls (default).
+        profile='vs-nfd': Proxmox-safe subset + BSI VS-NfD extras ( ).
+        """
+        all_checks = self._all_hardening_controls()
+        members = self._profile_control_set(profile)
+        if members is not None:
+            checks = {cid: ctrl for cid, ctrl in all_checks.items() if cid in members}
+        else:
+            checks = self.CIS_CHECKS  # original behaviour
+        parts = []
+        for cid, ctrl in checks.items():
+            if verbose and ctrl.get("verbose_check"):
+                # verbose check: extra context command AFTER the OK/FAIL line
+                parts.append(
+                    f"echo '---{cid}---' && {{ {ctrl['check']}; }} ; "
+                    f"echo '---{cid}:EVIDENCE---' && {{ {ctrl['verbose_check']}; }} 2>&1"
+                )
+            else:
+                parts.append(f"echo '---{cid}---' && {{ {ctrl['check']}; }}")
+        combined = " ; ".join(parts) + " ; echo '---END---'"
+
+        raw = self._ssh_node_output(node_name, combined, timeout=90)
+        if raw is None:
+            return None
+
+        # simple (non-verbose) parse — preserved for backward compat
+        if not verbose:
+            results = {}
+            current_id = None
+            for line in raw.splitlines():
+                line = line.strip()
+                if line.startswith("---") and line.endswith("---"):
+                    tag = line.strip("-")
+                    if tag == "END":
+                        break
+                    if tag in checks:
+                        current_id = tag
+                elif current_id:
+                    results[current_id] = line.strip() == "OK"
+                    current_id = None
+            return results
+
+        # verbose parse — capture status + everything up to next marker as evidence
+        results = {}
+        current_id = None
+        section = "status"  # 'status' or 'evidence'
+        evidence_lines = []
+        status_line = None
+
+        def _flush(cid):
+            if cid and cid in checks:
+                results[cid] = {
+                    "status": (status_line or "").strip() == "OK",
+                    "evidence": "\n".join(line for line in evidence_lines if line.strip())[:2000],
+                    "command": checks[cid].get("check", ""),
+                }
+
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("---") and stripped.endswith("---"):
+                tag = stripped.strip("-")
+                if tag == "END":
+                    _flush(current_id)
+                    break
+                # evidence sub-marker like "ssh_perms:EVIDENCE"
+                if ":EVIDENCE" in tag:
+                    section = "evidence"
+                    continue
+                # new control — flush previous
+                _flush(current_id)
+                current_id = tag if tag in checks else None
+                section = "status"
+                status_line = None
+                evidence_lines = []
+                continue
+
+            if not current_id:
+                continue
+            if section == "status" and status_line is None:
+                status_line = stripped
+            else:
+                evidence_lines.append(line)  # keep original (with whitespace)
+
+        return results
+
+    def apply_node_hardening(self, node_name, controls, params=None):
+        """Apply selected CIS controls to a node. Returns per-control results.
+
+        Also accepts VS-NfD informational checks (apply is no-op).
+        """
+        import re as _re
+
+        all_checks = self._all_hardening_controls()
+        out = {}
+        for ctrl_id in controls:
+            if ctrl_id not in all_checks:
+                out[ctrl_id] = {"success": False, "error": "unknown control"}
+                continue
+            check = all_checks[ctrl_id]
+            cmd = check["apply"]
+            # Templated controls get user-supplied values merged with defaults
+            # Extended validator to accept Linux usernames (comma-list)
+            # for the service_user param used by pam_faillock / pw_aging /
+            # session_limit / inactive_accounts. Old regex only allowed IPs which
+            # was fine for backup_dns but broke service-user templates.
+            if check.get("apply_template"):
+                vals = dict(check.get("defaults", {}))
+                if params and ctrl_id in params:
+                    for k, v in params[ctrl_id].items():
+                        v = str(v).strip()
+                        if not v:
+                            continue
+                        # IP/IPv6/MAC-style for backup_dns
+                        if _re.match(r"^[\d\.:a-fA-F]+$", v) or _re.match(
+                            r"^[a-zA-Z][a-zA-Z0-9._\-]{0,31}(?:,[a-zA-Z][a-zA-Z0-9._\-]{0,31})*$", v
+                        ):
+                            vals[k] = v
+                        # else: silently dropped (defaults remain)
+                cmd = cmd.format(**vals)
+            # #386: snapshot the files this control edits BEFORE applying, so the
+            # change can be rolled back. Only the first apply backs up (preserves
+            # the true pre-hardening state); a re-apply won't clobber the original.
+            bf = check.get("backup_files")
+            if bf:
+                pre = "; ".join(
+                    "{{ [ -f {} ] && [ ! -f {} ] && cp -p {} {}; }} || true".format(
+                        shlex.quote(f),
+                        shlex.quote(f + ".ProxmoxVEx-bak." + ctrl_id),
+                        shlex.quote(f),
+                        shlex.quote(f + ".ProxmoxVEx-bak." + ctrl_id),
+                    )
+                    for f in bf
+                )
+                cmd = pre + "; " + cmd
+            result = self._ssh_node_output(node_name, cmd, timeout=60)
+            if result is not None and "DONE" in result:
+                out[ctrl_id] = {"success": True}
+            else:
+                out[ctrl_id] = {"success": False, "error": result or "SSH command failed"}
+        return out
+
+    def rollback_node_hardening(self, node_name, controls):
+        """Restore the config files a CIS control changed, from the snapshot taken
+        at apply time (#386). Only controls that declare backup_files can roll back."""
+        all_checks = self._all_hardening_controls()
+        out = {}
+        for ctrl_id in controls:
+            ctrl = all_checks.get(ctrl_id)
+            if not ctrl:
+                out[ctrl_id] = {"success": False, "error": "unknown control"}
+                continue
+            bf = ctrl.get("backup_files")
+            if not bf:
+                out[ctrl_id] = {"success": False, "error": "control has no rollback snapshot (not reversible)"}
+                continue
+            steps = []
+            for f in bf:
+                bak = f + ".ProxmoxVEx-bak." + ctrl_id
+                qf, qb = shlex.quote(f), shlex.quote(bak)
+                steps.append(
+                    f"if [ -f {qb} ]; then cp -p {qb} {qf} && rm -f {qb} && echo RESTORED:{ctrl_id}; else echo NOBACKUP:{ctrl_id}; fi"
+                )
+            post = ctrl.get("rollback_post")
+            if post:
+                steps.append(f"{{ {post} ; }} || true")
+            steps.append("echo DONE")
+            result = self._ssh_node_output(node_name, " ; ".join(steps), timeout=60)
+            if result and "DONE" in result and "RESTORED:" in result:
+                out[ctrl_id] = {"success": True}
+            elif result and "NOBACKUP:" in result and "RESTORED:" not in result:
+                out[ctrl_id] = {
+                    "success": False,
+                    "error": "no snapshot found — control was never applied (or already rolled back)",
+                }
+            else:
+                out[ctrl_id] = {"success": False, "error": (result or "SSH command failed")[:300]}
+        return out
+
+    def _fetch_qemu_disk_usage(self, node: str, vmid: int) -> dict:
+        """Get actual filesystem usage from guest agent (get-fsinfo).
+        Returns {used, total} in bytes, or empty dict if unavailable."""
+        if vmid in self._no_agent_vms:
+            return {}
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/get-fsinfo"
+            resp = self._create_session().get(url, timeout=4)
+            if resp.status_code == 500:
+                self._no_agent_vms.add(vmid)
+                return {}
+            if resp.status_code != 200:
+                return {}
+            filesystems = resp.json().get("data", {}).get("result", [])
+            total, used = 0, 0
+            for fs in filesystems:
+                # skip snap/loop/tmpfs mounts
+                mt = fs.get("mountpoint", "")
+                if "/snap/" in mt or mt.startswith("/boot/efi"):
+                    continue
+                fs_total = fs.get("total-bytes", 0)
+                fs_used = fs.get("used-bytes", 0)
+                if fs_total > 0:
+                    total += fs_total
+                    used += fs_used
+            return {"used": used, "total": total} if total > 0 else {}
+        except Exception:
+            return {}
+
+    def refresh_ip_cache(self) -> None:
+        if not self.is_connected or not self.session:
+            return
+        try:
+            resources = self.get_vm_resources()
+            running = [r for r in resources if r.get("status") == "running"]
+            if not running:
+                return
+
+            def fetch_one(r):
+                node = r.get("node", "")
+                vmid = r.get("vmid")
+                if not node or not vmid:
+                    return None
+                vm_type = r.get("type", "qemu")
+                if vm_type == "lxc":
+                    ips = self._fetch_lxc_ips(node, vmid)
+                    return (node, vmid, ips, None)
+                else:
+                    ips = self._fetch_qemu_ips(node, vmid)
+                    disk = self._fetch_qemu_disk_usage(node, vmid)
+                    return (node, vmid, ips, disk)
+
+            tasks = [lambda r=r: fetch_one(r) for r in running]
+            results = run_concurrent(tasks, timeout=15.0)
+
+            with self._ip_cache_lock:
+                for result in results:
+                    if result is None:
+                        continue
+                    node, vmid, ips, disk = result
+                    self._ip_cache[(node, vmid)] = ips
+            with self._disk_cache_lock:
+                for result in results:
+                    if result is None:
+                        continue
+                    node, vmid, ips, disk = result
+                    if disk:
+                        self._disk_cache[(node, vmid)] = disk
+        except Exception as e:
+            self.logger.debug(f"[IP cache] refresh failed: {e}")
+
+    def refresh_ostype_cache(self) -> None:
+        """Fetch ostype from per-VM config for VMs not yet in the cache.
+
+        Only fetches a small batch per cycle (max 10) to avoid overloading the
+        PVE API.  Once an ostype is cached it stays until the manager restarts
+        (ostype almost never changes for an existing VM).
+        """
+        if not self.is_connected or not self.session:
+            return
+        try:
+            resources = self.get_vm_resources(max_age=6)
+            with self._ostype_cache_lock:
+                missing = [r for r in resources if (r.get("node", ""), r.get("vmid")) not in self._ostype_cache]
+            # batch limit: fetch at most 10 per cycle to stay lightweight
+            batch = missing[:10]
+            if not batch:
+                return
+
+            def fetch_ostype(r):
+                node = r.get("node", "")
+                vmid = r.get("vmid")
+                vm_type = r.get("type", "qemu")
+                if not node or not vmid:
+                    return None
+                try:
+                    if vm_type == "lxc":
+                        url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+                    else:
+                        url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+                    resp = self._create_session().get(url, timeout=5)
+                    if resp.status_code == 200:
+                        ostype = resp.json().get("data", {}).get("ostype")
+                        if ostype:
+                            return (node, vmid, ostype)
+                except Exception:
+                    pass
+                return None
+
+            tasks = [lambda r=r: fetch_ostype(r) for r in batch]
+            results = run_concurrent(tasks, timeout=15.0)
+            with self._ostype_cache_lock:
+                for result in results:
+                    if result is None:
+                        continue
+                    node, vmid, ostype = result
+                    self._ostype_cache[(node, vmid)] = ostype
+        except Exception as e:
+            self.logger.debug(f"[ostype cache] refresh failed: {e}")
+
+    def _ip_refresh_loop(self) -> None:
+        """Background loop that refreshes the IP cache every 30 seconds.
+
+        (#375) - every 5 min we also drop the entire `_no_agent_vms`
+        skip-list so VMs whose guest agent wasn't ready at the first probe get
+        re-checked. Without this, freshly-added or migrated VMs that booted
+        after the initial probe stayed permanently skipped until restart.
+        """
+        if self.stop_event.wait(15):  # 15s initial delay
+            return
+        _NO_AGENT_TTL = 300  # 5 minutes
+        last_no_agent_clear = time.time()
+        import random
+
+        while not self.stop_event.is_set():
+            try:
+                if self.is_connected:
+                    # H4 (scale audit): only refresh IPs for a cluster someone is
+                    # actually viewing — this fans out 1-2 guest-agent calls PER
+                    # running VM; doing it for all 30 clusters every 30s saturates
+                    # the shared node pool for data no client is looking at. The
+                    # _no_agent_vms TTL-clear stays unconditional (cheap).
+                    if is_cluster_watched(self.id):
+                        self.refresh_ip_cache()
+                        self.refresh_ostype_cache()
+                    now = time.time()
+                    if now - last_no_agent_clear >= _NO_AGENT_TTL:
+                        if self._no_agent_vms:
+                            self.logger.debug(
+                                f"[IP refresh] retrying {len(self._no_agent_vms)} previously-skipped agent VMs"
+                            )
+                            self._no_agent_vms.clear()
+                        last_no_agent_clear = now
+            except Exception as e:
+                self.logger.debug(f"[IP refresh loop] error: {e}")
+            # H4: jitter so 30 managers don't fire on the same wall-clock tick
+            self.stop_event.wait(30 + random.uniform(0, 10))
+
+    def start(self):
+        """Start the ProxmoxVEx daemon"""
+        if self.running:
+            return
+
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self.daemon_loop)
+        self.thread.daemon = True
+        self.thread.start()
+        self.running = True
+        self.logger.info(f"Started ProxmoxVEx manager for {self.config.name}")
+
+        # Start HA monitor if enabled
+        if self.config.ha_enabled:
+            self.start_ha_monitor()
+
+        # Start background IP refresh thread
+        self._ip_refresh_thread = threading.Thread(target=self._ip_refresh_loop, daemon=True)
+        self._ip_refresh_thread.start()
+
+    def stop(self):
+        """Stop the ProxmoxVEx daemon"""
+        if not self.running:
+            return
+
+        # Stop HA monitor
+        self.stop_ha_monitor()
+
+        # (#444) - when this manager is being swapped out (e.g. via
+        # reconfigure), block any straggler in-flight task from triggering a
+        # re-login on the way out. Whatever creds we hold are about to be
+        # replaced; we don't want orphan workers spamming pveproxy.
+        with self._auth_failure_lock:
+            self._auth_blocked_until = float("inf")
+
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=5)
+        self.running = False
+        self.logger.info(f"Stopped ProxmoxVEx manager for {self.config.name}")

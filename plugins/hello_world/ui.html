@@ -1,0 +1,58 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/hello_world/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hello World</title>
+    <script src="/static/js/purify.min.js"></script>
+    <link rel="stylesheet" href="/api/plugins/hello_world/api/ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Hello World</h1>
+            <span class="badge" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+
+        <div class="card">
+            <h2>Status <button id="refresh" class="secondary" style="margin-left:auto;">Refresh</button></h2>
+            <div id="statusCard">
+                <p class="muted">Loading...</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Info</h2>
+            <div id="infoCard">
+                <p class="muted">Loading...</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>Try the Echo API</h2>
+            <div class="actions">
+                <input type="text" id="echoText" placeholder="Type a message..." />
+                <button id="echoBtn">Send</button>
+            </div>
+            <pre id="echoResult" class="muted">Response will appear here.</pre>
+        </div>
+    </div>
+
+    <script src="/api/plugins/hello_world/api/ui.js"></script>
+</body>
+
+</html>

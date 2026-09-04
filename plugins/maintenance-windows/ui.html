@@ -1,0 +1,113 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/maintenance-windows/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Maintenance Windows</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Maintenance Windows</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="windows">Windows</button>
+            <button class="tab" role="tab" data-tab="add">Create/Edit</button>
+            <button class="tab" role="tab" data-tab="impact">Check Impact</button>
+        </div>
+
+        <div id="panel-windows" class="tab-panel">
+            <div class="card">
+                <h2>Windows</h2>
+                <div class="form">
+                    <label>Filter status <select id="wStatus">
+                            <option value="">All</option>
+                            <option value="active">Active</option>
+                            <option value="upcoming">Upcoming</option>
+                            <option value="past">Past</option>
+                            <option value="overridden">Overridden</option>
+                        </select></label>
+                    <label>Sort <select id="wSort">
+                            <option value="start">Start</option>
+                            <option value="end">End</option>
+                            <option value="name">Name</option>
+                        </select></label>
+                    <button id="wLoad">Refresh</button>
+                </div>
+                <p id="wError" class="error-text"></p>
+                <div id="windowsList">
+                    <p class="empty">No windows.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-add" class="tab-panel" hidden>
+            <div class="card">
+                <h2 id="addTitle">Create Window</h2>
+                <input type="hidden" id="wIdH" />
+                <div class="form">
+                    <label>Name <input type="text" id="wName" placeholder="Patch night" /></label>
+                    <label>Start <input type="datetime-local" id="wStart" /></label>
+                    <label>End <input type="datetime-local" id="wEnd" /></label>
+                    <label>Cluster scope <select id="wCluster">
+                            <option value="">Global</option>
+                        </select></label>
+                    <label>Time zone <select id="wTz">
+                            <option value="UTC">UTC</option>
+                            <option value="America/New_York">America/New_York</option>
+                            <option value="Europe/London">Europe/London</option>
+                            <option value="Asia/Tokyo">Asia/Tokyo</option>
+                        </select></label>
+                    <label>Recurring <input type="checkbox" id="wRecurring" /></label>
+                    <label>Cron <input type="text" id="wCron" placeholder="0 2 * * 0" /></label>
+                    <label>Description <textarea id="wDesc" rows="2"></textarea></label>
+                    <button id="wSave">Create</button>
+                    <button id="wCancel" class="secondary" hidden>Cancel</button>
+                </div>
+                <p id="wAddError" class="error-text"></p>
+            </div>
+        </div>
+
+        <div id="panel-impact" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Check Impact</h2>
+                <div class="form">
+                    <label>Window <select id="iWindow">
+                            <option value="">Select</option>
+                        </select></label>
+                    <label>Cluster (optional) <select id="iCluster">
+                            <option value="">All</option>
+                        </select></label>
+                    <button id="iCheck">Check</button>
+                </div>
+                <p id="iError" class="error-text"></p>
+                <div id="iResult">
+                    <p class="empty">No impact checked.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

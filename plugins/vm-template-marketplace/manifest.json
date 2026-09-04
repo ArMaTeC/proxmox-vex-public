@@ -1,0 +1,12 @@
+{
+    "id": "vm-template-marketplace",
+    "name": "VM Template Marketplace",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Manage and import VM templates from a local catalog.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Compute",
+    "min_license_tier": "advanced"
+}

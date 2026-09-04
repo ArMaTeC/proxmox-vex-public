@@ -1,0 +1,12 @@
+{
+    "id": "vm-migration-planner",
+    "name": "VM Migration Planner",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Plan live migrations across Proxmox cluster nodes.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Compute",
+    "min_license_tier": "advanced"
+}

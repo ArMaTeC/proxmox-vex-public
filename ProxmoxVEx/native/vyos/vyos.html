@@ -1,0 +1,46 @@
+<!doctype html>
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        ProxmoxVEx/native/vyos/vyos.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Vyos HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VyOS - ProxmoxVEx</title>
+
+  <link rel="stylesheet" href="vyos.css">
+</head>
+
+<body>
+  <h1 data-i18n="title">VyOS</h1>
+  <div class="tabs">
+    <button class="tab active" data-target="overview" data-i18n="overview">Overview</button>
+    <button class="tab" data-target="interfaces" data-i18n="interfaces">Interfaces</button>
+    <button class="tab" data-target="routes" data-i18n="routes">Routes</button>
+  </div>
+  <div id="overview" class="panel active">
+    <div class="status" id="status-overview" data-i18n="loading">Loading overview...</div>
+    <pre id="json-overview"></pre>
+  </div>
+  <div id="interfaces" class="panel">
+    <div class="status" id="status-interfaces" data-i18n="loading">Loading interfaces...</div>
+    <pre id="json-interfaces"></pre>
+  </div>
+  <div id="routes" class="panel">
+    <div class="status" id="status-routes" data-i18n="loading">Loading routes...</div>
+    <pre id="json-routes"></pre>
+  </div>
+
+  <script src="vyos.js"></script>
+</body>
+
+</html>

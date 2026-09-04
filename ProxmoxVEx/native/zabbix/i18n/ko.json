@@ -1,0 +1,15 @@
+{
+  "cancel": "취소",
+  "configured": "구성됨",
+  "loading": "로딩 중...",
+  "overview": "개요",
+  "save": "저장",
+  "status": "상태",
+  "title": "Zabbix",
+  "unconfigured": "구성되지 않음",
+  "hosts": "Hosts",
+  "problems": "Problems",
+  "error": "Error: %s",
+  "loaded": "Loaded %s",
+  "request_failed": "Request failed: %s"
+}

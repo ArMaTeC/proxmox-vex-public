@@ -1,0 +1,101 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/network-topology-map/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Network Topology Map</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Network Topology Map</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="map">Topology</button>
+            <button class="tab" role="tab" data-tab="edges">Cached Edges</button>
+        </div>
+
+        <div id="panel-map" class="tab-panel">
+            <div class="grid">
+                <div class="stat">
+                    <div class="muted">Cached Nodes</div>
+                    <div class="num" id="statNodes">0</div>
+                </div>
+                <div class="stat">
+                    <div class="muted">Cached Edges</div>
+                    <div class="num" id="statEdges">0</div>
+                </div>
+            </div>
+            <div class="card">
+                <h2>Load / Refresh</h2>
+                <div class="form">
+                    <label>Cluster <select id="mCluster">
+                            <option value="">Select</option>
+                        </select></label>
+                    <button id="mLoad">Load</button>
+                    <button id="mRefresh" class="secondary">Refresh Cache</button>
+                    <button id="mFit" class="secondary">Fit</button>
+                    <button id="mReset" class="secondary">Reset</button>
+                    <button id="mFullscreen" class="secondary">Fullscreen</button>
+                </div>
+                <p id="mError" class="error-text"></p>
+                <div class="legend">
+                    <span><span class="dot" style="background:var(--info)"></span> Node</span>
+                    <span><span class="dot" style="background:var(--success)"></span> VM</span>
+                    <span><span class="dot" style="background:var(--warning)"></span> Network</span>
+                </div>
+                <div class="form">
+                    <label>Filter <select id="mFilter">
+                            <option value="">All</option>
+                            <option value="node">Node</option>
+                            <option value="vm">VM</option>
+                            <option value="network">Network</option>
+                        </select></label>
+                </div>
+                <div id="graph"></div>
+                <div id="detail">
+                    <p class="empty">Click a node to see details.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-edges" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Cached Edges</h2>
+                <div class="form">
+                    <label>Sort <select id="eSort">
+                            <option value="source">Source</option>
+                            <option value="target">Target</option>
+                        </select></label>
+                    <button id="eLoad" class="secondary">Refresh</button>
+                </div>
+                <div id="edgesList">
+                    <p class="empty">No cached edges.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

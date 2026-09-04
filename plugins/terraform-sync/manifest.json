@@ -1,0 +1,12 @@
+{
+    "id": "terraform-sync",
+    "name": "Terraform State Sync",
+    "version": "1.1.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Export ProxmoxVEx-managed resources to Terraform and keep state in sync.",
+    "min_ProxmoxVEx": "1.2.75",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Automation",
+    "min_license_tier": "advanced"
+}

@@ -1,0 +1,16 @@
+{
+  "cancel": "Annuler",
+  "configured": "Configuré",
+  "loading": "Chargement...",
+  "overview": "Aperçu",
+  "save": "Enregistrer",
+  "status": "Statut",
+  "title": "vCenter VMware",
+  "unconfigured": "Non configuré",
+  "vms": "VMs",
+  "hosts": "Hosts",
+  "datastores": "Stockages de données",
+  "error": "Error: %s",
+  "loaded": "Loaded %s",
+  "request_failed": "Request failed: %s"
+}

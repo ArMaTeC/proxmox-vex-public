@@ -1,0 +1,16 @@
+{
+  "cancel": "Отмена",
+  "configured": "Настроено",
+  "loading": "Загрузка...",
+  "overview": "Обзор",
+  "save": "Сохранить",
+  "status": "Статус",
+  "title": "VyOS",
+  "unconfigured": "Не настроено",
+  "interfaces": "Интерфейсы",
+  "routes": "Маршруты",
+  "loaded_status": "Loaded %s (%s)",
+  "failed_to_load": "Failed to load %s: %s",
+  "error_loading": "Error loading %s: %s",
+  "unknown_error": "unknown error"
+}

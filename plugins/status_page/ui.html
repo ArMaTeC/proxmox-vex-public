@@ -1,0 +1,96 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/status_page/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Status Page Admin</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Status Page Admin</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="settings">Settings</button>
+            <button class="tab" role="tab" data-tab="incidents">Incidents</button>
+            <button class="tab" role="tab" data-tab="public">Public Link</button>
+        </div>
+
+        <div id="panel-settings" class="tab-panel">
+            <div class="card">
+                <h2>Settings</h2>
+                <div class="form">
+                    <label>Page Title <input type="text" id="sTitle" /></label>
+                    <label>Refresh Interval (s) <input type="number" id="sRefresh" min="5" max="3600" /></label>
+                    <label>PBS Stale Hours <input type="number" id="sPbsStale" min="1" max="8760" /></label>
+                    <label>Theme Color <input type="color" id="sColor" /></label>
+                    <label>Custom Logo URL <input type="text" id="sLogo" /></label>
+                    <label><input type="checkbox" id="sClusterName" /> Show Cluster Name</label>
+                    <label><input type="checkbox" id="sNodeDetails" /> Show Node Details</label>
+                    <label><input type="checkbox" id="sVmSummary" /> Show VM Summary</label>
+                    <label><input type="checkbox" id="sStorage" /> Show Storage</label>
+                    <label><input type="checkbox" id="sPbs" /> Show PBS Backups</label>
+                </div>
+                <button id="sSave">Save Settings</button>
+                <button id="sRegen" class="secondary">Regenerate Auth Key</button>
+                <p id="sError" class="error-text" style="color:var(--danger); font-size:0.8rem;"></p>
+            </div>
+        </div>
+
+        <div id="panel-incidents" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Incidents</h2>
+                <div class="form" style="grid-template-columns:1fr 1fr 2fr 120px 100px auto;">
+                    <label>Title <input type="text" id="iTitle" placeholder="Incident title" /></label>
+                    <label>Severity <select id="iSeverity">
+                            <option value="minor">Minor</option>
+                            <option value="major">Major</option>
+                            <option value="critical">Critical</option>
+                        </select></label>
+                    <label>Message <input type="text" id="iMessage" placeholder="Details" /></label>
+                    <label>Status <select id="iStatus">
+                            <option value="investigating">Investigating</option>
+                            <option value="identified">Identified</option>
+                            <option value="monitoring">Monitoring</option>
+                            <option value="resolved">Resolved</option>
+                        </select></label>
+                    <label>Components <input type="text" id="iComponents" placeholder="comma,list" /></label>
+                    <button id="iCreate" style="align-self:flex-end;">Create</button>
+                </div>
+                <div id="iList">
+                    <p class="muted">No incidents.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-public" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Public Status URL</h2>
+                <div id="publicUrl" class="url-box">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

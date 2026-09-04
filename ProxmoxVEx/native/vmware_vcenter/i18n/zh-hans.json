@@ -1,0 +1,16 @@
+{
+  "cancel": "取消",
+  "configured": "已配置",
+  "loading": "加载中...",
+  "overview": "概览",
+  "save": "保存",
+  "status": "状态",
+  "title": "VMware vCenter",
+  "unconfigured": "未配置",
+  "vms": "虚拟机",
+  "hosts": "Hosts",
+  "datastores": "数据存储",
+  "error": "Error: %s",
+  "loaded": "Loaded %s",
+  "request_failed": "Request failed: %s"
+}

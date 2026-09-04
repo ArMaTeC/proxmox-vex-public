@@ -1,0 +1,15 @@
+{
+  "cancel": "Annuler",
+  "configured": "Configuré",
+  "loading": "Chargement...",
+  "overview": "Aperçu",
+  "save": "Enregistrer",
+  "status": "Statut",
+  "title": "Gestionnaire pfSense",
+  "unconfigured": "Non configuré",
+  "interfaces": "Interfaces",
+  "rules": "Règles",
+  "error": "Error: %s",
+  "loaded": "Loaded %s",
+  "request_failed": "Request failed: %s"
+}

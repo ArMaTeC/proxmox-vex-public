@@ -1,0 +1,102 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/backup-retention-guard/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Backup Retention Guard</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Backup Retention Guard</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="policies">Policies</button>
+            <button class="tab" role="tab" data-tab="prune">Prune</button>
+            <button class="tab" role="tab" data-tab="compliance">Compliance</button>
+        </div>
+
+        <div id="panel-policies" class="tab-panel">
+            <div class="card">
+                <h2 id="formTitle">Create Policy</h2>
+                <form class="form" id="policyForm">
+                    <input type="hidden" id="pId" />
+                    <label>Name <input type="text" id="pName" required placeholder="Daily 7/30" /></label>
+                    <label>Keep count <input type="number" id="pKeep" min="1" value="7" /></label>
+                    <label>Max age (days) <input type="number" id="pAge" min="1" value="30" /></label>
+                    <label style="flex:1 1 100%;">Description <input type="text" id="pDesc"
+                            placeholder="Keep last 7 daily backups within 30 days" /></label>
+                    <button type="submit">Save</button>
+                    <button type="button" id="pReset" class="secondary">Reset</button>
+                </form>
+                <p id="pError" class="error-text"></p>
+            </div>
+            <div class="card">
+                <h2>Policies</h2>
+                <input type="text" id="pSearch" placeholder="Filter by name" />
+                <div id="policiesList">
+                    <p class="empty">No policies.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-prune" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Simulate / Apply Prune</h2>
+                <div class="form">
+                    <label>Policy <select id="prPolicy">
+                            <option value="">Select policy</option>
+                        </select></label>
+                    <button id="prSim">Simulate</button>
+                    <button id="prApply" class="secondary">Apply</button>
+                </div>
+                <div class="grid" id="prMetrics"></div>
+                <div id="pruneList">
+                    <p class="empty">Run a simulation.</p>
+                </div>
+            </div>
+            <div class="card">
+                <h2>Assign to Cluster/VM</h2>
+                <div class="form">
+                    <label>Policy <select id="asPolicy">
+                            <option value="">Select policy</option>
+                        </select></label>
+                    <label>Target <input type="text" id="asTarget" placeholder="cluster-1/vm-100" /></label>
+                    <button id="asAssign">Assign</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-compliance" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Compliance Status</h2>
+                <div class="grid" id="compGrid">
+                    <p class="empty">Loading...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

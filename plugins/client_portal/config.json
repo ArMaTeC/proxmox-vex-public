@@ -1,0 +1,58 @@
+{
+    "allowed_actions": [
+        "vm.view",
+        "vm.start",
+        "vm.stop",
+        "vm.console"
+    ],
+    "portal_title": "Client Portal",
+    "show_resource_usage": true,
+    "show_ip_addresses": true,
+    "allow_password_change": true,
+    "allow_snapshots": true,
+    "custom_logo_url": "",
+    "theme_color": "#e57000",
+    "max_snapshots_per_vm": 5,
+    "allowed_isos": [],
+    "iso_storage": "",
+    "ct_create": {
+        "cluster_id": "",
+        "node": "",
+        "storage": "local-lvm",
+        "bridge": "vmbr0",
+        "templates": [],
+        "max_cores": 2,
+        "max_memory_mb": 2048,
+        "max_disk_gb": 16
+    },
+    "allow_ct_create": false,
+    "allow_destroy": false,
+    "allow_iso_mount": false,
+    "_help": {
+        "allowed_actions": "Client self-service actions allowed for end users.",
+        "portal_title": "Title shown in the client portal header.",
+        "show_resource_usage": "Show CPU and memory usage in the client portal.",
+        "show_ip_addresses": "Show VM IP addresses in the client portal.",
+        "allow_password_change": "Allow clients to change their password.",
+        "allow_snapshots": "Allow clients to manage VM snapshots.",
+        "custom_logo_url": "URL to a custom logo image.",
+        "theme_color": "Primary theme colour (hex).",
+        "max_snapshots_per_vm": "Maximum number of snapshots a client may keep per VM.",
+        "allowed_isos": "List of ISO filenames clients are allowed to mount.",
+        "iso_storage": "Storage where allowed ISO files are located.",
+        "ct_create": {
+            "cluster_id": "Value for cluster id.",
+            "node": "Value for node.",
+            "storage": "Value for storage.",
+            "bridge": "Value for bridge.",
+            "templates": "Value for templates.",
+            "max_cores": "Value for max cores.",
+            "max_memory_mb": "Value for max memory mb.",
+            "max_disk_gb": "Value for max disk gb.",
+            "_description": "Value for ct create."
+        },
+        "allow_ct_create": "Allow clients to create containers.",
+        "allow_destroy": "Allow clients to destroy their assigned guests.",
+        "allow_iso_mount": "Allow clients to mount ISO files."
+    }
+}

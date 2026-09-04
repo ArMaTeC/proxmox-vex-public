@@ -1,0 +1,106 @@
+/* --- ProxmoxVEx auto-header start ---
+ * -------------------------------------------------------------------
+ * File:        web/src/constants.js
+ * Project:     ProxmoxVEx
+ * Version:     1.2.303
+ * Build:       2026.09.04
+ * Description: Constants JS source
+ * Docs:        https://proxmoxvex.local/docs
+ * Generated:   2026-09-04
+ * -------------------------------------------------------------------
+ * --- ProxmoxVEx auto-header end --- */
+const { useState, useEffect, useRef, useCallback, useMemo, createContext, useContext } = React;
+
+// API runs on same origin, Flask serves both frontend and API
+// This makes deployment super easy - just one process
+const API_URL = window.location.origin + '/api';
+// const API_URL = 'http://localhost:5000/api';  // local dev
+// const API_URL = 'https://ProxmoxVEx.internal/api' // old staging
+
+// Central version constant - keep in sync with backend ProxmoxVEx_VERSION
+const ProxmoxVEx_VERSION = "1.2.303";
+const DEBUG = false; // set true for verbose logging
+
+// =====================================================
+// CONVERTER MODULE
+// =====================================================
+const CONVERTER_OPERATIONS = [
+    { value: 'lxc_to_vm', label: 'LXC to VM' },
+    { value: 'vm_to_lxc', label: 'VM to LXC' },
+    { value: 'shrink_lxc', label: 'Shrink LXC disk' },
+    { value: 'expand_lxc', label: 'Expand LXC disk' },
+    { value: 'shrink_vm', label: 'Shrink VM disk' },
+    { value: 'expand_vm', label: 'Expand VM disk' },
+    { value: 'clone_replace_disk', label: 'Clone & replace disk' },
+];
+const CONVERTER_STATUS = {
+    pending: 'Pending',
+    validating: 'Validating',
+    preflight: 'Pre-flight',
+    running: 'Running',
+    paused: 'Paused',
+    succeeded: 'Succeeded',
+    failed: 'Failed',
+    rolled_back: 'Rolled back',
+    cancelled: 'Cancelled',
+};
+const CONVERTER_MIN_DISK_GB = 2;
+const CONVERTER_DEFAULT_HEADROOM_GB = 1;
+
+// Global time formatting - reads user pref from localStorage
+// (perf): fmtDate/fmtTime are called thousands of times per render
+// (every task/log/VM/taskbar timestamp). Each call used dt.toLocaleString(...)
+// which internally CONSTRUCTS a fresh Intl.DateTimeFormat every time — one of
+// the slowest common JS ops. A live Chrome trace (config-modal typing) showed
+// fmtDate alone eating ~1.5s of a few seconds. Cache the formatter per
+// (kind, 12h, options) key and reuse it via .format() — ~100x cheaper, same
+// output. h12 is still read per call so a 12h/24h toggle takes effect at once.
+const _dtfCache = {};
+function _dtf(kind, h12, opts) {
+    const key = kind + (h12 ? '1' : '0') + '|' + JSON.stringify(opts || {});
+    let f = _dtfCache[key];
+    if (!f) {
+        const base = kind === 'T'
+            ? { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: h12 }
+            : { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: h12 };
+        try { f = new Intl.DateTimeFormat(undefined, { ...base, ...(opts || {}) }); }
+        catch (_) { f = new Intl.DateTimeFormat(); }
+        _dtfCache[key] = f;
+    }
+    return f;
+}
+function fmtDate(d, opts = {}) {
+    if (!d) return '';
+    const dt = d instanceof Date ? d : new Date(typeof d === 'number' && d < 1e12 ? d * 1000 : d);
+    if (isNaN(dt)) return '';
+    const h12 = localStorage.getItem('ProxmoxVEx-time-format') === '12h';
+    return _dtf('D', h12, opts).format(dt);
+}
+function fmtTime(d) {
+    if (!d) return '';
+    const dt = d instanceof Date ? d : new Date(typeof d === 'number' && d < 1e12 ? d * 1000 : d);
+    if (isNaN(dt)) return '';
+    const h12 = localStorage.getItem('ProxmoxVEx-time-format') === '12h';
+    return _dtf('T', h12, null).format(dt);
+}
+
+// Timezone list for node time config (matches backend get_timezones)
+const TIMEZONES = [
+    'UTC', 'Europe/Berlin', 'Europe/Vienna', 'Europe/Zurich', 'Europe/London',
+    'Europe/Paris', 'Europe/Amsterdam', 'Europe/Brussels', 'Europe/Rome',
+    'Europe/Madrid', 'Europe/Warsaw', 'Europe/Prague', 'Europe/Budapest',
+    'Europe/Stockholm', 'Europe/Helsinki', 'Europe/Athens', 'Europe/Moscow',
+    'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+    'America/Toronto', 'America/Vancouver', 'America/Sao_Paulo', 'America/Mexico_City',
+    'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Singapore', 'Asia/Seoul',
+    'Asia/Dubai', 'Asia/Kolkata', 'Asia/Bangkok', 'Asia/Jakarta',
+    'Australia/Sydney', 'Australia/Melbourne', 'Australia/Perth',
+    'Pacific/Auckland', 'Pacific/Fiji',
+    'Africa/Cairo', 'Africa/Johannesburg', 'Africa/Lagos',
+];
+
+
+// =====================================================
+// TRANSLATION SYSTEM
+// de, en, fr, and es translations are defined in translations.js.
+// =====================================================

@@ -1,0 +1,5 @@
+{
+  "_help": {
+    "_note": "Configuration is persisted in state.json by the plugin backend; this file is reserved for future schema defaults."
+  }
+}

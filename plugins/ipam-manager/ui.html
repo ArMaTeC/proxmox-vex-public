@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/ipam-manager/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IPAM Manager</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>IPAM Manager</h1>
+            <span class="muted" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="subnets">Subnets</button>
+            <button class="tab" role="tab" data-tab="reservations">Reservations</button>
+            <button class="tab" role="tab" data-tab="detail">Subnet Detail</button>
+        </div>
+
+        <div id="panel-subnets" class="tab-panel">
+            <div class="card">
+                <h2 id="subTitle">Add Subnet</h2>
+                <input type="hidden" id="subId" />
+                <div class="form">
+                    <label>Name <input type="text" id="subName" placeholder="Production LAN" /></label>
+                    <label>CIDR <input type="text" id="subCidr" placeholder="192.168.10.0/24" /></label>
+                    <label>Gateway <input type="text" id="subGateway" placeholder="192.168.10.1" /></label>
+                    <button id="subSave">Save</button>
+                    <button id="subCancel" class="secondary" hidden>Cancel</button>
+                </div>
+                <p id="subError" class="error-text"></p>
+            </div>
+            <div class="card">
+                <h2>Subnets</h2>
+                <div class="form">
+                    <label>Family <select id="subFamily">
+                            <option value="">All</option>
+                            <option value="4">IPv4</option>
+                            <option value="6">IPv6</option>
+                        </select></label>
+                    <label>Sort <select id="subSort">
+                            <option value="name">Name</option>
+                            <option value="cidr">CIDR</option>
+                        </select></label>
+                    <label>Order <select id="subOrder">
+                            <option value="asc">Asc</option>
+                            <option value="desc">Desc</option>
+                        </select></label>
+                    <button id="subLoad">Refresh</button>
+                </div>
+                <p id="subListError" class="error-text"></p>
+                <div id="subnetsList">
+                    <p class="empty">No subnets.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-reservations" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Reserve IP</h2>
+                <div class="form">
+                    <label>Subnet <select id="resSub">
+                            <option value="">Select</option>
+                        </select></label>
+                    <label>IP (optional) <input type="text" id="resIp" placeholder="auto" /></label>
+                    <label>Label <input type="text" id="resLabel" placeholder="web-server-01" /></label>
+                    <label>MAC <input type="text" id="resMac" placeholder="00:11:22:33:44:55" /></label>
+                    <button id="resReserve">Reserve</button>
+                </div>
+                <p id="resError" class="error-text"></p>
+            </div>
+            <div class="card">
+                <h2>Reservations</h2>
+                <div class="form">
+                    <label>Filter by subnet <select id="resFilter">
+                            <option value="">All</option>
+                        </select></label>
+                    <button id="resLoad" class="secondary">Refresh</button>
+                </div>
+                <p id="resListError" class="error-text"></p>
+                <div id="resList">
+                    <p class="empty">No reservations.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-detail" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Subnet Detail</h2>
+                <div class="form">
+                    <label>Subnet <select id="detSub">
+                            <option value="">Select</option>
+                        </select></label>
+                    <button id="detLoad">Load</button>
+                </div>
+                <p id="detError" class="error-text"></p>
+                <div id="detailCards"></div>
+                <div id="ipMap" class="map"></div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

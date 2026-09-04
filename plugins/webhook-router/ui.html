@@ -1,0 +1,114 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/webhook-router/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webhook Router</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>Webhook Router</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div class="tabs" role="tablist">
+            <button class="tab" role="tab" aria-selected="true" data-tab="endpoints">Endpoints</button>
+            <button class="tab" role="tab" data-tab="add">Add / Edit</button>
+            <button class="tab" role="tab" data-tab="deliveries">Deliveries</button>
+        </div>
+
+        <div id="panel-endpoints" class="tab-panel">
+            <div class="card">
+                <h2>Endpoints</h2>
+                <div class="actions" style="margin-bottom:12px;">
+                    <input type="text" id="eSearch" placeholder="Search name" />
+                    <select id="eEnabled">
+                        <option value="">All</option>
+                        <option value="true">Enabled</option>
+                        <option value="false">Disabled</option>
+                    </select>
+                    <select id="eFilter">
+                        <option value="">All events</option>
+                        <option value="vm.start">vm.start</option>
+                        <option value="vm.stop">vm.stop</option>
+                        <option value="vm.create">vm.create</option>
+                        <option value="cluster.alert">cluster.alert</option>
+                    </select>
+                </div>
+                <div id="endpointsList">
+                    <p class="empty">No endpoints.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-add" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Add / Edit Endpoint</h2>
+                <form class="form" id="endpointForm">
+                    <input type="hidden" id="hId" />
+                    <label>Name <input type="text" id="hName" required /></label>
+                    <label>URL <input type="text" id="hUrl" required
+                            placeholder="https://hooks.slack.com/..." /></label>
+                    <label>Events (comma) <input type="text" id="hEvents" placeholder="vm.start, vm.stop" /></label>
+                    <label>Filter <input type="text" id="hFilter" placeholder="event.type == 'vm.start'" /></label>
+                    <label>Retries <input type="number" id="hRetries" min="0" value="3" /></label>
+                    <label>HMAC Secret <input type="text" id="hSecret" /></label>
+                    <label>Description <input type="text" id="hDesc" /></label>
+                    <label><input type="checkbox" id="hEnabled" checked /> Enabled</label>
+                    <button type="submit">Save</button>
+                    <button type="button" id="hReset" class="secondary">Reset</button>
+                </form>
+                <p id="hError" class="error-text"></p>
+            </div>
+        </div>
+
+        <div id="panel-deliveries" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Test Delivery</h2>
+                <form class="form" id="testForm">
+                    <label>Endpoint <select id="dEndpoint"></select></label>
+                    <label>Or Manual URL <input type="text" id="dUrl" placeholder="https://..." /></label>
+                    <label>Payload (JSON) <textarea id="dPayload" rows="4"
+                            placeholder='{"event": "vm.start"}'></textarea></label>
+                    <button type="submit">Test</button>
+                </form>
+                <div id="testResult"></div>
+            </div>
+            <div class="card">
+                <h2>Delivery History</h2>
+                <div id="deliveriesList">
+                    <p class="empty">No deliveries.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <dialog id="payDialog"
+        style="background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:12px;max-width:600px;width:90%;">
+        <h2>Payload</h2>
+        <pre id="payBody"></pre>
+        <button id="payClose" class="secondary">Close</button>
+    </dialog>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

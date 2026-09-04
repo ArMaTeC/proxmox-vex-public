@@ -1,0 +1,12 @@
+{
+    "id": "status_page",
+    "name": "Public Status Page",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Public cluster health dashboard for monitoring screens. No login required \u2014 uses URL auth key.",
+    "min_ProxmoxVEx": "0.9.4",
+    "has_frontend": true,
+    "frontend_route": "status",
+    "category": "Dashboard & Status",
+    "min_license_tier": "basic"
+}

@@ -1,0 +1,281 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/tenant-isolation/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tenant Isolation</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1 id="pageTitle">Tenant Isolation</h1>
+            <span class="status" id="status">Loading...</span>
+            <button class="secondary" id="retryBtn" onclick="init()" style="display:none">Retry</button>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <div class="title" id="statStatus">Status</div>
+                <div class="value" id="statStatusVal">-</div>
+            </div>
+            <div class="card">
+                <div class="title" id="statTenants">Tenants</div>
+                <div class="value" id="statTenantsVal">0</div>
+            </div>
+            <div class="card">
+                <div class="title" id="statBounds">Bounds</div>
+                <div class="value" id="statBoundsVal">0</div>
+            </div>
+            <div class="card">
+                <div class="title" id="statConflicts">Conflicts</div>
+                <div class="value" id="statConflictsVal">0</div>
+            </div>
+        </div>
+
+        <div id="globalError" class="section global-error" style="display:none">
+            <p class="error" id="globalErrorText">Could not reach the API.</p>
+            <button class="secondary" id="globalRetry" onclick="init()">Retry</button>
+        </div>
+
+        <div id="tabs" class="tabs" role="tablist" aria-label="Tenant Isolation tabs"></div>
+
+        <!-- Tenants -->
+        <div id="tenantsSection" class="section active" role="tabpanel">
+            <h2 id="tenantsTitle">Tenants</h2>
+            <div class="form">
+                <label>
+                    <span id="labelSearch">Search</span>
+                    <input type="text" id="tenantSearch" placeholder="Filter tenants" oninput="loadTenants()" />
+                </label>
+                <label>
+                    <span id="labelStatusFilter">Status</span>
+                    <select id="tenantStatusFilter" onchange="loadTenants()">
+                        <option value="" id="optAll">All</option>
+                        <option value="active" id="optActive">Active</option>
+                        <option value="locked" id="optLocked">Locked</option>
+                        <option value="retired" id="optRetired">Retired</option>
+                    </select>
+                </label>
+                <button onclick="openTenantDialog()" id="btnCreateTenant">Create Tenant</button>
+            </div>
+            <div id="tenantsList">
+                <p class="empty" id="noTenants">No tenants.</p>
+            </div>
+            <div id="tenantPagination" class="pagination" style="display:none"></div>
+        </div>
+
+        <!-- Bounds -->
+        <div id="boundsSection" class="section" role="tabpanel">
+            <h2 id="boundsTitle">Bounds</h2>
+            <div class="form">
+                <label>
+                    <span id="labelCluster">Cluster</span>
+                    <select id="boundsCluster" onchange="onBoundsClusterChange()"></select>
+                </label>
+                <label>
+                    <span id="labelTenant">Tenant</span>
+                    <select id="boundsTenant"></select>
+                </label>
+            </div>
+            <div class="form">
+                <label>
+                    <span id="labelVmSearch">Search VMs</span>
+                    <input type="text" id="vmSearch" placeholder="Filter VMs" oninput="renderVmOptions()" />
+                </label>
+                <label>
+                    <span id="labelVms">VMs</span>
+                    <select id="vmMulti" multiple size="5" style="min-width:220px"></select>
+                </label>
+                <button onclick="assignVms()" id="btnAssign">Assign</button>
+            </div>
+            <div id="boundsList">
+                <p class="empty" id="noBounds">No bounds.</p>
+            </div>
+        </div>
+
+        <!-- Validate -->
+        <div id="validateSection" class="section" role="tabpanel">
+            <h2 id="validateTitle">Validate VMID</h2>
+            <div class="form">
+                <label>
+                    <span id="labelValCluster">Cluster</span>
+                    <select id="validateCluster"></select>
+                </label>
+                <label>
+                    <span id="labelValTenant">Tenant</span>
+                    <select id="validateTenant"></select>
+                </label>
+                <label>
+                    <span id="labelValVm">VMID</span>
+                    <input type="number" id="validateVmid" />
+                </label>
+                <button onclick="validateSingle()" id="btnValidate">Validate</button>
+                <button class="secondary" onclick="validateTenant()" id="btnValidateAll">Validate All</button>
+            </div>
+            <div id="validateResult"></div>
+        </div>
+
+        <!-- Conflicts -->
+        <div id="conflictsSection" class="section" role="tabpanel">
+            <h2 id="conflictsTitle">Conflicts</h2>
+            <div class="form">
+                <button onclick="loadConflicts()" class="secondary" id="btnRefreshConflicts">Refresh</button>
+                <button onclick="loadConflicts(true)" class="secondary" id="btnAutoFixAll">Auto-fix all</button>
+            </div>
+            <div id="conflictsList">
+                <p class="empty" id="noConflicts">No conflicts.</p>
+            </div>
+        </div>
+
+        <!-- Audit -->
+        <div id="auditSection" class="section" role="tabpanel">
+            <h2 id="auditTitle">Audit Log</h2>
+            <div class="form">
+                <label>
+                    <span id="labelAuditTenant">Tenant</span>
+                    <select id="auditTenant">
+                        <option value="" id="optAnyTenant">Any</option>
+                    </select>
+                </label>
+                <label>
+                    <span id="labelAuditAction">Action</span>
+                    <select id="auditAction">
+                        <option value="" id="optAnyAction">Any</option>
+                    </select>
+                </label>
+                <button onclick="loadAudit()" class="secondary" id="btnRefreshAudit">Refresh</button>
+            </div>
+            <div id="auditList">
+                <p class="empty" id="noAudit">No audit events.</p>
+            </div>
+            <div id="auditPagination" class="pagination" style="display:none"></div>
+        </div>
+
+        <!-- Quotas / Network / Permissions -->
+        <div id="quotasSection" class="section" role="tabpanel">
+            <h2 id="quotasTitle">Quotas & Settings</h2>
+            <div class="form">
+                <label>
+                    <span id="labelQTenant">Tenant</span>
+                    <select id="quotaTenant" onchange="loadQuota()"></select>
+                </label>
+            </div>
+            <div id="quotaPanel"></div>
+            <hr style="border-color: var(--border); margin: 24px 0;">
+            <h3 id="netTitle">Network Isolation</h3>
+            <div class="form">
+                <label>
+                    <span id="labelNetTenant">Tenant</span>
+                    <select id="netTenant"></select>
+                </label>
+                <label>
+                    <span id="labelVlans">Allowed VLANs (comma separated)</span>
+                    <input type="text" id="netVlans" placeholder="10,20,30" />
+                </label>
+                <button onclick="saveNetwork()" id="btnSaveNet">Save</button>
+            </div>
+            <hr style="border-color: var(--border); margin: 24px 0;">
+            <h3 id="permTitle">Permission Template</h3>
+            <div class="form">
+                <label>
+                    <span id="labelPermTenant">Tenant</span>
+                    <select id="permTenant"></select>
+                </label>
+                <label>
+                    <span id="labelTemplate">Template</span>
+                    <select id="permTemplate">
+                        <option value="">None</option>
+                        <option value="admin">Admin</option>
+                        <option value="operator">Operator</option>
+                        <option value="viewer">Viewer</option>
+                    </select>
+                </label>
+                <button onclick="savePermission()" id="btnSavePerm">Save</button>
+            </div>
+        </div>
+
+        <!-- Import / Export -->
+        <div id="importSection" class="section" role="tabpanel">
+            <h2 id="importTitle">Import / Export</h2>
+            <div class="form">
+                <label>
+                    <span id="labelMode">Mode</span>
+                    <select id="importMode">
+                        <option value="append" id="optAppend">Append</option>
+                        <option value="replace" id="optReplace">Replace</option>
+                    </select>
+                </label>
+                <label style="flex: 1; min-width: 260px;">
+                    <span id="labelJson">JSON</span>
+                    <textarea id="importJson" rows="6" style="width: 100%;"
+                        placeholder="{ tenants: [], bounds: [] }"></textarea>
+                </label>
+            </div>
+            <div class="form">
+                <button onclick="doImport()" id="btnImport">Import</button>
+                <button onclick="doExport()" class="secondary" id="btnExport">Export JSON</button>
+            </div>
+            <pre id="importResult" class="muted" style="white-space: pre-wrap;"></pre>
+        </div>
+
+        <!-- Tenant dialog -->
+        <div id="tenantDialog" class="section" style="display:none; margin-top: 16px;">
+            <h3 id="tenantDialogTitle">Create Tenant</h3>
+            <div class="form">
+                <input type="hidden" id="editTenantId" />
+                <label>
+                    <span id="labelName">Name</span>
+                    <input type="text" id="tenantName" required />
+                </label>
+                <label>
+                    <span id="labelStatus">Status</span>
+                    <select id="tenantStatus">
+                        <option value="active" id="optActive2">Active</option>
+                        <option value="locked" id="optLocked2">Locked</option>
+                        <option value="retired" id="optRetired2">Retired</option>
+                    </select>
+                </label>
+                <label>
+                    <span id="labelMaxVms">Max VMs</span>
+                    <input type="number" id="quotaMaxVms" min="0" placeholder="Unlimited" />
+                </label>
+                <label>
+                    <span id="labelMaxCpu">Max CPU (MHz)</span>
+                    <input type="number" id="quotaMaxCpu" min="0" placeholder="Unlimited" />
+                </label>
+                <label>
+                    <span id="labelMaxMem">Max Memory (MiB)</span>
+                    <input type="number" id="quotaMaxMem" min="0" placeholder="Unlimited" />
+                </label>
+            </div>
+            <div class="form">
+                <button onclick="saveTenant()" id="btnSaveTenant">Save</button>
+                <button class="secondary" onclick="closeTenantDialog()" id="btnCancel">Cancel</button>
+            </div>
+            <p id="tenantError" class="message error" style="display:none"></p>
+        </div>
+
+        <div class="toast" id="toasts"></div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

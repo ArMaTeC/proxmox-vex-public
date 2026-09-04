@@ -1,0 +1,12 @@
+{
+    "id": "client-billing-portal",
+    "name": "Client Billing Portal",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Client-facing portal for usage, invoices, and payment status (extends client_portal).",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Cost & Billing",
+    "min_license_tier": "advanced"
+}

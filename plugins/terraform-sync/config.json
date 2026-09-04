@@ -1,0 +1,5 @@
+{
+    "_help": {
+        "_note": "This plugin stores state in state.json and provides no user-configurable config.json settings."
+    }
+}

@@ -1,0 +1,399 @@
+<!doctype html>
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        ProxmoxVEx/native/truenas/truenas_src/ui/plugin.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Plugin HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TrueNAS — ProxmoxVEx</title>
+
+
+  <link rel="stylesheet" href="/static/css/plugin-ui.css" />
+  <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+  <header>
+    <h1>TrueNAS</h1>
+    <select id="instance-select">
+      <option value="">no instances configured</option>
+    </select>
+    <span id="instance-chip" class="chip"></span>
+  </header>
+  <div style="display: flex; height: calc(100vh - 58px); overflow: hidden;">
+    <nav id="tabs">
+      <button data-tab="fleet" class="active"><svg class="tab-icon" viewBox="0 0 24 24">
+          <rect x="3" y="3" width="7" height="7" rx="1" />
+          <rect x="14" y="3" width="7" height="7" rx="1" />
+          <rect x="3" y="14" width="7" height="7" rx="1" />
+          <rect x="14" y="14" width="7" height="7" rx="1" />
+        </svg><span data-i18n="Fleet">Fleet</span></button>
+      <button data-tab="overview"><svg class="tab-icon" viewBox="0 0 24 24">
+          <path d="M3 12h4l2-7 4 14 2-7h6" />
+        </svg><span data-i18n="Overview">Overview</span></button>
+      <button data-tab="pools"><svg class="tab-icon" viewBox="0 0 24 24">
+          <ellipse cx="12" cy="5" rx="8" ry="3" />
+          <path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5" />
+          <path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" />
+        </svg><span data-i18n="Pools & Disks">Pools & Disks</span></button>
+      <button data-tab="datasets"><svg class="tab-icon" viewBox="0 0 24 24">
+          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+        </svg><span data-i18n="Datasets">Datasets</span></button>
+      <button data-tab="snapshots"><svg class="tab-icon" viewBox="0 0 24 24">
+          <path d="M4 8h3l1.5-2h6L16 8h4a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z" />
+          <circle cx="12" cy="13" r="3.5" />
+        </svg><span data-i18n="Snapshots">Snapshots</span></button>
+      <button data-tab="shares"><svg class="tab-icon" viewBox="0 0 24 24">
+          <circle cx="6" cy="12" r="2.2" />
+          <circle cx="18" cy="6" r="2.2" />
+          <circle cx="18" cy="18" r="2.2" />
+          <path d="M8 11l8-4M8 13l8 4" />
+        </svg><span data-i18n="Shares">Shares</span></button>
+      <button data-tab="replication"><svg class="tab-icon" viewBox="0 0 24 24">
+          <path d="M4 12a8 8 0 0 1 14-5.3M20 12a8 8 0 0 1-14 5.3" />
+          <path d="M18 3v4h-4M6 21v-4h4" />
+        </svg><span data-i18n="Replication">Replication</span></button>
+      <button data-tab="data-protection"><svg class="tab-icon" viewBox="0 0 24 24">
+          <path d="M12 3l7 3v6c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V6l7-3z" />
+          <path d="M9 12l2 2 4-4" />
+        </svg><span data-i18n="Data Protection">Data Protection</span></button>
+      <button data-tab="apps"><svg class="tab-icon" viewBox="0 0 24 24">
+          <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z" />
+          <path d="M4.5 7.5L12 12l7.5-4.5M12 12v9" />
+        </svg><span data-i18n="Apps/VMs">Apps/VMs</span></button>
+      <button data-tab="services"><svg class="tab-icon" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="3" />
+          <path
+            d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8" />
+        </svg><span data-i18n="Services">Services</span></button>
+      <button data-tab="settings"><svg class="tab-icon" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="3" />
+          <path
+            d="M19.4 13a7.4 7.4 0 0 0 0-2l2-1.5-2-3.4-2.4 1a7.7 7.7 0 0 0-1.7-1L15 3h-4l-.3 2.6a7.7 7.7 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.4 7.4 0 0 0 0 2l-2 1.5 2 3.4 2.4-1a7.7 7.7 0 0 0 1.7 1L11 21h4l.3-2.6a7.7 7.7 0 0 0 1.7-1l2.4 1 2-3.4-2-1.5z" />
+        </svg><span data-i18n="Settings">Settings</span></button>
+    </nav>
+
+    <main>
+      <section class="tab active" id="tab-fleet">
+        <div id="fleet-body" class="empty">Loading…</div>
+      </section>
+      <section class="tab" id="tab-overview">
+        <div id="ov-body" class="empty">Select an instance above to see its status.</div>
+      </section>
+      <section class="tab" id="tab-pools">
+        <div id="pools-body" class="empty">Select an instance above to see its pools.</div>
+      </section>
+      <section class="tab" id="tab-datasets">
+        <div class="toolbar">
+          <div class="subtab-hint" style="margin:0">Create/edit/delete against the selected instance (F2).</div>
+          <button class="btn" id="btn-new-dataset"><span data-i18n="+ New dataset">+ New dataset</span></button>
+        </div>
+        <div id="datasets-body" class="empty">Select an instance above.</div>
+
+        <div class="card" id="dataset-write-card" hidden>
+          <h2 id="dataset-write-title">New dataset</h2>
+          <div class="field" id="dataset-write-name-field">
+            <label><span data-i18n="Full name (pool/dataset)">Full name (pool/dataset)</span></label>
+            <input type="text" id="dsw-name" placeholder="pool/dataset-name">
+          </div>
+          <div class="field" id="dataset-write-changes-field" hidden>
+            <label><span data-i18n="Fields (JSON) — e.g.">Fields (JSON) —
+                e.g.</span><code>{"volsize": 4294967296, "force_size": true}</code></label>
+            <textarea id="dsw-changes" rows="4"></textarea>
+          </div>
+          <div class="field" id="dataset-write-confirm-field" hidden>
+            <label><span data-i18n="Enter the full dataset name to confirm deletion">Enter the full dataset name to
+                confirm deletion</span></label>
+            <input type="text" id="dsw-confirm">
+          </div>
+          <div class="row-actions">
+            <button class="btn secondary" id="btn-dataset-preview"><span data-i18n="Preview">Preview</span></button>
+            <button class="btn" id="btn-dataset-confirm" disabled><span data-i18n="Confirm and run">Confirm and
+                run</span></button>
+            <button class="btn secondary" id="btn-dataset-cancel"><span data-i18n="Cancel">Cancel</span></button>
+          </div>
+          <pre id="dataset-write-preview" style="white-space:pre-wrap;font-size:12px;margin-top:10px"></pre>
+          <div id="dataset-write-result" style="font-size:13px;margin-top:6px"></div>
+        </div>
+      </section>
+      <section class="tab" id="tab-snapshots">
+        <div class="toolbar">
+          <div class="subtab-hint" style="margin:0">Create/delete snapshots against the selected instance (F2).</div>
+          <button class="btn" id="btn-new-snapshot"><span data-i18n="+ New snapshot">+ New snapshot</span></button>
+        </div>
+        <div id="snapshots-body" class="empty">Select an instance above.</div>
+
+        <div class="card" id="snapshot-write-card" hidden>
+          <h2 id="snapshot-write-title">New snapshot</h2>
+          <div class="field-row" id="snapshot-create-fields">
+            <div class="field"><label><span data-i18n="Dataset">Dataset</span></label><input type="text"
+                id="ssw-dataset" placeholder="pool/dataset"></div>
+            <div class="field"><label><span data-i18n="Snapshot name">Snapshot name</span></label><input type="text"
+                id="ssw-name"></div>
+          </div>
+          <div class="checkbox-field" id="snapshot-recursive-field">
+            <input type="checkbox" id="ssw-recursive">
+            <label for="ssw-recursive" style="margin:0"><span data-i18n="recursive">recursive</span></label>
+          </div>
+          <div class="field" id="snapshot-write-confirm-field" hidden>
+            <label><span data-i18n="Enter the full id (">Enter the full id (</span><code>dataset@name</code><span
+                data-i18n=") to confirm deletion">) to confirm deletion</span></label>
+            <input type="text" id="ssw-confirm">
+          </div>
+          <div class="row-actions">
+            <button class="btn secondary" id="btn-snapshot-preview"><span data-i18n="Preview">Preview</span></button>
+            <button class="btn" id="btn-snapshot-confirm" disabled><span data-i18n="Confirm and run">Confirm and
+                run</span></button>
+            <button class="btn secondary" id="btn-snapshot-cancel"><span data-i18n="Cancel">Cancel</span></button>
+          </div>
+          <pre id="snapshot-write-preview" style="white-space:pre-wrap;font-size:12px;margin-top:10px"></pre>
+          <div id="snapshot-write-result" style="font-size:13px;margin-top:6px"></div>
+        </div>
+      </section>
+      <section class="tab" id="tab-shares">
+        <div class="toolbar">
+          <div class="subtab-hint" style="margin:0">SMB/NFS: create/edit/delete (F4c). iSCSI: read-only.</div>
+          <div class="row-actions">
+            <button class="btn secondary" id="btn-new-smb"><span data-i18n="+ New SMB">+ New SMB</span></button>
+            <button class="btn secondary" id="btn-new-nfs"><span data-i18n="+ New NFS">+ New NFS</span></button>
+          </div>
+        </div>
+        <div id="shares-body" class="empty">Select an instance above.</div>
+
+        <div class="card" id="share-write-card" hidden>
+          <h2 id="share-write-title">New share</h2>
+          <div class="field" id="share-write-name-field">
+            <label><span data-i18n="Name">Name</span></label>
+            <input type="text" id="shw-name">
+          </div>
+          <div class="field">
+            <label>Path</label>
+            <input type="text" id="shw-path" placeholder="/mnt/pool/dataset">
+          </div>
+          <div class="field">
+            <label><span data-i18n="Comment">Comment</span></label>
+            <input type="text" id="shw-comment">
+          </div>
+          <div class="checkbox-field">
+            <input type="checkbox" id="shw-enabled" checked>
+            <label for="shw-enabled" style="margin:0"><span data-i18n="enabled">enabled</span></label>
+          </div>
+          <div class="checkbox-field">
+            <input type="checkbox" id="shw-readonly">
+            <label for="shw-readonly" id="shw-readonly-label" style="margin:0"><span
+                data-i18n="read-only">read-only</span></label>
+          </div>
+          <div class="checkbox-field" id="share-write-browsable-field">
+            <input type="checkbox" id="shw-browsable" checked>
+            <label for="shw-browsable" style="margin:0"><span data-i18n="visible when browsing (browsable, SMB)">visible
+                when browsing (browsable, SMB)</span></label>
+          </div>
+          <div class="field" id="share-write-hosts-field" hidden>
+            <label><span data-i18n="Allowed hosts (comma separated, empty = all)">Allowed hosts (comma separated, empty
+                = all)</span></label>
+            <input type="text" id="shw-hosts" placeholder="192.168.1.10, backup.example.com">
+          </div>
+          <div class="field" id="share-write-networks-field" hidden>
+            <label><span data-i18n="Allowed CIDR networks (comma separated, empty = all)">Allowed CIDR networks (comma
+                separated, empty = all)</span></label>
+            <input type="text" id="shw-networks" placeholder="192.168.1.0/24">
+          </div>
+          <div class="field" id="share-write-confirm-field" hidden>
+            <label><span data-i18n="Enter the exact name/path to confirm deletion">Enter the exact name/path to confirm
+                deletion</span></label>
+            <input type="text" id="shw-confirm">
+          </div>
+          <div class="row-actions">
+            <button class="btn secondary" id="btn-share-preview"><span data-i18n="Preview">Preview</span></button>
+            <button class="btn" id="btn-share-confirm"><span data-i18n="Confirm and run">Confirm and run</span></button>
+            <button class="btn secondary" id="btn-share-cancel"><span data-i18n="Cancel">Cancel</span></button>
+          </div>
+          <pre id="share-write-preview" style="white-space:pre-wrap;font-size:12px;margin-top:10px"></pre>
+          <div id="share-write-result" style="font-size:13px;margin-top:6px"></div>
+        </div>
+      </section>
+      <section class="tab" id="tab-replication">
+        <div class="subtab-hint">Read-only in F1 — creating tasks comes in F4.</div>
+        <div id="replication-body" class="empty">Select an instance above.</div>
+      </section>
+      <section class="tab" id="tab-data-protection">
+        <div id="data-protection-body" class="empty">Select an instance above.</div>
+      </section>
+      <section class="tab" id="tab-apps">
+        <div id="apps-body" class="empty">Select an instance above.</div>
+        <div class="card" id="resource-write-card" hidden>
+          <h2 id="resource-write-title"></h2>
+          <div id="resource-write-preview" class="subtab-hint"></div>
+          <div class="toolbar" style="margin-top:10px">
+            <button class="btn secondary" id="btn-resource-preview"><span data-i18n="Preview">Preview</span></button>
+            <button class="btn" id="btn-resource-confirm"><span data-i18n="Confirm and run">Confirm and
+                run</span></button>
+            <button class="btn secondary" id="btn-resource-cancel"><span data-i18n="Cancel">Cancel</span></button>
+          </div>
+          <div id="resource-write-result" class="subtab-hint"></div>
+        </div>
+      </section>
+      <section class="tab" id="tab-services">
+        <div id="services-body" class="empty">Select an instance above.</div>
+        <div class="card" id="service-write-card" hidden>
+          <h2 id="service-write-title"></h2>
+          <div id="service-write-preview" class="subtab-hint"></div>
+          <div class="toolbar" style="margin-top:10px">
+            <button class="btn secondary" id="btn-service-preview"><span data-i18n="Preview">Preview</span></button>
+            <button class="btn" id="btn-service-confirm"><span data-i18n="Confirm and run">Confirm and
+                run</span></button>
+            <button class="btn secondary" id="btn-service-cancel"><span data-i18n="Cancel">Cancel</span></button>
+          </div>
+          <div id="service-write-result" class="subtab-hint"></div>
+        </div>
+      </section>
+
+      <section class="tab" id="tab-settings">
+        <div class="card" id="thresholds-card">
+          <h2 style="margin:0 0 8px;font-size:15px;">Alert thresholds (global)</h2>
+          <div class="subtab-hint" style="margin-bottom:8px">
+            Control which instances show yellow/red in Fleet and Pools. Any instance can override them individually in
+            "Advanced options".
+          </div>
+          <div class="field-row">
+            <div class="field"><label><span data-i18n="Warning (%)">Warning (%)</span></label><input type="number"
+                id="f-thresh-warn" min="1" max="99" value="80"></div>
+            <div class="field"><label><span data-i18n="Critical (%)">Critical (%)</span></label><input type="number"
+                id="f-thresh-crit" min="1" max="99" value="90"></div>
+            <div class="field" style="justify-content:flex-end;display:flex;align-items:flex-end">
+              <button class="btn secondary" id="btn-save-thresholds"><span data-i18n="Save thresholds">Save
+                  thresholds</span></button>
+            </div>
+          </div>
+          <div id="thresholds-result"></div>
+        </div>
+
+        <div class="card" id="notify-card">
+          <h2 style="margin:0 0 8px;font-size:15px;">Notifications</h2>
+          <div class="subtab-hint" style="margin-bottom:8px">
+            Generic webhook: receives a POST with JSON when an instance/pool changes state (capacity, reachability,
+            TrueNAS alerts). Built-in antiflood — warns on real transitions, not on every poll.
+          </div>
+          <div class="field-row">
+            <div class="field" style="flex:2"><label><span data-i18n="Webhook URL">Webhook URL</span></label><input
+                type="text" id="f-webhook-url" placeholder="https://…"></div>
+            <div class="field" style="justify-content:flex-end;display:flex;align-items:flex-end">
+              <button class="btn secondary" id="btn-save-notify"><span data-i18n="Save notifications">Save
+                  notifications</span></button>
+            </div>
+          </div>
+          <div class="subtab-hint" style="margin:10px 0 4px">WhatsApp (existing Evolution gateway in the org):</div>
+          <div class="field-row tri">
+            <div class="field"><label><span data-i18n="Evolution instance">Evolution instance</span></label><input
+                type="text" id="f-wa-instance" placeholder="e.g. cum"></div>
+            <div class="field"><label><span data-i18n="Destination number/JID">Destination
+                  number/JID</span></label><input type="text" id="f-wa-target" placeholder="593XXXXXXXXX"></div>
+            <div class="field"><label><span data-i18n="API key">API key</span></label><input type="text" id="f-wa-key"
+                placeholder="***"></div>
+          </div>
+          <div id="notify-result"></div>
+          <div class="subtab-hint" id="poller-status-badge" style="margin-top:10px"></div>
+        </div>
+
+        <div class="toolbar">
+          <h2 style="margin:0;font-size:15px;">Configured instances</h2>
+          <button class="btn" id="btn-new-instance"><span data-i18n="+ New instance">+ New instance</span></button>
+        </div>
+        <div id="instances-by-client">
+          <div class="empty">Loading…</div>
+        </div>
+
+        <div class="card" id="instance-delete-card" hidden>
+          <h2>Delete instance</h2>
+          <div class="subtab-hint">
+            This will stop managing <b id="del-inst-name"></b> from ProxmoxVEx — the data and pools in TrueNAS are not
+            touched. If you add it again later you will need to paste the API key again (it is not recovered).
+          </div>
+          <div class="field">
+            <label><span data-i18n="Enter the exact ID to confirm:">Enter the exact ID to confirm:</span><b
+                id="del-inst-id"></b></label>
+            <input type="text" id="f-delete-confirm" autocomplete="off">
+          </div>
+          <div class="row-actions">
+            <button class="btn" id="btn-delete-confirm" disabled><span data-i18n="Delete permanently">Delete
+                permanently</span></button>
+            <button class="btn secondary" id="btn-delete-cancel"><span data-i18n="Cancel">Cancel</span></button>
+          </div>
+          <div id="delete-result"></div>
+        </div>
+
+        <div class="card" id="instance-form-card" hidden>
+          <h2 id="instance-form-title">New instance</h2>
+          <div class="field-row">
+            <div class="field"><label><span data-i18n="ID">ID</span></label><input type="text" id="f-id"></div>
+            <div class="field"><label><span data-i18n="Name">Name</span></label><input type="text" id="f-name"></div>
+          </div>
+          <div class="field">
+            <label><span data-i18n="Client (client_id)">Client (client_id)</span></label>
+            <input type="text" id="f-client" list="known-clients" placeholder="e.g. acme-corp, client-b…">
+            <datalist id="known-clients"></datalist>
+          </div>
+          <div class="field-row tri">
+            <div class="field"><label><span data-i18n="Host">Host</span></label><input type="text" id="f-host"></div>
+            <div class="field"><label><span data-i18n="Port">Port</span></label><input type="number" id="f-port"
+                value="443"></div>
+            <div class="field"><label><span data-i18n="API key (RO)">API key (RO)</span></label><input type="text"
+                id="f-key" placeholder="***"></div>
+          </div>
+          <div class="checkbox-field"><input type="checkbox" id="f-tls" checked><label for="f-tls"
+              style="margin:0"><span data-i18n="use_tls (required with API key)">use_tls (required with API
+                key)</span></label></div>
+          <div class="checkbox-field"><input type="checkbox" id="f-verify"><label for="f-verify" style="margin:0"><span
+                data-i18n="verify_tls">verify_tls</span></label></div>
+          <div class="checkbox-field"><input type="checkbox" id="f-readonly" checked><label for="f-readonly"
+              style="margin:0"><span data-i18n="readonly (write kill-switch)">readonly (write
+                kill-switch)</span></label></div>
+          <button type="button" class="btn secondary" id="btn-toggle-advanced" style="margin-bottom:10px"><span
+              data-i18n="Advanced options ▾">Advanced options ▾</span></button>
+          <div id="advanced-fields" hidden>
+            <div class="field">
+              <label><span data-i18n="API key (RW) — enables dataset and snapshot create/update/delete">API key (RW) —
+                  enables dataset and snapshot create/update/delete</span></label>
+              <input type="text" id="f-key-rw" placeholder="***">
+            </div>
+            <div class="field">
+              <label><span data-i18n="tls_server_name — certificate name, if the host is accessed by IP">tls_server_name
+                  — certificate name, if the host is accessed by IP</span></label>
+              <input type="text" id="f-tls-name" placeholder="e.g. nas.mycompany.com">
+            </div>
+            <div class="field-row">
+              <div class="field"><label><span data-i18n="Warning threshold (%) — empty = use global">Warning threshold
+                    (%) — empty = use global</span></label><input type="number" id="f-warn-pct" min="1" max="99"
+                  placeholder="80"></div>
+              <div class="field"><label><span data-i18n="Critical threshold (%) — empty = use global">Critical threshold
+                    (%) — empty = use global</span></label><input type="number" id="f-crit-pct" min="1" max="99"
+                  placeholder="90"></div>
+            </div>
+          </div>
+          <div class="row-actions">
+            <button class="btn secondary" id="btn-test"><span data-i18n="Test connection">Test
+                connection</span></button>
+            <button class="btn" id="btn-save-instance"><span data-i18n="Save">Save</span></button>
+            <button class="btn secondary" id="btn-cancel-instance"><span data-i18n="Cancel">Cancel</span></button>
+          </div>
+          <div id="test-result"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+
+  <script src="ui.js"></script>
+</body>
+
+</html>

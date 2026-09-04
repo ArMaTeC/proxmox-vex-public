@@ -1,0 +1,112 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/vm-rightsizing/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VM Rightsizing</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1>VM Rightsizing</h1>
+            <span class="status" id="status">Loading...</span>
+        </header>
+        <div id="toasts" class="live" aria-live="polite"></div>
+        <div id="message"></div>
+        <div class="stats" id="stats"></div>
+
+        <div class="tabs" role="tablist" aria-label="VM Rightsizing sections">
+            <button class="tab" role="tab" aria-selected="true" data-tab="scan">Scan</button>
+            <button class="tab" role="tab" data-tab="reports">Saved Reports</button>
+            <button class="tab" role="tab" data-tab="schedule">Schedule</button>
+        </div>
+
+        <div id="panel-scan" class="tab-panel">
+            <div class="card">
+                <h2>Scan Cluster</h2>
+                <form class="form" id="scanForm">
+                    <label>
+                        Cluster
+                        <select name="cluster_id" id="scanCluster" required></select>
+                    </label>
+                    <label>
+                        Report name
+                        <input type="text" name="name" id="scanName" placeholder="Scan 1" />
+                    </label>
+                    <button type="submit">Scan</button>
+                </form>
+                <div class="actions">
+                    <input type="text" id="filterText" placeholder="Filter name / VMID" />
+                    <select id="filterRec">
+                        <option value="">All recommendations</option>
+                        <option value="scale_up_cpu">Scale up CPU</option>
+                        <option value="scale_down_cpu">Scale down CPU</option>
+                        <option value="reduce_memory">Reduce memory</option>
+                        <option value="right_sized">Right sized</option>
+                    </select>
+                    <button id="exportJson" class="secondary">Export JSON</button>
+                    <button id="exportCsv" class="secondary">Export CSV</button>
+                </div>
+                <div id="scanSummary" class="chart"></div>
+                <div id="scanList">
+                    <p class="empty">Select a cluster and run a scan.</p>
+                </div>
+                <div id="applyPanel" class="card" hidden>
+                    <h2>Apply Recommendations</h2>
+                    <div id="selectedList" class="muted"></div>
+                    <button id="applyBtn" type="button">Apply selected</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-reports" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Saved Reports</h2>
+                <div id="reportsList">
+                    <p class="empty">No saved reports.</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="panel-schedule" class="tab-panel" hidden>
+            <div class="card">
+                <h2>Scheduled Scans</h2>
+                <form class="form" id="scheduleForm">
+                    <label>
+                        Cluster
+                        <select name="cluster_id" id="schCluster" required></select>
+                    </label>
+                    <label>
+                        Cron
+                        <input type="text" name="cron" id="schCron" placeholder="0 2 * * 0" required />
+                    </label>
+                    <button type="submit">Add schedule</button>
+                </form>
+                <div id="scheduleList">
+                    <p class="empty">No schedules.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

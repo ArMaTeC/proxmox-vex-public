@@ -1,0 +1,11 @@
+# --- ProxmoxVEx auto-header start ---
+# --------------------------------------------------------------------
+# File:        ProxmoxVEx/native/opnsense/opnsense_src/__init__.py
+# Project:     ProxmoxVEx
+# Version:     1.2.303
+# Build:       2026.09.04
+# Description: Package initializer for opnsense_src
+# Docs:        https://proxmoxvex.local/docs
+# Generated:   2026-09-04
+# --------------------------------------------------------------------
+# --- ProxmoxVEx auto-header end ---

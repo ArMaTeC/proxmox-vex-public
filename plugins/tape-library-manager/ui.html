@@ -1,0 +1,186 @@
+<!-- ==== ProxmoxVEx auto-header start ====
+  ====================================================================
+  File:        plugins/tape-library-manager/ui.html
+  Project:     ProxmoxVEx
+  Version:     1.2.303
+  Build:       2026.09.04
+  Description: Ui HTML source
+  Docs:        https://proxmoxvex.local/docs
+  Generated:   2026-09-04
+  ====================================================================
+==== ProxmoxVEx auto-header end ==== -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tape Library Manager</title>
+    <script src="/static/js/purify.min.js"></script>
+
+    <link rel="stylesheet" href="ui.css">
+</head>
+
+<body>
+    <div class="container">
+        <header>
+            <h1 id="pageTitle">Tape Library Manager</h1>
+            <div class="header-right">
+                <div class="counts" id="counts" aria-live="polite"></div>
+                <span class="status" id="status">Loading…</span>
+            </div>
+        </header>
+
+        <div id="toasts" aria-live="polite" aria-atomic="true"></div>
+        <div id="globalError" class="message error" style="display:none;" role="alert">
+            <span id="globalErrorText"></span>
+            <button class="secondary small" id="retryBtn">Retry</button>
+        </div>
+
+        <div class="tabs" role="tablist" aria-label="Tape Library tabs">
+            <button class="tab" role="tab" aria-selected="true" data-tab="drives">Drives</button>
+            <button class="tab" role="tab" data-tab="tapes">Tapes</button>
+            <button class="tab" role="tab" data-tab="rack">Rack</button>
+            <button class="tab" role="tab" data-tab="activity">Activity</button>
+            <button class="tab" role="tab" data-tab="import">Import / Export</button>
+        </div>
+
+        <section id="drives" class="section active" role="tabpanel">
+            <h2 id="drivesTitle">Drives</h2>
+            <form class="form" id="driveForm">
+                <label><span id="driveIdLabel">Drive ID</span><input type="text" name="id" required
+                        placeholder="drive2" /></label>
+                <label><span id="driveNameLabel">Name</span><input type="text" name="name" required
+                        placeholder="LTO-2" /></label>
+                <label><span id="driveSerialLabel">Serial</span><input type="text" name="serial"
+                        placeholder="SN00001" /></label>
+                <button type="submit" id="addDriveBtn">Add Drive</button>
+            </form>
+            <div id="drivesList">
+                <p class="empty">No drives.</p>
+            </div>
+        </section>
+
+        <section id="tapes" class="section" role="tabpanel">
+            <h2 id="tapesTitle">Tapes</h2>
+            <form class="form" id="tapeForm">
+                <label><span id="barcodeLabel">Barcode</span><input type="text" name="barcode" required
+                        placeholder="TAPE-001" /></label>
+                <label><span id="locationLabel">Location</span>
+                    <input list="locations" type="text" name="location" placeholder="shelf" />
+                </label>
+                <datalist id="locations"></datalist>
+                <label><span id="backupJobLabel">Backup job</span><input type="text" name="backup_job"
+                        placeholder="" /></label>
+                <button type="submit" id="addTapeBtn">Add Tape</button>
+            </form>
+            <div class="toolbar">
+                <label><span id="searchLabel">Search</span><input type="text" id="tapeSearch"
+                        placeholder="barcode or location" /></label>
+                <label><span id="filterStatusLabel">Status</span>
+                    <select id="tapeStatusFilter">
+                        <option value="">All</option>
+                        <option value="shelf">Shelf</option>
+                        <option value="loaded">Loaded</option>
+                        <option value="retired">Retired</option>
+                        <option value="bad">Bad</option>
+                    </select>
+                </label>
+                <label><span id="filterLocationLabel">Location</span><input type="text" id="tapeLocationFilter"
+                        placeholder="filter location" /></label>
+                <label><span id="sortLabel">Sort</span>
+                    <select id="tapeSort">
+                        <option value="added_at">Added</option>
+                        <option value="barcode">Barcode</option>
+                        <option value="location">Location</option>
+                        <option value="last_used">Last used</option>
+                    </select>
+                </label>
+                <label><span id="orderLabel">Order</span>
+                    <select id="tapeOrder">
+                        <option value="desc">Desc</option>
+                        <option value="asc">Asc</option>
+                    </select>
+                </label>
+                <button class="secondary" id="refreshTapes">Refresh</button>
+            </div>
+            <div id="tapesList">
+                <p class="empty">No tapes.</p>
+            </div>
+            <div class="pagination" id="tapePagination"></div>
+        </section>
+
+        <section id="rack" class="section" role="tabpanel">
+            <h2 id="rackTitle">Rack / Shelf View</h2>
+            <div id="rackList" class="rack">
+                <p class="empty">No locations.</p>
+            </div>
+        </section>
+
+        <section id="activity" class="section" role="tabpanel">
+            <h2 id="activityTitle">Activity Log</h2>
+            <div class="toolbar">
+                <label><span id="actDriveLabel">Drive</span><input type="text" id="actDrive"
+                        placeholder="drive id" /></label>
+                <label><span id="actTapeLabel">Tape</span><input type="text" id="actTape"
+                        placeholder="tape id" /></label>
+                <label><span id="actActionLabel">Action</span>
+                    <select id="actAction">
+                        <option value="">All</option>
+                        <option value="load">Load</option>
+                        <option value="eject">Eject</option>
+                        <option value="add">Add</option>
+                        <option value="edit">Edit</option>
+                        <option value="delete">Delete</option>
+                    </select>
+                </label>
+                <button class="secondary" id="refreshActivity">Refresh</button>
+            </div>
+            <div id="activityList">
+                <p class="empty">No activity.</p>
+            </div>
+        </section>
+
+        <section id="import" class="section" role="tabpanel">
+            <h2 id="importTitle">Import / Export</h2>
+            <div class="form">
+                <button id="exportJSON">Export JSON</button>
+                <button id="exportCSV" class="secondary">Export CSV</button>
+            </div>
+            <form class="form" id="importForm">
+                <label><span id="importFormatLabel">Format</span>
+                    <select name="format">
+                        <option value="json">JSON</option>
+                        <option value="csv">CSV</option>
+                    </select>
+                </label>
+                <label><span id="importModeLabel">Mode</span>
+                    <select name="mode">
+                        <option value="append">Append</option>
+                        <option value="replace">Replace</option>
+                    </select>
+                </label>
+                <label style="flex:1"><span id="importDataLabel">Data</span><textarea name="data" rows="6"
+                        placeholder="Paste JSON or CSV here" style="width:100%"></textarea></label>
+                <button type="submit" id="importBtn">Import</button>
+            </form>
+            <pre id="importResult" class="muted"></pre>
+        </section>
+    </div>
+
+    <div class="modal-backdrop" id="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <div class="modal">
+            <h3 id="modalTitle">Confirm</h3>
+            <p id="modalBody"></p>
+            <div class="actions">
+                <button class="secondary" id="modalCancel">Cancel</button>
+                <button id="modalConfirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+
+    <script src="ui.js"></script>
+</body>
+
+</html>

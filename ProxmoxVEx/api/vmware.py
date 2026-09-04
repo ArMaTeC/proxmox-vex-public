@@ -1,0 +1,1415 @@
+# --- ProxmoxVEx auto-header start ---
+# --------------------------------------------------------------------
+# File:        ProxmoxVEx/api/vmware.py
+# Project:     ProxmoxVEx
+# Version:     1.2.303
+# Build:       2026.09.04
+# Description: vmware + v2p migration routes - split from monolith dec...
+# Docs:        https://proxmoxvex.local/docs
+# Generated:   2026-09-04
+# --------------------------------------------------------------------
+# --- ProxmoxVEx auto-header end ---
+"""vmware + v2p migration routes - split from monolith dec 2025,"""
+
+import html
+import logging
+import threading
+import time
+import uuid
+
+from flask import Blueprint, jsonify, request
+
+from ProxmoxVEx.api.helpers import check_cluster_access, check_vmware_access, server_access_guard
+from ProxmoxVEx.background.broadcast import broadcast_resources_loop
+from ProxmoxVEx.core.db import get_db
+from ProxmoxVEx.core.v2p import V2PMigrationTask, _run_v2p_migration
+from ProxmoxVEx.core.vmware import VMwareManager, save_vmware_server
+from ProxmoxVEx.globals import cluster_managers, vmware_managers
+from ProxmoxVEx.utils.audit import log_audit
+from ProxmoxVEx.utils.auth import load_users, require_auth
+from ProxmoxVEx.utils.rbac import filter_servers_for_user, user_can_access_vmware_vm
+
+# 2026-06-04 (CWE-117): mgr.name is from cluster-config (admin-controlled),
+# vmware_id from URL. Sanitise both before logging for consistency.
+from ProxmoxVEx.utils.sanitization import sanitize_log_message as _sl
+
+bp = Blueprint("vmware", __name__)
+bp.before_request(server_access_guard("vmware", "vmware_id", write_level="edit"))
+
+# V2P migration tracking
+_vmware_migrations = {}
+_migration_lock_v2p = threading.Lock()
+
+# =============================================================================
+
+
+@bp.route("/api/vmware", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def list_vmware_servers():
+    """List all configured VMware/vCenter servers"""
+    result = []
+    for _vmware_id, mgr in vmware_managers.items():
+        result.append(mgr.to_dict())
+
+    # Also include disabled servers from DB
+    try:
+        db = get_db()
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT id, name, host, port, enabled, server_type FROM vmware_servers")
+        for row in cursor.fetchall():
+            row_dict = dict(row)
+            if row_dict["id"] not in vmware_managers:
+                result.append({
+                    "id": row_dict["id"],
+                    "name": row_dict["name"],
+                    "host": row_dict["host"],
+                    "port": row_dict["port"],
+                    "server_type": row_dict.get("server_type", "vcenter"),
+                    "enabled": bool(row_dict["enabled"]),
+                    "connected": False,
+                })
+    except Exception:
+        pass
+
+    # Apply server access group filter for non-admins.
+    user = load_users().get(request.session.get("user", ""), {})
+    if user.get("role") != "admin":
+        allowed = filter_servers_for_user(user, "vmware", [r["id"] for r in result])
+        result = [r for r in result if r["id"] in allowed]
+
+    # lgtm[py/reflected-xss]
+    return jsonify(result)
+
+
+@bp.route("/api/vmware", methods=["POST"])
+@require_auth(perms=["vmware.config"])
+def add_vmware_server():
+    """Add a new VMware/vCenter server"""
+    data = request.json or {}
+
+    if not data.get("name") or not data.get("host"):
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Name and host are required"}), 400  # snyk:ignore:Cross-site Scripting (XSS)
+    if not data.get("username"):
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Username is required"}), 400  # snyk:ignore:Cross-site Scripting (XSS)
+    if not data.get("password"):
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Password is required"}), 400  # snyk:ignore:Cross-site Scripting (XSS)
+
+    vmware_id = str(uuid.uuid4())[:8]
+
+    mgr = VMwareManager(vmware_id, data)
+    if not mgr.connect():
+        return jsonify({
+            "error": f"Connection failed: {html.escape(str(mgr.last_error))}"
+        }), 400  # snyk:ignore:Cross-site Scripting (XSS)  # lgtm[py/reflected-xss]
+
+    save_vmware_server(vmware_id, data)
+    vmware_managers[vmware_id] = mgr
+
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.added",
+        f"Added VMware server: {data['name']} ({data['host']}, type={data.get('server_type', 'vcenter')})",
+    )
+
+    # lgtm[py/reflected-xss]
+    return jsonify({"id": vmware_id, "message": "VMware server added successfully", **mgr.to_dict()}), 201
+
+
+@bp.route("/api/vmware/<vmware_id>", methods=["PUT"])
+@require_auth(perms=["vmware.config"])
+def update_vmware_server(vmware_id):
+    """Update a VMware server config"""
+    data = request.json or {}
+
+    if vmware_id not in vmware_managers:
+        db = get_db()
+        row = db.conn.cursor().execute("SELECT * FROM vmware_servers WHERE id = ?", (vmware_id,)).fetchone()
+        if not row:
+            # lgtm[py/reflected-xss]
+            return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # (#469 port) - cred-exfil guard. If host changes WHILE the
+    # password is preserved (came in as ********), don't auto-connect — that
+    # would ship the saved credential to a potentially attacker-controlled host.
+    credentials_preserved = False
+    host_changed = False
+
+    if vmware_id in vmware_managers:
+        old_mgr = vmware_managers[vmware_id]
+        if (data.get("host") and data.get("host") != old_mgr.host) or (
+            data.get("port") and int(data.get("port", 443)) != old_mgr.port
+        ):
+            host_changed = True
+        if data.get("password") == "********":
+            data["password"] = old_mgr.password
+            credentials_preserved = True
+
+    save_vmware_server(vmware_id, data)
+
+    mgr = VMwareManager(vmware_id, data)
+    if data.get("enabled", True):
+        if host_changed and credentials_preserved:
+            try:
+                mgr.connected = False
+                mgr.last_error = "Host changed — auto-connect skipped for security (preserved credentials). Use Test Connection manually after verifying the new host."
+            except Exception:
+                pass
+            logging.warning(
+                f"[VMware:{_sl(getattr(mgr, 'name', vmware_id))}] Skipped auto-connect after host change with preserved credentials (cred-exfil guard)"
+            )
+        else:
+            mgr.connect()
+    vmware_managers[vmware_id] = mgr
+
+    log_audit(
+        request.session.get("user", "admin"), "vmware.updated", f"Updated VMware server: {data.get('name', vmware_id)}"
+    )
+
+    # lgtm[py/reflected-xss]
+    return jsonify(mgr.to_dict())
+
+
+@bp.route("/api/vmware/<vmware_id>", methods=["DELETE"])
+@require_auth(perms=["vmware.config"])
+def delete_vmware_server(vmware_id):
+    """Delete a VMware server"""
+    name = vmware_managers[vmware_id].name if vmware_id in vmware_managers else vmware_id
+    if vmware_id in vmware_managers:
+        del vmware_managers[vmware_id]
+
+    db = get_db()
+    db.conn.cursor().execute("DELETE FROM vmware_servers WHERE id = ?", (vmware_id,))
+    db.conn.commit()
+
+    log_audit(request.session.get("user", "admin"), "vmware.deleted", f"Deleted VMware server: {name}")
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": f"VMware server {name} deleted"})
+
+
+@bp.route("/api/vmware/test-connection", methods=["POST"])
+@require_auth(perms=["vmware.config"])
+def test_vmware_connection():
+    """Test VMware connection with provided credentials"""
+    data = request.json or {}
+    if not data.get("host") or not data.get("username") or not data.get("password"):
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Host, username and password required"}), 400  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = VMwareManager("test", data)
+    if mgr.connect():
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "success": True,
+            "server_info": mgr.server_info,
+            "api_version": mgr.api_version,
+            "connection_type": mgr._connection_type,
+        })
+    # lgtm[py/reflected-xss]
+    return jsonify({"success": False, "error": mgr.last_error}), 400
+
+
+@bp.route("/api/vmware/<vmware_id>/diagnose", methods=["GET"])
+@require_auth(perms=["vmware.config"])
+def diagnose_vmware_connection(vmware_id):
+    """diagnose connection issues -- compares stored vs. fresh credentials"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+
+    # Get stored encrypted password from DB
+    db = get_db()
+    row = (
+        db.conn
+        .cursor()
+        .execute("SELECT pass_encrypted, username, host, port FROM vmware_servers WHERE id = ?", (vmware_id,))
+        .fetchone()
+    )
+    if not row:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Not found in DB"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    row_d = dict(row)
+    stored_enc = row_d.get("pass_encrypted", "")
+
+    # Try decrypt
+    decrypted = ""
+    decrypt_ok = False
+    try:
+        decrypted = db._decrypt(stored_enc)
+        decrypt_ok = True
+    except Exception as e:
+        decrypted = f"DECRYPT_FAILED: {e}"
+
+    # SECURITY: no password chars in API response, only boolean indicators
+    result = {
+        "vmware_id": vmware_id,
+        "host": mgr.host,
+        "port": mgr.port,
+        "username_in_db": row_d.get("username", ""),
+        "username_in_mgr": mgr.username,
+        "password_encrypted_present": bool(stored_enc),
+        "password_decrypted_ok": decrypt_ok,
+        "password_matches_mgr": decrypted == mgr.password if decrypt_ok else False,
+        "mgr_connected": mgr.connected,
+        "mgr_connection_type": mgr._connection_type,
+        "mgr_last_error": mgr.last_error,
+    }
+
+    # Try fresh SOAP connection with stored credentials.
+    # 2026-06-04: honour the per-cluster `ssl_verify` flag instead of
+    # hard-disabling. Default is False because ESXi/vCenter ship with
+    # self-signed certs in most labs; admins flip it on via cluster settings
+    # once they've installed a real CA-signed cert + uploaded the CA. When
+    # opt-out is in effect we log it so the cert posture is observable in
+    # the audit/SIEM forward.
+    try:
+        import ssl
+
+        from pyVim.connect import SmartConnect
+
+        verify_tls = bool(getattr(mgr, "ssl_verify", False))
+        if verify_tls:
+            ctx = ssl.create_default_context()
+        else:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            logging.warning(
+                f"[VMware:{getattr(mgr, 'name', vmware_id)}] fresh-SOAP-test TLS verify DISABLED "
+                f"(cluster ssl_verify=false). Set ssl_verify=true once a CA-signed cert is in place."
+            )
+        si = SmartConnect(
+            host=mgr.host,
+            user=mgr.username,
+            pwd=mgr.password,
+            port=mgr.port,
+            sslContext=ctx,
+            disableSslCertValidation=not verify_tls,
+        )
+        if si:
+            result["fresh_soap_test"] = "SUCCESS"
+            from pyVim.connect import Disconnect
+
+            Disconnect(si)
+        else:
+            result["fresh_soap_test"] = "FAILED: SmartConnect returned None"
+    except Exception as e:
+        err = str(e)
+        if "InvalidLogin" in err:
+            result["fresh_soap_test"] = "FAILED: InvalidLogin (password wrong or locked)"
+        else:
+            result["fresh_soap_test"] = f"FAILED: {err[:150]}"
+
+    # lgtm[py/reflected-xss]
+    return jsonify(result)
+
+
+@bp.route("/api/vmware/<vmware_id>/vms", methods=["GET"])
+@require_auth(perms=["vmware.vm.view"])
+def get_vmware_vms(vmware_id):
+    """List all VMs from vCenter/ESXi"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    result = mgr.get_vms()
+    if "error" in result:
+        if mgr.connect():
+            result = mgr.get_vms()
+        if "error" in result and result.get("status_code") == 400:
+            mgr._try_soap_fallback()
+            if mgr._connection_type == "soap":
+                result = mgr.get_vms()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>", methods=["GET"])
+@require_auth(perms=["vmware.vm.view"])
+def get_vmware_vm_detail(vmware_id, vm_id):
+    """Get detailed VM info with guest and performance data"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    result = mgr.get_vm(vm_id)
+    if "error" in result and mgr.connect():
+        result = mgr.get_vm(vm_id)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+
+    data = result.get("data", {})
+    # Guest info
+    guest = mgr.get_vm_guest_info(vm_id)
+    if "error" not in guest:
+        data["guest_info"] = guest.get("data", {})
+    # Performance
+    perf = mgr.get_vm_performance(vm_id)
+    if "error" not in perf:
+        data["performance"] = perf.get("data", {})
+
+    # lgtm[py/reflected-xss]
+    return jsonify(data)
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/power/<action>", methods=["POST"])
+@require_auth(perms=["vmware.vm.power"])
+def vmware_vm_power(vmware_id, vm_id, action):
+    """VM power actions: start, stop, suspend, reset"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    if action not in ("start", "stop", "suspend", "reset"):
+        return jsonify({
+            "error": f"Invalid action: {html.escape(action)}"
+        }), 400  # snyk:ignore:Cross-site Scripting (XSS)  # lgtm[py/reflected-xss]
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.power"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    result = mgr.vm_power_action(vm_id, action)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+
+    log_audit(request.session.get("user", "admin"), f"vmware.vm.{action}", f"VM power {action} on {vm_id} @ {mgr.name}")
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": f"VM {action} successful"})
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/snapshots", methods=["GET"])
+@require_auth(perms=["vmware.vm.snapshot"])
+def get_vmware_snapshots(vmware_id, vm_id):
+    """List VM snapshots"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    result = mgr.get_snapshots(vm_id)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/snapshots", methods=["POST"])
+@require_auth(perms=["vmware.vm.snapshot"])
+def create_vmware_snapshot(vmware_id, vm_id):
+    """Create a VM snapshot"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    data = request.json or {}
+    if not data.get("name"):
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Snapshot name required"}), 400  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.snapshot"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    result = mgr.create_snapshot(
+        vm_id, data["name"], data.get("description", ""), data.get("memory", False), data.get("quiesce", True)
+    )
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.snapshot.created",
+        f"Snapshot '{data['name']}' created for VM {vm_id} @ {mgr.name}",
+    )
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": "Snapshot created", "data": result.get("data")}), 201
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/snapshots/<snapshot_id>", methods=["DELETE"])
+@require_auth(perms=["vmware.vm.snapshot"])
+def delete_vmware_snapshot(vmware_id, vm_id, snapshot_id):
+    """Delete a VM snapshot"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.snapshot"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    result = mgr.delete_snapshot(vm_id, snapshot_id)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.snapshot.deleted",
+        f"Snapshot {snapshot_id} deleted from VM {vm_id} @ {mgr.name}",
+    )
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": "Snapshot deleted"})
+
+
+@bp.route("/api/vmware/<vmware_id>/hosts", methods=["GET"])
+@require_auth(perms=["vmware.host.view"])
+def get_vmware_hosts(vmware_id):
+    """List ESXi hosts"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    result = mgr.get_hosts()
+    if "error" in result:
+        # Reconnect and retry
+        if mgr.connect():
+            result = mgr.get_hosts()
+        # If still failing with 400, try SOAP fallback
+        if "error" in result and result.get("status_code") == 400:
+            mgr._try_soap_fallback()
+            if mgr._connection_type == "soap":
+                result = mgr.get_hosts()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/datastores", methods=["GET"])
+@require_auth(perms=["vmware.datastore.view"])
+def get_vmware_datastores(vmware_id):
+    """List VMware datastores"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    result = mgr.get_datastores()
+    if "error" in result:
+        if mgr.connect():
+            result = mgr.get_datastores()
+        if "error" in result and result.get("status_code") == 400:
+            mgr._try_soap_fallback()
+            if mgr._connection_type == "soap":
+                result = mgr.get_datastores()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/datastores/<ds_id>", methods=["GET"])
+@require_auth(perms=["vmware.datastore.view"])
+def get_vmware_datastore_detail(vmware_id, ds_id):
+    """Get detailed datastore info"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    result = mgr.get_datastore_detail(ds_id)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", {}))
+
+
+@bp.route("/api/vmware/<vmware_id>/networks", methods=["GET"])
+@require_auth(perms=["vmware.network.view"])
+def get_vmware_networks(vmware_id):
+    """List VMware networks"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    result = mgr.get_networks()
+    if "error" in result:
+        if mgr.connect():
+            result = mgr.get_networks()
+        if "error" in result and result.get("status_code") == 400:
+            mgr._try_soap_fallback()
+            if mgr._connection_type == "soap":
+                result = mgr.get_networks()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/clusters", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def get_vmware_vcenter_clusters(vmware_id):
+    """List vCenter compute clusters with DRS/HA status"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    result = mgr.get_vcenter_clusters_detailed()
+    if "error" in result:
+        # Fallback to basic list
+        result = mgr.get_vcenter_clusters()
+    if "error" in result and result.get("status_code") == 400:
+        mgr._try_soap_fallback()
+        if mgr._connection_type == "soap":
+            result = mgr.get_vcenter_clusters_detailed()
+            if "error" in result:
+                result = mgr.get_vcenter_clusters()
+    if "error" in result:
+        # For standalone ESXi (no clusters), return empty list instead of error
+        if result.get("status_code") in (400, 404):
+            # lgtm[py/reflected-xss]
+            return jsonify([])
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/clusters/<cluster_id>", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def get_vmware_cluster_detail(vmware_id, cluster_id):
+    """Get cluster detail with DRS/HA config"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    result = mgr.get_cluster_detail(cluster_id)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", {}))
+
+
+@bp.route("/api/vmware/<vmware_id>/clusters/<cluster_id>/drs", methods=["POST"])
+@require_auth(perms=["vmware.cluster.manage"])
+def set_vmware_cluster_drs(vmware_id, cluster_id):
+    """Toggle DRS on a cluster"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    data = request.json or {}
+    enabled = data.get("enabled", False)
+    automation = data.get("automation")
+    mgr = vmware_managers[vmware_id]
+    result = mgr.set_cluster_drs(cluster_id, enabled, automation)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), 500
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.cluster.drs",
+        f"DRS {'enabled' if enabled else 'disabled'} on cluster {cluster_id} @ {mgr.name}",
+    )
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": f"DRS {'enabled' if enabled else 'disabled'}"})
+
+
+@bp.route("/api/vmware/<vmware_id>/clusters/<cluster_id>/ha", methods=["POST"])
+@require_auth(perms=["vmware.cluster.manage"])
+def set_vmware_cluster_ha(vmware_id, cluster_id):
+    """Toggle HA on a cluster"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    data = request.json or {}
+    enabled = data.get("enabled", False)
+    mgr = vmware_managers[vmware_id]
+    result = mgr.set_cluster_ha(cluster_id, enabled)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), 500
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.cluster.ha",
+        f"HA {'enabled' if enabled else 'disabled'} on cluster {cluster_id} @ {mgr.name}",
+    )
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": f"HA {'enabled' if enabled else 'disabled'}"})
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/performance", methods=["GET"])
+@require_auth(perms=["vmware.vm.view"])
+def get_vmware_vm_performance(vmware_id, vm_id):
+    """Get VM performance metrics"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    result = mgr.get_vm_performance(vm_id)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", {}))
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/watch", methods=["POST"])
+@require_auth(perms=["vmware.vm.view"])
+def watch_vmware_vm(vmware_id, vm_id):
+    """register interest in a VM -- SSE will push detail data every 5s.
+    Call again to renew the 120s watch window. POST with empty body."""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if not hasattr(broadcast_resources_loop, "_vmw_watched"):
+        broadcast_resources_loop._vmw_watched = {}
+    broadcast_resources_loop._vmw_watched[(vmware_id, vm_id)] = time.time()
+    # lgtm[py/reflected-xss]
+    return jsonify({"ok": True, "watching": vm_id, "ttl": 120})
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/watch", methods=["DELETE"])
+@require_auth(perms=["vmware.vm.view"])
+def unwatch_vmware_vm(vmware_id, vm_id):
+    """Stop watching a VM"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    watched = getattr(broadcast_resources_loop, "_vmw_watched", {})
+    watched.pop((vmware_id, vm_id), None)
+    # lgtm[py/reflected-xss]
+    return jsonify({"ok": True})
+
+
+@bp.route("/api/vmware/<vmware_id>/datacenters", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def get_vmware_datacenters(vmware_id):
+    """List vCenter datacenters"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    result = mgr.get_datacenters()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/summary", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def get_vmware_summary(vmware_id):
+    """Get environment summary (VM counts, host counts, health)"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    result = mgr.get_summary()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", {}))
+
+
+@bp.route("/api/vmware/<vmware_id>/health", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def get_vmware_health(vmware_id):
+    """Get vCenter appliance health"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    result = mgr.get_appliance_health()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", {}))
+
+
+@bp.route("/api/vmware/<vmware_id>/folders", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def get_vmware_folders(vmware_id):
+    """List folders"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    folder_type = request.args.get("type")
+    result = mgr.get_folders(folder_type)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/resource-pools", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def get_vmware_resource_pools(vmware_id):
+    """List resource pools"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    result = mgr.get_resource_pools()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/storage-policies", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def get_vmware_storage_policies(vmware_id):
+    """List storage policies"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    result = mgr.get_storage_policies()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/content-libraries", methods=["GET"])
+@require_auth(perms=["vmware.view"])
+def get_vmware_content_libraries(vmware_id):
+    """List content libraries"""
+    # (CodeAnt re-scan IDOR) - per-server tenant gate (was role-perm only)
+    ok, err = check_vmware_access(vmware_id)
+    if not ok:
+        # lgtm[py/reflected-xss]
+        return err
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    mgr = vmware_managers[vmware_id]
+    result = mgr.get_content_libraries()
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", []))
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/console", methods=["POST"])
+@require_auth(perms=["vmware.vm.view"])
+def get_vmware_console(vmware_id, vm_id):
+    """get console ticket -- tries WebMKS, MKS, direct URL"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.view"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+
+    # Security: Verify VM exists on this VMware server before issuing console ticket
+    # This prevents users from requesting console tickets for arbitrary VM IDs
+    vm_check = mgr.get_vm(vm_id)
+    if "error" in vm_check:
+        log_audit(
+            request.session.get("user", "admin"),
+            "vmware.console.denied",
+            f"Console access denied for VM {vm_id} @ {mgr.name}: VM not found",
+        )
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VM not found or access denied"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    result = mgr.get_vm_console_ticket(vm_id)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.console.accessed",
+        f"Console ticket issued for VM {vm_id} @ {mgr.name}",
+    )
+    # lgtm[py/reflected-xss]
+    return jsonify(result.get("data", {}))
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/config", methods=["PUT"])
+@require_auth(perms=["vmware.vm.manage"])
+def update_vmware_vm_config(vmware_id, vm_id):
+    """Update VM configuration (CPU, RAM, notes, hot-add, etc)"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.manage"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    mgr.ensure_connected()
+    data = request.json or {}
+    result = mgr.update_vm_config(vm_id, data)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), 500
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.vm.config",
+        f"Updated config on VM {vm_id} @ {mgr.name}: {list(data.keys())}",
+    )
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": "VM configuration updated"})
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/network", methods=["PUT"])
+@require_auth(perms=["vmware.vm.manage"])
+def update_vmware_vm_network(vmware_id, vm_id):
+    """Change VM network adapter"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.manage"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    data = request.json or {}
+    nic_key = int(data.get("nic_key", 0))
+    network = data.get("network", "")
+    if not network:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Network name required"}), 400  # snyk:ignore:Cross-site Scripting (XSS)
+    result = mgr.update_vm_network(vm_id, nic_key, network)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), 500
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.vm.network",
+        f"Changed network on VM {vm_id} to '{network}' @ {mgr.name}",
+    )
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": f"Network changed to '{network}'"})
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/boot-order", methods=["PUT"])
+@require_auth(perms=["vmware.vm.manage"])
+def update_vmware_vm_boot_order(vmware_id, vm_id):
+    """Change VM boot order"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.manage"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    data = request.json or {}
+    boot_order = data.get("boot_order", ["disk", "cdrom", "net"])
+    result = mgr.update_vm_boot_order(vm_id, boot_order)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), 500
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": "Boot order updated"})
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/clone", methods=["POST"])
+@require_auth(perms=["vmware.vm.migrate"])
+def clone_vmware_vm(vmware_id, vm_id):
+    """Clone a VM"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    data = request.json or {}
+    if not data.get("name"):
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Clone name is required"}), 400  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.migrate"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    result = mgr.clone_vm(vm_id, data["name"], data.get("folder"), data.get("resource_pool"), data.get("datastore"))
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+
+    log_audit(
+        request.session.get("user", "admin"), "vmware.vm.cloned", f"Cloned VM {vm_id} as '{data['name']}' @ {mgr.name}"
+    )
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": f"VM cloned as '{data['name']}'", "data": result.get("data")}), 201
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>", methods=["DELETE"])
+@require_auth(perms=["vmware.vm.power"])
+def delete_vmware_vm(vmware_id, vm_id):
+    """Delete a VM (must be powered off)"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.power"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    result = mgr.delete_vm(vm_id)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+
+    log_audit(request.session.get("user", "admin"), "vmware.vm.deleted", f"Deleted VM {vm_id} @ {mgr.name}")
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": "VM deleted"})
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/rename", methods=["POST"])
+@require_auth(perms=["vmware.vm.power"])
+def rename_vmware_vm(vmware_id, vm_id):
+    """Rename a VM"""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    data = request.json or {}
+    if not data.get("name"):
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "New name is required"}), 400  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.power"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    result = mgr.rename_vm(vm_id, data["name"])
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), result.get("status_code", 500)
+
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.vm.renamed",
+        f"Renamed VM {vm_id} to '{data['name']}' @ {mgr.name}",
+    )
+    # lgtm[py/reflected-xss]
+    return jsonify({"message": f"VM renamed to '{data['name']}'"})
+
+
+# ===========================================================================
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/migration-plan", methods=["GET"])
+@require_auth(perms=["vmware.vm.migrate"])
+def get_vmware_migration_plan(vmware_id, vm_id):
+    """Analyze source VM and return migration plan with available Proxmox targets.
+    Also detects ESXi host and datastore for SSHFS access."""
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.migrate"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    result = mgr.get_vm_disks_for_export(vm_id)
+    if "error" in result:
+        # lgtm[py/reflected-xss]
+        return jsonify(result), 400
+    vm_data = result["data"]
+
+    # Available Proxmox targets — only clusters the caller may reach (don't leak others' topology)
+    targets = []
+    for cid, cmgr in cluster_managers.items():
+        if cmgr.is_connected:
+            allowed, _ = check_cluster_access(cid)
+            if not allowed:
+                continue
+            nodes = list(cmgr.nodes.keys()) if cmgr.nodes else []
+            node_storages = {}
+            for n in nodes:
+                try:
+                    sr = cmgr._api_get(f"https://{cmgr.host}:{cmgr.api_port}/api2/json/nodes/{n}/storage")
+                    if sr.status_code == 200:
+                        node_storages[n] = [
+                            s["storage"]
+                            for s in sr.json().get("data", [])
+                            if s.get("active") and "images" in s.get("content", "")
+                        ]
+                except Exception:
+                    node_storages[n] = []
+            targets.append({
+                "cluster_id": cid,
+                "cluster_name": cmgr.config.name,
+                "nodes": nodes,
+                "storages": node_storages,
+            })
+
+    # lgtm[py/reflected-xss]
+    return jsonify({
+        "source": vm_data,
+        "targets": targets,
+        "esxi_host": mgr.host,
+        "esxi_user": "root",
+        "estimated_downtime_seconds": max(10, int(vm_data.get("total_disk_gb", 10) * 0.3)),
+        "requirements": [
+            "SSH must be enabled on ESXi host",
+            "sshfs must be installed on target Proxmox node (apt install sshfs)",
+            "ESXi root password is required for SSHFS access",
+            "Sufficient temp space on Proxmox node for disk conversion",
+        ],
+        "method": "SSHFS + qm importdisk (works on VMFS 5, VMFS 6, vSAN, NFS)",
+    })
+
+
+@bp.route("/api/vmware/<vmware_id>/vms/<vm_id>/migrate", methods=["POST"])
+@require_auth(perms=["vmware.vm.migrate"])
+def start_vmware_migration(vmware_id, vm_id):
+    """Start near-zero-downtime migration from VMware to Proxmox.
+
+    Required body:
+    - target_cluster, target_node, target_storage
+    - esxi_password: Root password for ESXi SSH access
+
+    Optional:
+    - esxi_host: ESXi host IP (default: from VMware server config)
+    - esxi_user: SSH username (default: root)
+    - esxi_datastore: Datastore name (auto-detected if not set)
+    - esxi_vm_dir: VM directory name on datastore (default: VM name)
+    - network_bridge, start_after, remove_source
+    """
+    if vmware_id not in vmware_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "VMware server not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # Security fix: Check VM-level authorization
+    users = load_users()
+    user = users.get(request.session.get("user", ""), {})
+    user["username"] = request.session.get("user", "")
+
+    if not user_can_access_vmware_vm(user, vmware_id, vm_id, "vmware.vm.migrate"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Permission denied: You do not have access to this VM"
+        }), 403  # snyk:ignore:Cross-site Scripting (XSS)
+
+    data = request.json or {}
+
+    for field in ("target_cluster", "target_node", "target_storage"):
+        if not data.get(field):
+            # lgtm[py/reflected-xss]
+            # snyk:ignore:Cross-site Scripting (XSS)
+            return jsonify({"error": f"{field} is required"}), 400  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # (#481 port) - target_storage flows into `pvesm` calls on the
+    # PVE node. Validate at the api boundary before the shell touches it.
+    from ProxmoxVEx.utils.sanitization import validate_esxi_path_component, validate_storage_name
+
+    if not validate_storage_name(data["target_storage"]):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Invalid target_storage name. Must be alphanumeric with hyphens, underscores, or dots only."
+        }), 400
+
+    # 2026-06-05 (audit C-2/M-2): esxi_datastore / esxi_vm_dir are user-supplied
+    # and get interpolated into root shell commands on the PVE node. Empty = let
+    # the task auto-detect from the VM config; non-empty must be a safe single
+    # component name (no slashes, no shell metacharacters). Reject at the door.
+    for _f in ("esxi_datastore", "esxi_vm_dir"):
+        _v = (data.get(_f) or "").strip()
+        if _v and not validate_esxi_path_component(_v):
+            # lgtm[py/reflected-xss]
+            return jsonify({
+                "error": f"Invalid {_f}: only letters, digits, space and ._()+- are allowed (single name, no path)."
+            }), 400
+
+    # #598 — aio_mode is interpolated into the root `qm set` / conf line that
+    # attaches the migrated disk. V2PMigrationTask.__init__ already whitelists it,
+    # but reject a bad value at the door too (matches the boundary-validation
+    # style above); empty = unset = PVE default.
+    _aio = (data.get("aio_mode") or "").strip().lower()
+    if _aio and _aio not in ("threads", "native", "io_uring"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "Invalid aio_mode: must be threads, native or io_uring."
+        }), 400  # snyk:ignore:Cross-site Scripting (XSS)
+
+    if not data.get("esxi_password"):
+        # lgtm[py/reflected-xss]
+        return jsonify({
+            "error": "esxi_password is required for SSHFS-based migration"
+        }), 400  # snyk:ignore:Cross-site Scripting (XSS)
+    if data["target_cluster"] not in cluster_managers:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Target cluster not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+
+    # gate the migration target on cluster access
+    allowed, err_response = check_cluster_access(data["target_cluster"])
+    if not allowed:
+        # lgtm[py/reflected-xss]
+        return err_response  # snyk:ignore:Cross-site Scripting (XSS)
+
+    mgr = vmware_managers[vmware_id]
+    vm_detail = mgr.get_vm(vm_id)
+    vm_name = vm_detail.get("data", {}).get("name", vm_id) if "data" in vm_detail else vm_id
+
+    # Pass all NICs from VMware to migration task so multi-NIC + MAC works
+    if "selected_nics" not in data and "data" in vm_detail:
+        nics = vm_detail["data"].get("nics", [])
+        if nics:
+            data["selected_nics"] = nics
+
+    mid = str(uuid.uuid4())[:8]
+    task = V2PMigrationTask(
+        mid, vmware_id, vm_id, data["target_cluster"], data["target_node"], data["target_storage"], vm_name, data
+    )
+
+    with _migration_lock_v2p:
+        _vmware_migrations[mid] = task
+
+    thread = threading.Thread(target=_run_v2p_migration, args=(task,), daemon=True)
+    thread.start()
+
+    log_audit(
+        request.session.get("user", "admin"),
+        "vmware.migration.started",
+        f"V2P migration: {vm_name} @ {data.get('esxi_host', mgr.host)} -> "
+        f"{data['target_cluster']}/{data['target_node']}/{data['target_storage']}",
+    )
+
+    # lgtm[py/reflected-xss]
+    return jsonify({
+        "migration_id": mid,
+        "message": f"Migration started for {vm_name}",
+        "task": task.to_dict(),
+    }), 202
+
+
+@bp.route("/api/vmware/migrations", methods=["GET"])
+@require_auth(perms=["vmware.vm.migrate"])
+def _migration_reachable(t):
+    # (CodeAnt IDOR) - a caller may see a migration only if they can reach one of the
+    # clusters it touches (source or target). Tasks with no determinable cluster are shown.
+    cids = [c for c in (getattr(t, "target_cluster", None), getattr(t, "source_cluster", None)) if c]
+    # lgtm[py/reflected-xss]
+    return (not cids) or any(check_cluster_access(c)[0] for c in cids)
+
+
+def list_vmware_migrations():
+    """List all active and recent migrations"""
+    # lgtm[py/reflected-xss]
+    return jsonify([t.to_dict() for t in _vmware_migrations.values() if _migration_reachable(t)])
+
+
+@bp.route("/api/vmware/migrations/<mid>", methods=["GET"])
+@require_auth(perms=["vmware.vm.migrate"])
+def get_vmware_migration_status(mid):
+    """Get detailed status of a specific migration"""
+    if mid not in _vmware_migrations:
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Migration not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    if not _migration_reachable(_vmware_migrations[mid]):
+        # lgtm[py/reflected-xss]
+        return jsonify({"error": "Migration not found"}), 404  # snyk:ignore:Cross-site Scripting (XSS)
+    # lgtm[py/reflected-xss]
+    return jsonify(_vmware_migrations[mid].to_dict())
+
+
+# End VMware API endpoints
+# ============================================================================

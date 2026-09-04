@@ -1,0 +1,16 @@
+{
+  "cancel": "取消",
+  "configured": "已配置",
+  "loading": "加载中...",
+  "overview": "概览",
+  "save": "保存",
+  "status": "状态",
+  "title": "VyOS",
+  "unconfigured": "未配置",
+  "interfaces": "接口",
+  "routes": "路由",
+  "loaded_status": "Loaded %s (%s)",
+  "failed_to_load": "Failed to load %s: %s",
+  "error_loading": "Error loading %s: %s",
+  "unknown_error": "unknown error"
+}

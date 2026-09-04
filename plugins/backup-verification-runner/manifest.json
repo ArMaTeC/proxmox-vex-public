@@ -1,0 +1,12 @@
+{
+    "id": "backup-verification-runner",
+    "name": "Backup Verification Runner",
+    "version": "1.0.0",
+    "author": "ProxmoxVEx Team",
+    "description": "Simulates backup restore verification and schedules re-verification jobs.",
+    "min_ProxmoxVEx": "1.2.23",
+    "has_frontend": true,
+    "frontend_route": "ui",
+    "category": "Backup & Recovery",
+    "min_license_tier": "advanced"
+}

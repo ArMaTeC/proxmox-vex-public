@@ -1,0 +1,288 @@
+/* --- ProxmoxVEx auto-header start ---
+ * -------------------------------------------------------------------
+ * File:        plugins/vm-resource-quotas/ui.css
+ * Project:     ProxmoxVEx
+ * Version:     1.2.303
+ * Build:       2026.09.04
+ * Description: Ui CSS source
+ * Docs:        https://proxmoxvex.local/docs
+ * Generated:   2026-09-04
+ * -------------------------------------------------------------------
+ * --- ProxmoxVEx auto-header end --- */
+:root {
+    --bg: #0b0d0d;
+    --card: #1a2222;
+    --border: #283d3d;
+    --accent: #7ce8e7;
+    --text: #f0f2f5;
+    --muted: #8b949e;
+    --danger: #f85149;
+    --success: #238636;
+    --warning: #d29922;
+    --info: #58a6ff;
+}
+
+[data-theme="corp-light"] {
+    --bg: #f4f4f4;
+    --card: #ffffff;
+    --border: #d4d4d4;
+    --text: #1a1a1a;
+    --muted: #666666;
+    --accent: #e57000;
+    --danger: #d32f2f;
+    --success: #2e7d32;
+    --warning: #d29922;
+    --info: #1976d2;
+}
+
+
+
+[data-theme="corp-dark"] {
+  --bg: #1e272e;
+  --fg: #f5f6fa;
+  --muted: #95a5a6;
+  --card: #2f3640;
+  --border: #57606f;
+  --input-bg: #2f3640;
+  --row-even: #2d3436;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.4rem;
+}
+
+nav {
+  display: flex;
+  gap: .25rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+nav button {
+  background: transparent;
+  color: var(--fg);
+  border: 0;
+  padding: .65rem 1rem;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+
+nav button.active {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: .5rem;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: .75rem;
+  margin-bottom: 1rem;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  font-size: .85rem;
+  color: var(--muted);
+}
+
+input,
+select,
+textarea,
+button.btn {
+  padding: .5rem .6rem;
+  background: var(--input-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: .35rem;
+}
+
+textarea {
+  min-height: 4rem;
+}
+
+button.btn,
+nav button {
+  cursor: pointer;
+}
+
+button.btn {
+  background: var(--accent);
+  border: 0;
+  color: #fff;
+}
+
+button.btn.secondary {
+  background: #555;
+}
+
+button.btn.danger {
+  background: var(--danger);
+}
+
+.actions {
+  display: flex;
+  gap: .5rem;
+  margin-top: .5rem;
+  flex-wrap: wrap;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .9rem;
+}
+
+th,
+td {
+  padding: .55rem .5rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+tr:nth-child(even) {
+  background: var(--row-even);
+}
+
+th {
+  cursor: pointer;
+  user-select: none;
+  color: var(--muted);
+}
+
+th.active {
+  color: var(--accent);
+}
+
+.empty {
+  color: var(--muted);
+  padding: 1rem 0;
+}
+
+.message {
+  position: fixed;
+  bottom: 1rem;
+  right: 1rem;
+  padding: .75rem 1rem;
+  border-radius: .35rem;
+  max-width: 400px;
+  z-index: 100;
+  display: none;
+}
+
+.message.show {
+  display: block;
+}
+
+.message.success {
+  background: var(--ok);
+  color: #000;
+}
+
+.message.error {
+  background: var(--danger);
+  color: #fff;
+}
+
+.progress {
+  height: 1.2rem;
+  border-radius: .35rem;
+  overflow: hidden;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+}
+
+.progress-bar {
+  height: 100%;
+  width: 0;
+  transition: width .3s;
+}
+
+.progress-bar.ok {
+  background: var(--ok);
+}
+
+.progress-bar.warning {
+  background: var(--warning);
+}
+
+.progress-bar.danger {
+  background: var(--danger);
+}
+
+.badge {
+  display: inline-block;
+  padding: .15rem .4rem;
+  border-radius: .2rem;
+  font-size: .8rem;
+}
+
+.badge.ok {
+  background: var(--ok);
+  color: #000;
+}
+
+.badge.warning {
+  background: var(--warning);
+  color: #000;
+}
+
+.badge.danger {
+  background: var(--danger);
+  color: #fff;
+}
+
+.tabs-content {
+  display: none;
+}
+
+.tabs-content.active {
+  display: block;
+}
+
+.search-bar {
+  display: flex;
+  gap: .5rem;
+  margin-bottom: .75rem;
+}
+
+.hidden {
+  display: none !important;
+}
