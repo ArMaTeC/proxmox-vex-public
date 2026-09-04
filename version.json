@@ -1,9 +1,9 @@
 {
-  "version": "1.2.339",
+  "version": "1.2.340",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.339 (2026-09-04) - Implement compression for cost engine (spec 961)"
+    "1.2.340 (2026-09-04) - Implement connection pooling for cost engine (spec 962)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
