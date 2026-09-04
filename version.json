@@ -1,9 +1,9 @@
 {
-  "version": "1.2.375",
+  "version": "1.2.376",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.375 (2026-09-04) - Implement HA signed images (spec 996)"
+    "1.2.376 (2026-09-04) - Implement HA vulnerability scan (spec 997)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
