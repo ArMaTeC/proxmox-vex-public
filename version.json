@@ -1,10 +1,9 @@
 {
-  "version": "1.2.334",
+  "version": "1.2.335",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.334 (2026-09-04) - Show context-aware Upgrade/Downgrade buttons on licence tier cards",
-    "1.2.334 (2026-09-04) - Implement caching for cost engine (spec 956)"
+    "1.2.335 (2026-09-04) - Implement lazy loading for cost engine (spec 957)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
