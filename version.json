@@ -1,9 +1,9 @@
 {
-  "version": "1.2.306",
+  "version": "1.2.307",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.306 (2026-09-04) - Implement bulk selection for recovery drill (spec 938)"
+    "1.2.307 (2026-09-04) - Implement step-by-step wizard for recovery drill (spec 939)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
