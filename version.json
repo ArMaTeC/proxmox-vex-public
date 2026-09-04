@@ -1,9 +1,9 @@
 {
-  "version": "1.2.369",
+  "version": "1.2.370",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.369 (2026-09-04) - Implement single-node rollback path (spec 991)"
+    "1.2.370 (2026-09-04) - Implement HA base chart (spec 992)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
