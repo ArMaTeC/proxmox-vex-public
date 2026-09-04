@@ -1,9 +1,9 @@
 {
-  "version": "1.2.374",
+  "version": "1.2.375",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.374 (2026-09-04) - Implement HA replicated service (spec 995)"
+    "1.2.375 (2026-09-04) - Implement HA signed images (spec 996)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
