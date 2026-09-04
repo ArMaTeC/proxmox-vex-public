@@ -3,12 +3,12 @@
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.303 (2026-09-04) - Build fix: resolve test and theme regressions"
+    "1.2.303 (2026-09-04) - Public release sync"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
   "docs_url": "https://github.com/ArMaTeC/proxmox-vex-public#readme",
-  "update_archive": "https://github.com/ArMaTeC/proxmox-vex-public/archive/refs/heads/main.tar.gz",
+  "update_archive": "https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/main/dist/ProxmoxVEx-latest.tar.gz",
   "update_files": [
     "Dockerfile",
     "LICENSE",

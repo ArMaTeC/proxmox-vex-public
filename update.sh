@@ -54,7 +54,7 @@ GITHUB_BRANCH="${ProxmoxVEx_BRANCH:-main}"
 # Raw content and archive URLs for the selected branch.
 GITHUB_RAW="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/${GITHUB_BRANCH}"
 # Local release mirror placeholder (see speckit for endpoint implementation)
-GITHUB_ARCHIVE="https://github.com/ArMaTeC/proxmox-vex-public/archive/refs/heads/${GITHUB_BRANCH}.tar.gz"
+GITHUB_ARCHIVE="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/${GITHUB_BRANCH}/dist/ProxmoxVEx-latest.tar.gz"
 
 
 
