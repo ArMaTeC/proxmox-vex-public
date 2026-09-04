@@ -1,9 +1,9 @@
 {
-  "version": "1.2.329",
+  "version": "1.2.330",
   "build": "2026.09.04",
   "release_date": "2026-09-04",
   "changelog": [
-    "1.2.329 (2026-09-04) - Remove public-facing GitHub links and fix pre-build xdist/gevent LoopExit"
+    "1.2.330 (2026-09-04) - Implement connection pooling for realtime graph (spec 952)"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
