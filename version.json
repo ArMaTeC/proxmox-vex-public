@@ -1,9 +1,9 @@
 {
-  "version": "1.2.379",
+  "version": "1.2.381",
   "build": "2026.09.05",
   "release_date": "2026-09-05",
   "changelog": [
-    "1.2.379 (2026-09-05) - Full build pipeline"
+    "1.2.381 (2026-09-05) - Full build pipeline"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
