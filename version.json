@@ -1,9 +1,9 @@
 {
-  "version": "1.2.381",
-  "build": "2026.09.05",
-  "release_date": "2026-09-05",
+  "version": "1.2.384",
+  "build": "2026.09.06",
+  "release_date": "2026-09-06",
   "changelog": [
-    "1.2.381 (2026-09-05) - Full build pipeline"
+    "1.2.384 (2026-09-06) - Audit run integrated: ISS-034 and ISS-046"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",

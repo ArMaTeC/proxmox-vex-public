@@ -3,7 +3,7 @@
 # --------------------------------------------------------------------
 # File:        update.sh
 # Project:     ProxmoxVEx
-# Version:     1.2.380
+# Version:     1.2.383
 # Build:       2026.09.05
 # Description: Update SH source
 # Docs:        https://proxmoxvex.local/docs
