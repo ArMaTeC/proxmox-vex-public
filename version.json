@@ -1,9 +1,10 @@
 {
-  "version": "1.2.419",
-  "build": "2026.09.10",
-  "release_date": "2026-09-10",
+  "version": "1.2.421",
+  "build": "2026.09.11",
+  "release_date": "2026-09-11",
   "changelog": [
-    "1.2.419 (2026-09-10) - Demo sandbox: fixture-backed inventory + recorded live metrics"
+    "1.2.421 (2026-09-11) - Remove real integration credentials from shipped native configs; persist integration config on the config volume; sanitize demo image",
+    "1.2.421 (2026-09-11) - README rework: PostgreSQL-only backend, XCP-ng, demo mode, corrected env vars and public endpoints"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
@@ -14,7 +15,6 @@
     "LICENSE",
     "NOTICE",
     "README.md",
-    "SECURITY.md",
     "deploy.sh",
     "docker-compose.yml",
     "docs/SECURITY.md",
