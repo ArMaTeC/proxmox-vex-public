@@ -6,7 +6,7 @@
 # Version:     1.2.403
 # Build:       2026.09.09
 # Description: Update SH source
-# Docs:        https://pmvex.certrunnerx.com/docs
+# Docs:        https://proxmoxvex.com/docs
 # Generated:   2026-09-09
 # --------------------------------------------------------------------
 # --- ProxmoxVEx auto-header end ---
