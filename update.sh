@@ -3,11 +3,11 @@
 # --------------------------------------------------------------------
 # File:        update.sh
 # Project:     ProxmoxVEx
-# Version:     1.2.403
-# Build:       2026.09.09
+# Version:     1.2.437
+# Build:       2026.09.12
 # Description: Update SH source
 # Docs:        https://proxmoxvex.com/docs
-# Generated:   2026-09-09
+# Generated:   2026-09-12
 # --------------------------------------------------------------------
 # --- ProxmoxVEx auto-header end ---
 set -e
@@ -52,9 +52,10 @@ NC='\033[0m'
 GITHUB_BRANCH="${ProxmoxVEx_BRANCH:-main}"
 
 # Raw content and archive URLs for the selected branch.
-# 1000-local-release-mirror: update via the local ProxmoxVEx mirror.
+# Raw files come from the public GitHub mirror repo; the release archive is
+# served by the main site (proxmoxvex.com/downloads).
 GITHUB_RAW="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/${GITHUB_BRANCH}"
-GITHUB_ARCHIVE="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/main/dist/ProxmoxVEx-latest.tar.gz"
+GITHUB_ARCHIVE="https://proxmoxvex.com/downloads/ProxmoxVEx-latest.tar.gz"
 
 
 
