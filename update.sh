@@ -3,11 +3,11 @@
 # --------------------------------------------------------------------
 # File:        update.sh
 # Project:     ProxmoxVEx
-# Version:     1.2.437
-# Build:       2026.09.12
+# Version:     1.2.453
+# Build:       2026.09.14
 # Description: Update SH source
 # Docs:        https://proxmoxvex.com/docs
-# Generated:   2026-09-12
+# Generated:   2026-09-14
 # --------------------------------------------------------------------
 # --- ProxmoxVEx auto-header end ---
 set -e
