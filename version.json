@@ -1,9 +1,9 @@
 {
-  "version": "1.2.467",
-  "build": "2026.09.16",
-  "release_date": "2026-09-16",
+  "version": "1.2.472",
+  "build": "2026.09.17",
+  "release_date": "2026-09-17",
   "changelog": [
-    "1.2.467 (2026-09-16) - Spec 081 support ticketing + Helm deploy fixes (in-cluster postgres, k8s env-injection port crash, writable plugins volume)"
+    "1.2.472 (2026-09-17) - Fix API token persistence and idempotent custom_scripts migration"
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
