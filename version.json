@@ -3,7 +3,18 @@
   "build": "2026.09.17",
   "release_date": "2026-09-17",
   "changelog": [
-    "1.2.472 (2026-09-17) - Fix API token persistence and idempotent custom_scripts migration"
+    {
+      "type": "fix",
+      "component": "dist",
+      "breaking": false,
+      "text": "1.2.472 (2026-09-19) - Distribution integrity: GPG-signed release tarballs with pubkey.asc, SHA256 checksums manifest, SLSA provenance release workflow, and countersigned signing-key rotation (update.sh verifies signatures/checksums before extraction)"
+    },
+    {
+      "type": "fix",
+      "component": "dist",
+      "breaking": false,
+      "text": "1.2.472 (2026-09-17) - Fix API token persistence and idempotent custom_scripts migration"
+    }
   ],
   "min_python": "3.8",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
@@ -1448,5 +1459,28 @@
     "web/sw.js"
   ],
   "prev_changelog": [],
-  "breaking_changes": []
+  "breaking_changes": [],
+  "channels": {
+    "stable": {
+      "version": "1.2.472",
+      "archive": "ProxmoxVEx-latest.tar.gz",
+      "size_bytes": 18413275
+    }
+  },
+  "deltas": {},
+  "releases": {
+    "1.2.472": {
+      "support_until": "2027-09-17",
+      "min_from": "1.0.0",
+      "size_bytes": 18413275
+    }
+  },
+  "mirrors": [
+    "https://proxmoxvex.com/downloads",
+    "https://mirror.proxmoxvex.com/dist"
+  ],
+  "formats": [
+    "tar.gz",
+    "tar.zst"
+  ]
 }

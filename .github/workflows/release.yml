@@ -1,0 +1,76 @@
+# spec 093/US003: SLSA3 build provenance for release tarballs.
+#
+# On every published release the workflow hashes dist/*.tar.gz and hands
+# the digests to the official slsa-github-generator reusable workflow,
+# which mints a signed provenance attestation (via sigstore OIDC) and
+# uploads it as a release asset. Operators verify with slsa-verifier —
+# see docs/verify.md.
+name: Release provenance
+
+on:
+  release:
+    types: [published]
+  # manual run for re-attesting artifacts already in dist/
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # spec 093/US021: version.json is the update trust root — schema-check
+      # it before anything is built or published.
+      - name: Schema-check version.json
+        run: python3 scripts/validate-version.py version.json
+
+  reproducibility:
+    name: Verify deterministic rebuild
+    needs: [metadata]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      # spec 093/US006, FR-018: rebuild the tree twice and require
+      # identical digests — the release must be reproducible per commit.
+      - name: Build twice and compare
+        run: |
+          set -euo pipefail
+          bash scripts/build-release.sh
+          mv dist out-a
+          bash scripts/build-release.sh
+          for f in out-a/*.tar.gz; do
+            b=$(basename "$f")
+            cmp "$f" "dist/$b" || { echo "reproducibility FAILED: $b"; exit 1; }
+          done
+          echo "reproducible build verified"
+
+  digests:
+    name: Compute artifact digests
+    needs: [reproducibility]
+    runs-on: ubuntu-24.04
+    outputs:
+      digests: ${{ steps.hash.outputs.digests }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: sha256sum every tarball
+        id: hash
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz > checksums.txt
+          echo "digests=$(base64 -w0 checksums.txt)" >> "$GITHUB_OUTPUT"
+          cat checksums.txt
+
+  provenance:
+    name: Generate SLSA3 provenance
+    needs: [digests]
+    permissions:
+      actions: read       # read workflow info for the attestation
+      id-token: write     # OIDC token for sigstore signing
+      contents: write     # upload the .intoto.jsonl as a release asset
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: ${{ needs.digests.outputs.digests }}
+      upload-assets: true

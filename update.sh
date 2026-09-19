@@ -57,12 +57,1097 @@ GITHUB_BRANCH="${ProxmoxVEx_BRANCH:-main}"
 GITHUB_RAW="https://raw.githubusercontent.com/ArMaTeC/proxmox-vex-public/${GITHUB_BRANCH}"
 GITHUB_ARCHIVE="https://proxmoxvex.com/downloads/ProxmoxVEx-latest.tar.gz"
 
+die() { echo -e "${RED}$1${NC}" >&2; exit 1; }
 
+# =============================================================================
+# spec 093/US001: release signature verification.
+#
+# Every published tarball carries a detached armored GPG signature
+# (<file>.asc) made by the release-signing key. The public half ships in
+# this repo as pubkey.asc; verification runs in a scratch keyring so an
+# operator's own keyring is never touched. A BAD signature is fatal —
+# a missing signature/tooling warns and proceeds (same posture as the
+# SHA256SUMS check) so pre-signing-era installs keep working.
+# VEX_SKIP_SIG_VERIFY=1 opts out explicitly.
+# =============================================================================
+# SCRIPT_DIR is resolved again below for the install path; it is computed
+# here too because --verify can exit before that point is reached.
+PUBKEY_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pubkey.asc"
+# spec 093/US010: the trust root may live in several places — the shipped
+# pubkey.asc beside this script, a key bundled inside a previously
+# extracted release (dist/keys/release.pub), or a system-installed copy.
+# resolve_pubkey walks that fallback chain so verification still works
+# when the repo file is absent (e.g. bare update.sh fetched alone).
+INSTALL_DIR="${INSTALL_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+ETC_DIR="${ETC_DIR:-/etc/proxmoxvex}"
+resolve_pubkey() {
+    local cand
+    for cand in "$PUBKEY_FILE" \
+                "${INSTALL_DIR}/dist/keys/release.pub" \
+                "${ETC_DIR}/vex-release.pub" \
+                "/etc/vex-release.pub"; do
+        if [ -f "$cand" ]; then echo "$cand"; return 0; fi
+    done
+    return 1
+}
+
+# verify_signature <archive> <sig>: returns 0 good / 1 bad / 2 unavailable.
+verify_signature() {
+    local archive="$1" sig="$2"
+    if [ "${VEX_SKIP_SIG_VERIFY:-0}" = "1" ]; then
+        return 2
+    fi
+    if ! command -v gpg >/dev/null 2>&1 || [ ! -f "$sig" ]; then
+        return 2
+    fi
+    local KEYFILE
+    KEYFILE=$(resolve_pubkey) || return 2
+    local KR
+    KR=$(mktemp -d)
+    gpg --batch --quiet --homedir "$KR" --import "$KEYFILE" >/dev/null 2>&1
+    local rc=1
+    if gpg --batch --homedir "$KR" --verify "$sig" "$archive" >/dev/null 2>&1; then
+        rc=0
+    fi
+    rm -rf "$KR"
+    return $rc
+}
+
+# =============================================================================
+# spec 093/US004: signing-key rotation.
+#
+# keys/rotation.json on the downloads host carries the NEXT release pubkey
+# embedded inline and is itself signed by the CURRENT trusted key — the old
+# key vouches for its successor, so a compromised host can't substitute a
+# key it doesn't hold. A forged/unsigned rotation doc is fatal; an absent
+# doc means no rotation is in flight and is ignored.
+# =============================================================================
+
+# verify_rotation_doc <doc> <sig>: 0 valid+trusted / 1 bad sig / 2 unavailable.
+verify_rotation_doc() {
+    local doc="$1" sig="$2"
+    if ! command -v gpg >/dev/null 2>&1; then
+        return 2
+    fi
+    local KEYFILE
+    KEYFILE=$(resolve_pubkey) || return 2
+    local KR
+    KR=$(mktemp -d)
+    gpg --batch --quiet --homedir "$KR" --import "$KEYFILE" >/dev/null 2>&1
+    local rc=1
+    if gpg --batch --homedir "$KR" --verify "$sig" "$doc" >/dev/null 2>&1; then
+        rc=0
+    fi
+    rm -rf "$KR"
+    return $rc
+}
+
+# process_key_rotation <base_url> <workdir>: fetch + verify + apply a
+# pending rotation. On success the embedded new pubkey replaces pubkey.asc
+# on disk (trust persists for the next update too).
+process_key_rotation() {
+    local base="$1" work="$2"
+    local doc="$work/rotation.json" sig="$work/rotation.json.asc"
+    curl -sfL "$base/keys/rotation.json" -o "$doc" 2>/dev/null || return 0
+    curl -sfL "$base/keys/rotation.json.asc" -o "$sig" 2>/dev/null \
+        || die "rotation doc published without a signature — refusing to continue"
+    verify_rotation_doc "$doc" "$sig"
+    case $? in
+        0) ;;
+        2) echo -e "${YELLOW}rotation doc present but gpg/pubkey unavailable — ignoring${NC}"; return 0 ;;
+        *) die "rotation doc signature FAILED — a forged key rotation was attempted" ;;
+    esac
+    # Extract the embedded new pubkey to a scratch file first.
+    python3 - "$doc" "$work/new-pubkey.asc" <<'PY' || die "rotation doc malformed (no new_pubkey)"
+import json, sys
+doc, out = sys.argv[1], sys.argv[2]
+d = json.load(open(doc))
+pub = d.get("new_pubkey", "")
+if "BEGIN PGP PUBLIC KEY BLOCK" not in pub:
+    sys.exit(1)
+with open(out, "w") as f:
+    f.write(pub)
+PY
+    # Confirm the embedded key's real fingerprint matches the doc's claim —
+    # a mismatched doc is malformed even when signed, so fail closed.
+    local KR2 ACTUAL_FPR CLAIMED_FPR
+    KR2=$(mktemp -d)
+    gpg --batch --quiet --homedir "$KR2" --import "$work/new-pubkey.asc" >/dev/null 2>&1
+    ACTUAL_FPR=$(gpg --batch --homedir "$KR2" --with-colons -k | awk -F: '/^fpr/{print $10; exit}')
+    rm -rf "$KR2"
+    CLAIMED_FPR=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("new_fingerprint",""))' "$doc")
+    [ -n "$ACTUAL_FPR" ] && [ "$ACTUAL_FPR" = "$CLAIMED_FPR" ] \
+        || die "rotation doc fingerprint mismatch — refusing new key"
+    chmod 600 "$work/new-pubkey.asc"
+    mv "$work/new-pubkey.asc" "$PUBKEY_FILE"
+    echo -e "${GREEN}✓ key rotation applied${NC} — trust moved to key $ACTUAL_FPR"
+}
+
+# =============================================================================
+# spec 093/US005: signed version.json. The detached signature covers the
+# CANONICAL (sorted-key) serialization, so whitespace/formatting differences
+# between publisher and file don't break verification — content does.
+# =============================================================================
+
+# canonical_json <in> <out>: sorted-key, compact serialization.
+canonical_json() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+with open(sys.argv[2], "w") as f:
+    f.write(json.dumps(d, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+}
+
+# verify_version_metadata <json> <sig>: 0 valid / 1 bad / 2 unavailable.
+verify_version_metadata() {
+    local doc="$1" sig="$2"
+    if ! command -v gpg >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        return 2
+    fi
+    local KEYFILE
+    KEYFILE=$(resolve_pubkey) || return 2
+    local KR CANON rc=1
+    KR=$(mktemp -d); CANON="$KR/canonical.json"
+    if canonical_json "$doc" "$CANON" 2>/dev/null; then
+        gpg --batch --quiet --homedir "$KR" --import "$KEYFILE" >/dev/null 2>&1
+        gpg --batch --homedir "$KR" --verify "$sig" "$CANON" >/dev/null 2>&1 && rc=0
+    fi
+    rm -rf "$KR"
+    return $rc
+}
+
+# =============================================================================
+# spec 093/US007: release transparency log. Every published release appends
+# {version, sha256, ts} to transparency.log (signed as transparency.log.asc).
+# Divergence is ADVISORY — a swapped artifact is already caught by the
+# signature/checksum gates; the log exists so silent post-publish
+# replacement is detectable, so we warn but never block the update.
+# =============================================================================
+
+# =============================================================================
+# spec 093/US013: release channels (stable/beta/lts).
+#
+# version.json may carry a per-channel pointer table:
+#   "channels": {"stable": {"version": ..., "archive": ...}, ...}
+# The subscribed channel comes from config/update-channel (persists across
+# updates — config/ is never overwritten) or VEX_CHANNEL; default "stable".
+# When a channels table exists but the channel is absent we fail closed —
+# silently falling back to stable would push non-lts builds at lts users.
+# =============================================================================
+
+# resolve_channel_release <doc> <channel>: prints "<version>\t<archive>".
+resolve_channel_release() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+ch = sys.argv[2] or "stable"
+channels = d.get("channels")
+if channels:
+    ptr = channels.get(ch)
+    if not ptr or not ptr.get("version"):
+        sys.exit(1)
+    print(f"{ptr['version']}\t{ptr.get('archive', '')}")
+    sys.exit(0)
+ver = d.get("version")
+if not ver:
+    sys.exit(1)
+print(f"{ver}\t{d.get('archive', '')}")
+PY
+}
+
+# =============================================================================
+# spec 093/US018: version pinning & update hold.
+#
+# config/update-hold (or VEX_UPDATE_HOLD=1) freezes all updates — clean exit.
+# config/update-pin (or VEX_PIN_VERSION) pins the target to an exact version,
+# overriding the channel pointer. Pins always install the FULL archive (a
+# delta to a non-sequential target may not exist).
+# =============================================================================
+
+# resolve_update_target: hold → clean exit; pin → VERSION/ARCHIVE_NAME set.
+resolve_update_target() {
+    BASE_DIR="${BASE_DIR:-${SCRIPT_DIR:-.}}"
+    local hold pin
+    hold="${VEX_UPDATE_HOLD:-$(cat "$BASE_DIR/config/update-hold" 2>/dev/null || echo 0)}"
+    if [ "$hold" = "1" ] || [ "$hold" = "true" ]; then
+        echo "updates held (update-hold) — exiting without changes"
+        exit 0
+    fi
+    PINNED=0
+    pin="${VEX_PIN_VERSION:-$(cat "$BASE_DIR/config/update-pin" 2>/dev/null || true)}"
+    if [ -n "$pin" ]; then
+        VERSION="$pin"
+        ARCHIVE_NAME="ProxmoxVEx-$pin.tar.gz"
+        DELTA_NAME=""
+        PINNED=1
+    fi
+}
+
+# =============================================================================
+# spec 093/US019: maintenance-window gate.
+#
+# config/update-window or VEX_UPDATE_WINDOW restricts updates to HH:MM-HH:MM.
+# Overnight windows (22:00-02:00) are handled; --force bypasses with a log.
+# =============================================================================
+
+# in_window: 0 inside/no window configured, 1 outside the window.
+in_window() {
+    BASE_DIR="${BASE_DIR:-${SCRIPT_DIR:-.}}"
+    local window now start end
+    window="${UPDATE_WINDOW:-${VEX_UPDATE_WINDOW:-$(cat "$BASE_DIR/config/update-window" 2>/dev/null || true)}}"
+    [ -z "$window" ] && return 0
+    now="${NOW_OVERRIDE:-$(date +%H:%M)}"
+    start="${window%%-*}"; end="${window##*-}"
+    if [ "$start" \< "$end" ] || [ "$start" = "$end" ]; then
+        [ "$now" \> "$start" ] && [ "$now" \< "$end" ]
+    else
+        # overnight window: inside if past start OR before end
+        [ "$now" \> "$start" ] || [ "$now" \< "$end" ]
+    fi
+}
+
+# =============================================================================
+# spec 093/US024: minimum-source-version gate.
+#
+# Releases declare min_from — the oldest version they can safely upgrade.
+# Clients below it get a named stepping stone (releases.<t>.via) instead of
+# a broken jump. Comparison is real semver, not lexicographic (1.10 > 1.9).
+# =============================================================================
+
+# version_ge <a> <b>: 0 when a >= b (semver).
+version_ge() {
+    python3 -c "
+import sys
+pa = [int(x) for x in '$1'.split('.')]
+pb = [int(x) for x in '$2'.split('.')]
+n = max(len(pa), len(pb)); pa += [0]*(n-len(pa)); pb += [0]*(n-len(pb))
+sys.exit(0 if pa >= pb else 1)
+" 2>/dev/null
+}
+
+# check_min_from <current> <target> <version.json>: refuse when current is
+# below the target's declared minimum; name the stepping stone if provided.
+check_min_from() {
+    local cur="$1" target="$2" doc="$3"
+    [ -f "$doc" ] || return 0
+    local min via
+    min=$(python3 -c "
+import json
+r = json.load(open('$doc')).get('releases', {})
+print(r.get('$target', {}).get('min_from', '0.0.0'))
+" 2>/dev/null || echo 0.0.0)
+    [ -n "$min" ] || min="0.0.0"
+    version_ge "$cur" "$min" && return 0
+    via=$(python3 -c "
+import json
+r = json.load(open('$doc')).get('releases', {})
+print(r.get('$target', {}).get('via', ''))
+" 2>/dev/null || true)
+    die "cannot jump $cur -> $target; update to ${via:-$min} first"
+}
+
+# =============================================================================
+# spec 093/US025: security advisory surfacing.
+#
+# Releases that fix vulnerabilities carry releases.<v>.security{severity,
+# advisory}; the updater must flag those distinctly so admins notice urgent
+# patches instead of treating them as routine version bumps.
+# =============================================================================
+
+# check_security_advisory <target> <version.json>: prints a SECURITY UPDATE
+# banner (severity + advisory URL) when the target release fixes vulns.
+check_security_advisory() {
+    local target="$1" doc="$2"
+    [ -f "$doc" ] || return 0
+    local sec
+    sec=$(python3 -c "
+import json
+s = json.load(open('$doc')).get('releases', {}).get('$target', {}).get('security') or {}
+if s:
+    print(s.get('severity', '') + '\t' + s.get('advisory', ''))
+" 2>/dev/null || true)
+    [ -n "$sec" ] || return 0
+    local sev="${sec%%	*}" adv="${sec##*	}"
+    echo "*** SECURITY UPDATE ($sev) — $adv ***" >&2
+}
+
+# =============================================================================
+# spec 093/US041: transport security.
+#
+# Update endpoints must be https:// — a plaintext http:// base would let any
+# on-path attacker serve a forged release before signature checks even run.
+# file:// is allowed for airgap/bundle mode (already verified locally).
+# VEX_CACERT supplies a private CA bundle via CURL_CA_BUNDLE (libcurl env).
+# =============================================================================
+
+# assert_update_scheme <url>: die unless https:// or file://.
+assert_update_scheme() {
+    case "$1" in
+        https://*|file://*) return 0 ;;
+        *) die "update endpoint must be https:// (got $1)" ;;
+    esac
+}
+
+# =============================================================================
+# spec 093/US042: --insecure double-gate.
+#
+# Disabling signature+TLS verification is catastrophic if it happens by
+# accident (a copied command, a stale comment). The flag alone is never
+# enough: VEX_I_ACCEPT_RISK=1 must be set deliberately in the environment,
+# the run is announced loudly, and the incident log records it.
+# =============================================================================
+
+# enforce_insecure_gate: called early when --insecure was passed.
+enforce_insecure_gate() {
+    [ "${INSECURE:-}" = "1" ] || return 0
+    [ "${VEX_I_ACCEPT_RISK:-}" = "1" ] || die \
+        "--insecure requires VEX_I_ACCEPT_RISK=1 in the environment (disables signature+TLS verification)"
+    echo "!!! WARNING: update verification DISABLED by --insecure + VEX_I_ACCEPT_RISK=1 !!!" >&2
+    log_update "INSECURE update initiated — signature+TLS verification disabled"
+    export VEX_SKIP_SIG_VERIFY=1
+}
+
+# =============================================================================
+# spec 093/US040: parallel .tar.zst artifacts.
+#
+# Releases ship both gzip and zstd tarballs; zstd decompresses ~4x faster at
+# smaller size. Hosts with zstd prefer .tar.zst, everyone else gets .tar.gz.
+# =============================================================================
+
+# pick_archive_ext: echoes ".tar.zst" or ".tar.gz" by tool availability.
+pick_archive_ext() {
+    if command -v zstd >/dev/null 2>&1; then
+        echo ".tar.zst"
+    else
+        echo ".tar.gz"
+    fi
+}
+
+# untar_release <archive> <dest>: extract .tar.gz or .tar.zst transparently.
+untar_release() {
+    local archive="$1" dest="$2"
+    case "$archive" in
+        *.tar.zst|*.tzst) zstd -dc "$archive" 2>/dev/null | tar -x -C "$dest" ;;
+        *)                tar -xzf "$archive" -C "$dest" ;;
+    esac
+}
+
+# =============================================================================
+# spec 093/US037: latency-based mirror selection.
+#
+# Among reachable mirrors, pick the fastest measured — listed order is a
+# preference hint, not a performance guarantee. VEX_MIRROR still wins.
+# =============================================================================
+
+# pick_mirror_latency <version.json> <default_base>: echoes lowest-latency
+# reachable base; nonzero if none respond.
+pick_mirror_latency() {
+    local doc="$1" default="$2"
+    # explicit operator choice always wins, no probing needed
+    if [ -n "${VEX_MIRROR:-}" ]; then
+        echo "$VEX_MIRROR"
+        return 0
+    fi
+    local mirrors base ms best="" bestms=999999
+    mirrors=$(python3 -c "
+import json
+try:
+    for m in json.load(open('$doc')).get('mirrors', []): print(m)
+except Exception: pass
+" 2>/dev/null)
+    for base in $mirrors "$default"; do
+        [ -n "$base" ] || continue
+        case "$base" in https://*|file://*) ;; *) continue ;; esac  # US041
+        # NOTE: -w prints even on failure — only trust the timing on rc 0
+        ms=$(curl -o /dev/null -fsS --max-time 5 -w '%{time_total}' \
+                "$base/version.json" 2>/dev/null) || continue
+        [ -n "$ms" ] || continue
+        ms=$(awk "BEGIN{print int($ms*1000)}")
+        if [ "$ms" -lt "$bestms" ]; then
+            bestms=$ms; best=$base
+        fi
+    done
+    [ -n "$best" ] || return 1
+    echo "$best"
+    echo "mirror latency pick: $best (${bestms}ms)" >&2
+    return 0
+}
+
+# =============================================================================
+# spec 093/US032: resumable downloads.
+#
+# A 200MB+ tarball on a flaky link must not restart at byte 0 after a drop.
+# curl -C - resumes from the partial file's size; the .done marker prevents
+# re-validating an already-complete fetch on retry runs.
+# =============================================================================
+
+# fetch_resume <url> <out>: resume partial downloads; retries transient
+# failures; touches <out>.done only after a complete transfer.
+fetch_resume() {
+    local url="$1" out="$2"
+    if [ -f "$out.done" ] && [ -f "$out" ]; then
+        return 0
+    fi
+    # US034: optional bandwidth cap for shared links (e.g. VEX_DOWNLOAD_LIMIT=1m).
+    local rate=()
+    [ -n "${VEX_DOWNLOAD_LIMIT:-}" ] && rate=(--limit-rate "$VEX_DOWNLOAD_LIMIT")
+    if curl -fSL -C - --retry 3 --retry-delay 2 --retry-all-errors \
+            "${rate[@]}" -o "$out" "$url" 2>/dev/null; then
+        touch "$out.done"
+        return 0
+    fi
+    return 1
+}
+
+# =============================================================================
+# spec 093/US029: python compatibility gate.
+#
+# Releases declare min_python (and optionally max_python); the updater checks
+# the interpreter that would run the app BEFORE downloading — a refused
+# upgrade is cheap here and expensive after a half-applied install.
+# =============================================================================
+
+# check_python_compat <version.json> [pyver]: die unless local python satisfies
+# min_python/max_python. pyver defaults to the python3 on PATH.
+check_python_compat() {
+    local doc="$1" pyv="${2:-}"
+    [ -f "$doc" ] || return 0
+    if [ -z "$pyv" ]; then
+        pyv=$(python3 -c "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo 0.0)
+    fi
+    python3 - "$doc" "$pyv" <<'PY'
+import json, sys
+def t(v):
+    try: return tuple(int(x) for x in str(v).split(".")[:3])
+    except Exception: return (0,)
+doc, pyv = sys.argv[1], t(sys.argv[2])
+d = json.load(open(doc))
+lo, hi = d.get("min_python"), d.get("max_python")
+if lo and pyv < t(lo):
+    print(f"FAIL: requires python >= {lo}, have {sys.argv[2]}"); sys.exit(1)
+if hi and pyv > t(hi):
+    print(f"FAIL: requires python <= {hi}, have {sys.argv[2]}"); sys.exit(1)
+sys.exit(0)
+PY
+    [ $? -eq 0 ] || die "python version incompatible with this release (see above)"
+}
+
+# =============================================================================
+# spec 093/US028: declared artifact sizes.
+#
+# releases.<v>.size_bytes (and channels.<c>.size_bytes) let preflight size the
+# download without a network HEAD probe — important for airgapped/bundle mode
+# and for refusing early when disk space is short.
+# =============================================================================
+
+# declared_size <version.json> <version>: echoes byte size or empty.
+declared_size() {
+    local doc="$1" ver="$2"
+    [ -f "$doc" ] || return 0
+    python3 -c "
+import json
+d = json.load(open('$doc'))
+rel = d.get('releases', {}).get('$ver', {})
+ch = next((c for c in d.get('channels', {}).values() if c.get('version') == '$ver'), {})
+sz = rel.get('size_bytes') or ch.get('size_bytes') or ''
+print(sz)
+" 2>/dev/null || true
+}
+
+# =============================================================================
+# spec 093/US027: mirror failover.
+#
+# version.json may list mirror base URLs; VEX_MIRROR env takes top priority.
+# Each candidate is HEAD-probed for the archive before use — a dead primary
+# must not kill the update when a mirror has the bits.
+# =============================================================================
+
+# select_mirror <version.json> <archive_name> <default_base>: echoes the
+# first reachable base URL (preferred env → listed mirrors → default).
+select_mirror() {
+    local doc="$1" archive="$2" default_base="$3"
+    local mirrors base
+    mirrors=$(python3 -c "
+import json
+try:
+    for m in json.load(open('$doc')).get('mirrors', []): print(m)
+except Exception: pass
+" 2>/dev/null)
+    for base in ${VEX_MIRROR:-} $mirrors "$default_base"; do
+        [ -n "$base" ] || continue
+        case "$base" in https://*|file://*) ;; *) continue ;; esac  # US041
+        if curl -fsSI --max-time 10 "$base/$archive" -o /dev/null 2>/dev/null; then
+            echo "$base"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# =============================================================================
+# spec 093/US026: structured changelog surfacing.
+#
+# changelog entries are objects {type, component, breaking, text}; the updater
+# scans them so breaking changes are shown BEFORE the admin commits to the
+# install, not discovered after.
+# =============================================================================
+
+# warn_breaking_changes <version.json>: list entries flagged breaking:true.
+warn_breaking_changes() {
+    local doc="$1"
+    [ -f "$doc" ] || return 0
+    python3 - "$doc" <<'PY' >&2
+import json, sys
+try:
+    entries = json.load(open(sys.argv[1])).get("changelog", [])
+except Exception:
+    sys.exit(0)
+breaking = [e for e in entries if isinstance(e, dict) and e.get("breaking")]
+if breaking:
+    print("*** BREAKING CHANGES in this release ***")
+    for e in breaking:
+        comp = e.get("component", "core")
+        print(f"  - [{comp}] {e.get('text', '')}")
+PY
+    return 0
+}
+
+# =============================================================================
+# spec 093/US023: EOL advisory.
+#
+# version.json's releases map carries support_until per release; when the
+# INSTALLED version has passed that date, warn — running EOL software is a
+# security posture problem, but the update should still proceed (advisory).
+# =============================================================================
+
+# check_eol <version> <version.json>: warn when version's support window ended.
+check_eol() {
+    local ver="$1" doc="$2"
+    [ -f "$doc" ] || return 0
+    local eol
+    eol=$(python3 -c "
+import json, sys
+r = json.load(open('$doc')).get('releases', {})
+print(r.get('$ver', {}).get('support_until', ''))
+" 2>/dev/null || true)
+    [ -n "$eol" ] || return 0
+    local today="${TODAY_OVERRIDE:-$(date +%F)}"
+    if [ "$today" \> "$eol" ]; then
+        echo "WARNING: installed version $ver left support on $eol — upgrade recommended" >&2
+    fi
+}
+
+# =============================================================================
+# spec 093/US022: per-file drift detection.
+#
+# Each release embeds MANIFEST.sha256 (every shipped file, minus config/data
+# operator paths). --verify-files checks the installed tree against it and
+# names any file that drifted — post-install tamper detection for auditors.
+# =============================================================================
+
+# verify_installed_files <dir>: sha256sum -c the release manifest; nonzero
+# and prints the drifted paths when any file fails.
+verify_installed_files() {
+    local dir="${1:-${SCRIPT_DIR:-.}}"
+    local manifest="$dir/MANIFEST.sha256"
+    [ -f "$manifest" ] || die "no MANIFEST.sha256 in $dir — release predates manifests"
+    local bad
+    bad=$(cd "$dir" && sha256sum -c MANIFEST.sha256 2>/dev/null | grep -v ': OK$' || true)
+    if [ -n "$bad" ]; then
+        echo "DRIFTED FILES:"
+        echo "$bad"
+        return 1
+    fi
+    echo "all files verified against MANIFEST.sha256"
+    return 0
+}
+
+# =============================================================================
+# spec 093/US020: airgap bundle.
+#
+# A .vexbundle carries the tarball, its signature, checksums, version.json and
+# the standalone verifier — everything needed to update with zero network.
+# apply_bundle verifies the tarball with the bundled verify-release.sh, then
+# points the normal download pipeline at file:// URLs so signature, checksum
+# and metadata verification all run unchanged, fully offline.
+# =============================================================================
+
+# apply_bundle <bundle.vexbundle> <workdir>: extract → verify → set
+# BUNDLE_DIR, ARCHIVE, LATEST_VERSION; repoint GITHUB_RAW/GITHUB_ARCHIVE.
+apply_bundle() {
+    local bundle="$1" work="${2:-$(mktemp -d)}"
+    BUNDLE_DIR="$work/bundle"
+    mkdir -p "$BUNDLE_DIR"
+    tar -xzf "$bundle" -C "$BUNDLE_DIR" 2>/dev/null || die "cannot extract bundle: $bundle"
+
+    local tarball
+    tarball=$(ls "$BUNDLE_DIR"/*.tar.gz 2>/dev/null | grep -v vexbundle | head -1)
+    [ -n "$tarball" ] || die "bundle contains no release tarball"
+
+    # Verify with the bundled verifier; --checksum-only when the bundle
+    # carries no detached signature (unsigned/airgapped builds).
+    if [ -x "$BUNDLE_DIR/verify-release.sh" ]; then
+        local vargs=""
+        [ -f "$tarball.asc" ] || vargs="--checksum-only"
+        (cd "$BUNDLE_DIR" && ./verify-release.sh "$(basename "$tarball")" $vargs) \
+            || die "bundle verification failed"
+    else
+        (cd "$BUNDLE_DIR" && sha256sum -c checksums.txt) >/dev/null 2>&1 \
+            || die "bundle checksum verification failed"
+    fi
+
+    # Hand the verified artifacts to the normal pipeline via file:// — the
+    # signature/checksum/metadata checks then run unchanged, offline.
+    GITHUB_RAW="file://$BUNDLE_DIR"
+    GITHUB_ARCHIVE="file://$tarball"
+    ARCHIVE="$tarball"
+    LATEST_VERSION=$(python3 -c "import json;print(json.load(open('$BUNDLE_DIR/version.json'))['version'])" 2>/dev/null || true)
+    [ -n "$LATEST_VERSION" ] || die "bundle version.json unreadable"
+    DECLARED_SIZE=$(declared_size "$BUNDLE_DIR/version.json" "$LATEST_VERSION")
+}
+
+# check_transparency <log> <sha256>: 0 listed / 1 not listed / 2 unusable.
+check_transparency() {
+    local log="$1" hash="$2"
+    [ -f "$log" ] && [ -n "$hash" ] || return 2
+    grep -q "\"$hash\"" "$log" && return 0
+    return 1
+}
+
+# =============================================================================
+# spec 093/US011: atomic update application.
+#
+# --atomic switches to a releases/<version> layout: the archive extracts to
+# a STAGING dir (never over the live tree), shared mutable state is
+# symlinked in from shared/, and activation is a single atomic symlink
+# rename (current.tmp → current). An interrupted run leaves either the old
+# release live or an orphaned stage — never a half-copied tree.
+# =============================================================================
+
+# check_disk_space [needed_kb]: is there room to stage a second tree?
+check_disk_space() {
+    local need_kb="${1:-204800}" avail
+    avail=$(df -Pk "$BASE_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "$avail" ] && [ "$avail" -ge "$need_kb" ]
+}
+
+# atomic_stage <archive> <version>: extract into releases/<ver> via a
+# temp sibling — the release dir appears fully-formed or not at all.
+atomic_stage() {
+    local archive="$1" version="$2"
+    local dest="$BASE_DIR/releases/$version"
+    local tmp="$BASE_DIR/releases/.stage-$version"
+    mkdir -p "$BASE_DIR/releases"
+    rm -rf "$tmp" "$dest"
+    mkdir -p "$tmp"
+    if ! untar_release "$archive" "$tmp" 2>/dev/null; then
+        rm -rf "$tmp"; return 1
+    fi
+    # GitHub-style archives wrap everything in one top dir — flatten it so
+    # the release root holds the tree directly.
+    local n
+    n=$(find "$tmp" -mindepth 1 -maxdepth 1 | wc -l)
+    if [ "$n" -eq 1 ] && [ -d "$tmp"/* ]; then
+        local inner="$tmp/.inner"
+        mv "$tmp"/* "$inner"
+        mv "$inner"/* "$tmp/" && rmdir "$inner"
+    fi
+    mv "$tmp" "$dest"
+}
+
+# wire_shared_state <release_dir>: mutable state lives in shared/, the
+# release sees it through symlinks — a swap never moves operator data.
+wire_shared_state() {
+    local rel="$1" d
+    # List inlined (not $SHARED_DIRS) so the function is self-contained —
+    # runbooks/tests extract it standalone from this script.
+    for d in config data logs plugins; do
+        mkdir -p "$BASE_DIR/shared/$d"
+        # first atomic install: seed shared/ from the release's shipped
+        # defaults instead of clobbering them with an empty dir.
+        if [ -d "$rel/$d" ] && [ -z "$(ls -A "$BASE_DIR/shared/$d" 2>/dev/null)" ]; then
+            cp -a "$rel/$d/." "$BASE_DIR/shared/$d/" 2>/dev/null || true
+        fi
+        rm -rf "$rel/$d"
+        ln -sfn "$BASE_DIR/shared/$d" "$rel/$d"
+    done
+}
+
+# atomic_swap <version>: the only live mutation — build the new symlink
+# under a temp name, then rename over `current` in one atomic step.
+atomic_swap() {
+    local version="$1"
+    local target="$BASE_DIR/releases/$version"
+    [ -d "$target" ] || return 1
+    # spec 093/US012: remember who was live so --rollback can repoint
+    # `current` without guessing from directory contents.
+    if [ -f "$BASE_DIR/.active-version" ]; then
+        cp "$BASE_DIR/.active-version" "$BASE_DIR/.previous-version"
+    fi
+    ln -sfn "$target" "$BASE_DIR/current.tmp"
+    mv -T "$BASE_DIR/current.tmp" "$BASE_DIR/current"
+    echo "$version" > "$BASE_DIR/.active-version"
+}
+
+# atomic_update <archive> <version>: stage → wire → swap, fail-closed at
+# each step so a failure mid-way leaves the old release serving.
+atomic_update() {
+    local archive="$1" version="$2"
+    # BASE_DIR defaults to the install root (SCRIPT_DIR), overridable for tests.
+    BASE_DIR="${BASE_DIR:-$SCRIPT_DIR}"
+    check_disk_space || die "insufficient disk space to stage $version (need ~200MB free)"
+    echo -n "Staging release $version... "
+    atomic_stage "$archive" "$version" || die "failed to stage $version"
+    echo -e "${GREEN}OK${NC}"
+    wire_shared_state "$BASE_DIR/releases/$version"
+    atomic_swap "$version" || die "activation failed"
+    echo -e "${GREEN}✓ activated $version${NC} (atomic swap — previous release retained in releases/)"
+}
+
+# =============================================================================
+# spec 093/US017: concurrent-update prevention.
+#
+# flock (not a pidfile): the lock lives in the kernel's open-file table, so
+# a killed -9 updater releases automatically and the next run can reclaim.
+# The .holder sidecar records pid+start time for humans diagnosing a stall.
+# Defined BEFORE the --rollback dispatch so rollback paths can take it too.
+# =============================================================================
+
+# acquire_update_lock: exclusive flock on .update.lock; aborts with the
+# holder's pid/started info when another update is in progress.
+acquire_update_lock() {
+    BASE_DIR="${BASE_DIR:-${SCRIPT_DIR:-.}}"
+    exec 9>"$BASE_DIR/.update.lock"
+    if ! flock -n 9; then
+        local holder
+        holder=$(cat "$BASE_DIR/.update.lock.holder" 2>/dev/null || echo unknown)
+        die "another update in progress ($holder)"
+    fi
+    echo "pid=$$ started=$(date -Is)" > "$BASE_DIR/.update.lock.holder"
+    trap 'rm -f "$BASE_DIR/.update.lock.holder" 2>/dev/null' EXIT
+}
+
+# =============================================================================
+# spec 093/US012: one-command rollback.
+#
+# `update.sh --rollback` repoints `current` at .previous-version's release
+# dir. Every rollback appends an audit line to shared/logs/rollback.log.
+# DB state: if the previous release ships a downgrade hook we run it,
+# otherwise we restore the newest pre-update pg dump under backups/ when
+# pg_restore is available; when neither exists the operator is told to
+# restore the database manually — the file swap still completes.
+# =============================================================================
+
+# log_rollback <message>: audit trail, best-effort (never blocks rollback).
+log_rollback() {
+    local msg="$1" dir="$BASE_DIR/shared/logs"
+    mkdir -p "$dir" 2>/dev/null || dir="$BASE_DIR/logs"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    printf '%s rollback %s\n' "$(date -u +%FT%TZ)" "$msg" >> "$dir/rollback.log" 2>/dev/null || true
+}
+
+rollback_release() {
+    BASE_DIR="${BASE_DIR:-$SCRIPT_DIR}"
+    acquire_update_lock   # US017: rollback mutates state — serialize it too
+    local prev
+    prev=$(cat "$BASE_DIR/.previous-version" 2>/dev/null || true)
+    [ -n "$prev" ] || die "no previous version recorded — nothing to roll back to"
+    local target="$BASE_DIR/releases/$prev"
+    [ -d "$target" ] || die "release directory missing: $target"
+
+    # DB revert, best-effort per FR-034: prefer the release's own downgrade
+    # hook, else the newest pre-update dump under backups/.
+    if [ -x "$target/install.sh" ]; then
+        "$target/install.sh" --downgrade-db \
+            || echo -e "${YELLOW}db downgrade hook failed — verify database state manually${NC}"
+    else
+        local dump
+        dump=$(ls -1t "$BASE_DIR"/backups/*.dump "$BASE_DIR"/backups/**/*.dump 2>/dev/null | head -1)
+        if [ -n "$dump" ] && command -v pg_restore >/dev/null 2>&1; then
+            echo -e "${YELLOW}restoring pre-update database dump: $dump${NC}"
+            pg_restore --clean --if-exists -d "${VEX_DB_URL:-proxmoxvex}" "$dump" \
+                || echo -e "${YELLOW}pg_restore failed — verify database state manually${NC}"
+        else
+            echo -e "${YELLOW}no db downgrade hook or restorable dump — revert DB manually if the update ran migrations${NC}"
+        fi
+    fi
+
+    local from_ver
+    from_ver=$(cat "$BASE_DIR/.active-version" 2>/dev/null || echo unknown)
+    atomic_swap "$prev" || die "rollback swap failed for $prev"
+    log_rollback "to=$prev from=$from_ver"
+    echo -e "${GREEN}✓ rolled back to $prev${NC} — restart services to serve it"
+}
+
+# --rollback mode: reactivate the previous release and exit.
+if [ "${1:-}" = "--rollback" ]; then
+    rollback_release
+    exit $?
+fi
+
+# =============================================================================
+# spec 093/US016: post-update verification + auto-rollback.
+#
+# After the service restarts, poll health for a bounded window (default
+# 300s — DB migrations may take minutes). A failed window rolls back
+# automatically, guarded by a marker file so one incident can trigger at
+# most ONE auto-rollback (no ping-pong if the rollback also comes up bad).
+# =============================================================================
+
+# wait_for_health <url> [timeout_s]: poll until healthy or deadline.
+wait_for_health() {
+    local url="$1" timeout="${2:-${HEALTH_TIMEOUT:-300}}" deadline
+    deadline=$(( $(date +%s) + timeout ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if curl -fsS --max-time 5 "$url" 2>/dev/null | grep -q 'ok'; then
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+
+# log_update <msg>: incident trail next to rollback.log, best-effort.
+log_update() {
+    local msg="$1" dir="$BASE_DIR/shared/logs"
+    mkdir -p "$dir" 2>/dev/null || dir="$BASE_DIR/logs"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    printf '%s update %s\n' "$(date -u +%FT%TZ)" "$msg" >> "$dir/update.log" 2>/dev/null || true
+}
+
+# auto_rollback <failed_version> <reason>: guarded auto-rollback — the
+# marker refuses a second attempt in the same incident and the refusal is
+# itself logged for the audit trail.
+auto_rollback() {
+    BASE_DIR="${BASE_DIR:-$SCRIPT_DIR}"
+    local failed="$1" reason="$2"
+    local marker="$BASE_DIR/shared/.auto-rollback-done"
+    if [ -f "$marker" ]; then
+        log_update "auto-rollback REFUSED (already attempted): failed=$failed reason=$reason"
+        echo -e "${RED}auto-rollback already attempted — manual intervention required${NC}"
+        return 1
+    fi
+    mkdir -p "$BASE_DIR/shared" 2>/dev/null || true
+    echo "$failed" > "$marker" 2>/dev/null || true
+    log_update "auto-rollback: failed=$failed reason=$reason"
+    rollback_release
+}
+
+# =============================================================================
+# spec 093/US014: delta packages. version.json may map an installed version
+# to a smaller delta archive ("deltas": {"<from>": {"archive": ...}}). The
+# delta artifact goes through the SAME signature+checksum gates as a full
+# release; after applying, the whole tree is re-verified against the
+# manifest's target file map. Any failure falls back to the full archive.
+# =============================================================================
+
+# resolve_delta <doc> <from_version>: prints the delta archive basename.
+resolve_delta() {
+    python3 - "$1" "$2" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+ptr = (d.get("deltas") or {}).get(sys.argv[2])
+if not ptr or not ptr.get("archive"):
+    sys.exit(1)
+print(ptr["archive"])
+PY
+}
+
+# apply_delta <delta_dir> <install_dir>: copy changed files, delete
+# removed. Operator-data paths get the same exclusions as the file copy
+# path — a delta must never touch config/, ssl/, logs/ or secrets.
+apply_delta() {
+    local ddir="$1" dest="$2"
+    python3 - "$ddir" "$dest" <<'PY'
+import fnmatch, json, os, shutil, sys
+ddir, dest = sys.argv[1], sys.argv[2]
+meta = json.load(open(os.path.join(ddir, "delta-manifest.json")))
+SKIP = ("config/*", "ssl/*", "logs/*", "backups/*", ".git/*",
+        "*.db", "*.pem", "*.key", "*.crt", "*.enc")
+def skip(rel):
+    return any(fnmatch.fnmatchcase(rel, pat) for pat in SKIP)
+for rel in meta.get("changed", []):
+    if skip(rel):
+        continue
+    src = os.path.join(ddir, rel)
+    dst = os.path.join(dest, rel)
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    shutil.copyfile(src, dst)
+for rel in meta.get("removed", []):
+    if skip(rel):
+        continue
+    p = os.path.join(dest, rel)
+    if os.path.isfile(p) or os.path.islink(p):
+        os.remove(p)
+PY
+}
+
+# verify_delta_tree <install_dir> <manifest>: every manifest file must
+# hash-match — skipped operator paths are exempt by the same filter.
+verify_delta_tree() {
+    python3 - "$1" "$2" <<'PY'
+import fnmatch, hashlib, json, os, sys
+root, mpath = sys.argv[1], sys.argv[2]
+meta = json.load(open(mpath))
+SKIP = ("config/*", "ssl/*", "logs/*", "backups/*", ".git/*",
+        "*.db", "*.pem", "*.key", "*.crt", "*.enc")
+def skip(rel):
+    return any(fnmatch.fnmatchcase(rel, pat) for pat in SKIP)
+for rel, want in meta.get("files", {}).items():
+    if skip(rel):
+        continue
+    p = os.path.join(root, rel)
+    if not os.path.isfile(p):
+        sys.exit(1)
+    with open(p, "rb") as f:
+        if hashlib.sha256(f.read()).hexdigest() != want:
+            sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# =============================================================================
+# spec 093/US015: pre-update preflight — runs BEFORE any artifact download.
+# Disk space (2.5x the archive: download+extract+backup), current app
+# health, and required tools. --force overrides health/disk failures but
+# logs a warning; tool absence always aborts (nothing can proceed).
+# =============================================================================
+
+preflight_tools() {
+    local missing="" t
+    for t in curl tar sha256sum python3; do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    [ -z "$missing" ] || die "missing required tools:$missing"
+}
+
+# preflight_diskspace <needed_bytes>: free space under the install dir.
+preflight_diskspace() {
+    local need_b="$1" avail_kb
+    avail_kb=$(df -Pk "${BASE_DIR:-${SCRIPT_DIR:-.}}" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "$avail_kb" ] || return 0   # can't measure → don't block
+    [ $((avail_kb * 1024)) -ge "$need_b" ]
+}
+
+preflight_health() {
+    local url="${HEALTH_URL:-http://localhost:8080/api/healthz}"
+    if curl -fsS --max-time 5 "$url" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "${FORCE:-0}" = "1" ]; then
+        echo -e "${YELLOW}preflight warn: app health check failed — continuing because --force was given${NC}"
+        return 0
+    fi
+    return 1
+}
+
+preflight_update() {
+    preflight_tools
+    # Size the download: prefer the metadata-declared size_bytes (US028 —
+    # captured into DECLARED_SIZE before the metadata doc is discarded);
+    # fall back to a HEAD probe.
+    local size need
+    size="${DECLARED_SIZE:-}"
+    if [ -z "$size" ]; then
+        size=$(curl -fsSI "$GITHUB_ARCHIVE" 2>/dev/null | awk 'tolower($1)=="content-length:"{print $2}' | tr -d '\r' | tail -1)
+    fi
+    need=$(( ${size:-0} * 5 / 2 ))
+    [ "$need" -le 0 ] && need=524288000
+    if ! preflight_diskspace "$need"; then
+        if [ "${FORCE:-0}" = "1" ]; then
+            echo -e "${YELLOW}preflight warn: low disk space — continuing because --force was given${NC}"
+        else
+            die "insufficient disk space: need ~$((need / 1024 / 1024))MB free (download+extract+backup); re-run with --force to override"
+        fi
+    fi
+    preflight_health || die "app health check failed — fix the service or re-run with --force"
+}
+
+# --verify mode: `update.sh --verify [--file archive.tgz]` validates a
+# release artifact against its published signature and exits — the
+# operator's independent check without running the updater.
+if [ "${1:-}" = "--verify" ]; then
+    VERIFY_FILE=""
+    while [ $# -gt 1 ]; do
+        case "$2" in
+            --file) VERIFY_FILE="$3"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [ -z "$VERIFY_FILE" ]; then
+        # relative to this script's directory — the dist host layout
+        VERIFY_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dist/ProxmoxVEx-latest.tar.gz"
+    fi
+    [ -f "$VERIFY_FILE" ] || die "verify: no such archive: $VERIFY_FILE"
+    [ -f "$VERIFY_FILE.asc" ] || die "verify: no signature: $VERIFY_FILE.asc"
+    verify_signature "$VERIFY_FILE" "$VERIFY_FILE.asc"
+    case $? in
+        0) echo -e "${GREEN}signature OK${NC}: $VERIFY_FILE"; exit 0 ;;
+        2) die "verify: gpg or pubkey.asc unavailable (VEX_SKIP_SIG_VERIFY set?)" ;;
+        *) die "signature verification FAILED: $VERIFY_FILE" ;;
+    esac
+fi
+
+# spec 093/US022: --verify-files checks the installed tree against the
+# release's per-file manifest — catches post-install drift/tampering.
+if [ "${1:-}" = "--verify-files" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    verify_installed_files "$SCRIPT_DIR"
+    exit $?
+fi
+
+# spec 093/US011: --atomic opts into the releases/<ver> + current-symlink
+# layout instead of copying files over the live tree.
+ATOMIC=0
+FORCE=0
+BUNDLE_MODE=0
+BUNDLE_FILE=""
+for _arg in "$@"; do
+    [ "$_arg" = "--atomic" ] && ATOMIC=1
+    [ "$_arg" = "--force" ]  && FORCE=1
+    [ "$_arg" = "--insecure" ] && INSECURE=1
+    [ "$_arg" = "--bundle" ] && BUNDLE_MODE=1
+    [ "$_prev" = "--bundle" ] && BUNDLE_FILE="$_arg"
+    _prev="$_arg"
+done
 
 # Locate the installation directory and move into it. update.sh is expected to
 # live at the root of the installation tree.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+BASE_DIR="$SCRIPT_DIR"
+
+# US041: refuse plaintext endpoints and honor a private CA bundle BEFORE any
+# network request is made.
+assert_update_scheme "$GITHUB_RAW"
+assert_update_scheme "$GITHUB_ARCHIVE"
+[ -n "${VEX_CACERT:-}" ] && export CURL_CA_BUNDLE="$VEX_CACERT"
+
+# US042: --insecure needs an explicit env confirmation; armed here so the
+# incident is logged before any verification is skipped.
+enforce_insecure_gate
+
+# US017: take the exclusive lock before doing anything mutating — a second
+# updater bails out here with the holder's pid instead of racing us.
+acquire_update_lock
+
+# US019: outside the maintenance window, defer cleanly (force bypasses).
+if ! in_window; then
+    if [ "$FORCE" = "1" ]; then
+        echo "⚠ --force: bypassing maintenance window ($(date +%H:%M))"
+    else
+        echo "outside update window — update deferred (use --force to override)"
+        exit 0
+    fi
+fi
+
+# US020: airgap bundle — extract+verify the bundle, then let the normal
+# pipeline run against its contents via file:// (fully offline).
+if [ "$BUNDLE_MODE" = "1" ]; then
+    [ -f "$BUNDLE_FILE" ] || die "--bundle requires a .vexbundle file path"
+    apply_bundle "$BUNDLE_FILE" "$(mktemp -d)"
+fi
 
 # Determine the owner of the existing install so we can restore it after the
 # update. This matters because the update may be run with sudo and would
@@ -102,7 +1187,84 @@ echo -e "Current version: ${BLUE}$CURRENT_VERSION${NC}"
 
 # Fetch the latest version from the branch's version.json on GitHub.
 echo -n "Checking for updates... "
-LATEST_VERSION=$(curl -s "$GITHUB_RAW/version.json" 2>/dev/null | grep -o '"version": *"[^"]*"' | cut -d'"' -f4)
+VERSION_DOC=$(mktemp)
+VERSION_SIG=$(mktemp)
+curl -sfL "$GITHUB_RAW/version.json" -o "$VERSION_DOC" 2>/dev/null || true
+# spec 093/US005: verify the detached signature over the canonical doc
+# BEFORE parsing — untrusted metadata must not drive the update decision.
+if curl -sfL "$GITHUB_RAW/version.json.asc" -o "$VERSION_SIG" 2>/dev/null; then
+    verify_version_metadata "$VERSION_DOC" "$VERSION_SIG"
+    case $? in
+        0) ;;
+        2) echo -e "${YELLOW}(metadata signature unverifiable — gpg/pubkey missing)${NC} " ;;
+        *) rm -f "$VERSION_DOC" "$VERSION_SIG"
+           die "untrusted version metadata — version.json signature FAILED" ;;
+    esac
+else
+    echo -e "${YELLOW}(no version.json.asc published — unverified)${NC} "
+fi
+# spec 093/US013: pick the subscribed channel's pointer. config/update-
+# channel lives in config/ so it survives every update; VEX_CHANNEL env
+# overrides for one-off switches.
+CHANNEL="${VEX_CHANNEL:-$(tr -d '[:space:]' < config/update-channel 2>/dev/null)}"
+CHANNEL="${CHANNEL:-stable}"
+RESOLVED=$(resolve_channel_release "$VERSION_DOC" "$CHANNEL") \
+    || { rm -f "$VERSION_DOC" "$VERSION_SIG"; die "no release for channel '$CHANNEL' published"; }
+LATEST_VERSION="${RESOLVED%%	*}"
+CHANNEL_ARCHIVE="${RESOLVED##*	}"
+if [ -n "$CHANNEL_ARCHIVE" ]; then
+    GITHUB_ARCHIVE="${GITHUB_ARCHIVE%/*}/$CHANNEL_ARCHIVE"
+fi
+# spec 093/US014: is there a published delta for the installed version?
+DELTA_NAME=$(resolve_delta "$VERSION_DOC" "$CURRENT_VERSION" 2>/dev/null || true)
+
+# spec 093/US023: warn if the installed release is past its support window.
+check_eol "$CURRENT_VERSION" "$VERSION_DOC"
+
+# spec 093/US018: pin/hold overrides the channel-resolved target. Resolve
+# this BEFORE the min_from gate so a pin is checked against its own floor.
+VERSION="$LATEST_VERSION"; ARCHIVE_NAME="$CHANNEL_ARCHIVE"
+resolve_update_target   # exits cleanly on hold; sets VERSION/ARCHIVE_NAME on pin
+if [ "$PINNED" = "1" ]; then
+    LATEST_VERSION="$VERSION"
+    GITHUB_ARCHIVE="${GITHUB_ARCHIVE%/*}/$ARCHIVE_NAME"
+fi
+
+# spec 093/US024: refuse jumps from below the target's declared min_from.
+check_min_from "$CURRENT_VERSION" "$LATEST_VERSION" "$VERSION_DOC"
+# spec 093/US029: refuse targets the local interpreter can't run.
+check_python_compat "$VERSION_DOC"
+# spec 093/US025: flag security releases distinctly before proceeding.
+check_security_advisory "$LATEST_VERSION" "$VERSION_DOC"
+# spec 093/US026: surface breaking changes before the admin commits.
+warn_breaking_changes "$VERSION_DOC"
+# spec 093/US028: capture declared size before the doc is discarded; preflight
+# uses it instead of a network HEAD probe.
+DECLARED_SIZE=$(declared_size "$VERSION_DOC" "$LATEST_VERSION")
+# spec 093/US040: prefer .tar.zst when the host has zstd AND the release
+# advertises one; otherwise stay on .tar.gz.
+if [ "$BUNDLE_MODE" != "1" ] && [ "$(pick_archive_ext)" = ".tar.zst" ] \
+        && python3 -c "
+import json,sys
+d=json.load(open('$VERSION_DOC'))
+fmts=d.get('formats',[])
+sys.exit(0 if any('zst' in f for f in fmts) else 1)
+" 2>/dev/null; then
+    GITHUB_ARCHIVE="${GITHUB_ARCHIVE%.tar.gz}.tar.zst"
+    ARCHIVE_NAME="${ARCHIVE_NAME%.tar.gz}.tar.zst"
+fi
+
+# spec 093/US027+US037: pick the lowest-latency reachable mirror, then sanity
+# check the archive is actually there; fall back to the ordered probe.
+if [ "$BUNDLE_MODE" != "1" ]; then
+    ARCHIVE_BASENAME=$(basename "$GITHUB_ARCHIVE")
+    MIRROR_BASE=$(pick_mirror_latency "$VERSION_DOC" "${GITHUB_ARCHIVE%/*}") \
+        && curl -fsSI --max-time 10 "$MIRROR_BASE/$ARCHIVE_BASENAME" -o /dev/null 2>/dev/null \
+        || MIRROR_BASE=$(select_mirror "$VERSION_DOC" "$ARCHIVE_BASENAME" "${GITHUB_ARCHIVE%/*}") \
+        || { rm -f "$VERSION_DOC" "$VERSION_SIG"; die "no reachable mirror for $ARCHIVE_BASENAME"; }
+    GITHUB_ARCHIVE="$MIRROR_BASE/$ARCHIVE_BASENAME"
+fi
+rm -f "$VERSION_DOC" "$VERSION_SIG"
 
 if [ -z "$LATEST_VERSION" ]; then
     echo -e "${RED}Failed${NC}"
@@ -167,11 +1329,59 @@ echo -e "${GREEN}OK${NC}"
 # unreachable, we fall back to a hard-coded list of essential files.
 # =============================================================================
 echo ""
-echo -n "Downloading release archive... "
 TMPDIR=$(mktemp -d)
 ARCHIVE="$TMPDIR/ProxmoxVEx.tar.gz"
 
-if curl -sfL "$GITHUB_ARCHIVE" -o "$ARCHIVE" 2>/dev/null; then
+# spec 093/US015: preflight BEFORE any artifact download — disk space,
+# app health, required tools. --force overrides with a logged warning.
+preflight_update
+
+# spec 093/US014: when a signed delta exists for the installed version,
+# apply it instead of downloading the full archive. The delta passes the
+# same signature+checksum gates; the applied tree is re-verified against
+# the manifest's full file map. Any failure → clean fallback to full.
+DELTA_APPLIED=0
+if [ -n "$DELTA_NAME" ]; then
+    echo -n "Trying delta package $DELTA_NAME... "
+    DELTA_FILE="$TMPDIR/delta.tar.gz"
+    DELTA_DIR="$TMPDIR/delta-x"
+    # US032: delta archives are large too — resumable fetch.
+    fetch_resume "${GITHUB_ARCHIVE%/*}/$DELTA_NAME" "$DELTA_FILE" || true
+    if [ -s "$DELTA_FILE" ] \
+        && curl -sfL "${GITHUB_ARCHIVE%/*}/$DELTA_NAME.asc" -o "$DELTA_FILE.asc" 2>/dev/null \
+        && curl -sfL "${GITHUB_ARCHIVE%/*}/checksums.txt" -o "$TMPDIR/checksums.txt" 2>/dev/null; then
+        DELTA_OK=0
+        verify_signature "$DELTA_FILE" "$DELTA_FILE.asc" && {
+            EXPECTED_D=$(awk -v f="$DELTA_NAME" '$2 == f {print $1}' "$TMPDIR/checksums.txt" 2>/dev/null)
+            ACTUAL_D=$(sha256sum "$DELTA_FILE" | awk '{print $1}')
+            [ -n "$EXPECTED_D" ] && [ "$EXPECTED_D" = "$ACTUAL_D" ] && DELTA_OK=1
+        }
+        if [ "$DELTA_OK" = "1" ]; then
+            rm -rf "$DELTA_DIR"; mkdir -p "$DELTA_DIR"
+            if tar -xzf "$DELTA_FILE" -C "$DELTA_DIR" 2>/dev/null \
+                && [ -f "$DELTA_DIR/delta-manifest.json" ] \
+                && apply_delta "$DELTA_DIR" "$SCRIPT_DIR" \
+                && verify_delta_tree "$SCRIPT_DIR" "$DELTA_DIR/delta-manifest.json"; then
+                DELTA_APPLIED=1
+                echo -e "${GREEN}delta applied + verified${NC} (full tree hash-checked)"
+            else
+                echo -e "${YELLOW}delta apply/verify failed — falling back to full archive${NC}"
+            fi
+        else
+            echo -e "${YELLOW}delta failed signature/checksum — falling back to full archive${NC}"
+        fi
+    else
+        echo -e "${YELLOW}delta unavailable — falling back to full archive${NC}"
+    fi
+fi
+
+# US020: bundle mode already holds the verified archive — skip the download
+# and the (network-dependent) individual-file fallback entirely.
+if [ "$DELTA_APPLIED" = "0" ] && [ "$BUNDLE_MODE" != "1" ]; then
+echo -n "Downloading release archive... "
+# US032: resume partial downloads; a dropped 200MB transfer continues from
+# its offset instead of restarting.
+if fetch_resume "$GITHUB_ARCHIVE" "$ARCHIVE"; then
     echo -e "${GREEN}OK (mirror)${NC}"
 else
     echo -e "${YELLOW}Archive not found, falling back to individual files...${NC}"
@@ -268,15 +1478,51 @@ except:
     ARCHIVE=""
 fi
 
+# spec 093/US004: process any pending key rotation BEFORE archive signature
+# verification — the old trusted key countersigns its successor, and the new
+# key then verifies this release. Fail closed on forged rotation docs.
+process_key_rotation "${GITHUB_RAW}" "$TMPDIR"
+
+# spec 093/US001: verify the detached GPG signature BEFORE the checksum or
+# extraction — the checksum guards corruption, the signature guards
+# authenticity (a tampered tarball fails closed here).
+if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
+    echo -n "Verifying archive signature... "
+    SIG_FILE="$TMPDIR/archive.asc"
+    SIG_URL="${GITHUB_ARCHIVE}.asc"
+    if curl -sfL "$SIG_URL" -o "$SIG_FILE" 2>/dev/null; then
+        verify_signature "$ARCHIVE" "$SIG_FILE"
+        case $? in
+            0)
+                echo -e "${GREEN}OK (signature verified)${NC}"
+                ;;
+            2)
+                echo -e "${YELLOW}skipped (gpg/pubkey.asc unavailable or VEX_SKIP_SIG_VERIFY=1)${NC}"
+                ;;
+            *)
+                echo -e "${RED}signature verification FAILED${NC}"
+                die "Archive signature does not verify — aborting; the download may be tampered with."
+                ;;
+        esac
+    else
+        echo -e "${YELLOW}no signature published at $SIG_URL (skipping)${NC}"
+    fi
+fi
+
 # If an archive was downloaded, verify its SHA256 checksum against the published
 # SHA256SUMS file (if any). Missing checksums are treated as a soft warning.
 if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
     echo -n "Verifying archive integrity... "
-    SHA_FILE="$TMPDIR/SHA256SUMS"
+    SHA_FILE="$TMPDIR/checksums.txt"
     SHA_VERIFIED=false
-    if curl -sfL "$GITHUB_RAW/SHA256SUMS" -o "$SHA_FILE" 2>/dev/null; then
-        # SHA256SUMS contains lines like: <hash>  <filename>
-        EXPECTED=$(grep -E "${GITHUB_BRANCH}\\.tar\\.gz\$" "$SHA_FILE" 2>/dev/null | awk '{print $1}')
+    # spec 093/US002: checksums.txt lives beside the archive on the
+    # downloads host and is keyed by the archive's real basename — the old
+    # lookup fetched SHA256SUMS and grepped <branch>.tar.gz, which could
+    # never match ProxmoxVEx-latest.tar.gz and always skipped.
+    ARCHIVE_BASENAME=$(basename "$GITHUB_ARCHIVE")
+    CHECKSUMS_URL="${GITHUB_ARCHIVE%/*}/checksums.txt"
+    if curl -sfL "$CHECKSUMS_URL" -o "$SHA_FILE" 2>/dev/null; then
+        EXPECTED=$(awk -v f="$ARCHIVE_BASENAME" '$2 == f {print $1}' "$SHA_FILE" 2>/dev/null)
         if [ -n "$EXPECTED" ]; then
             ACTUAL=$(sha256sum "$ARCHIVE" | awk '{print $1}')
             if [ "$EXPECTED" = "$ACTUAL" ]; then
@@ -296,17 +1542,36 @@ if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
     else
         echo -e "${YELLOW}SHA256SUMS not available (skipping verification)${NC}"
     fi
+
+    # spec 093/US007: advisory transparency-log check — an artifact whose
+    # hash never entered the public log may have been swapped post-publish.
+    # Warn loudly but don't block: the sig/checksum gates already failed
+    # closed on tampering.
+    TLOG="$TMPDIR/transparency.log"
+    if curl -sfL "$GITHUB_RAW/transparency.log" -o "$TLOG" 2>/dev/null; then
+        ACTUAL_HASH=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+        if check_transparency "$TLOG" "$ACTUAL_HASH"; then
+            echo -e "${GREEN}✓ artifact listed in transparency log${NC}"
+        else
+            echo -e "${YELLOW}transparency warn: artifact hash not in the published log${NC}"
+            echo -e "${YELLOW}  (possible post-publish replacement — verify out-of-band)${NC}"
+        fi
+    fi
 fi
 
 # Extract the archive to a temp directory, locate the actual source tree (GitHub
 # archives often wrap everything in a subdirectory), then copy it over using
 # rsync if available, falling back to a tar-pipe.
-if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
+# spec 093/US011: --atomic applies via releases/<ver> + symlink swap instead
+# of copying over the live tree.
+if [ "$ATOMIC" = "1" ] && [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
+    atomic_update "$ARCHIVE" "$LATEST_VERSION"
+elif [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
     echo -n "Extracting archive... "
     # Extract to temp dir first, then copy (safer)
     EXTRACT_DIR="$TMPDIR/extracted"
     mkdir -p "$EXTRACT_DIR"
-    tar xzf "$ARCHIVE" -C "$EXTRACT_DIR" 2>/dev/null
+    untar_release "$ARCHIVE" "$EXTRACT_DIR" 2>/dev/null
 
     # Find the actual content (might be in a subdirectory)
     CONTENT_DIR="$EXTRACT_DIR"
@@ -349,6 +1614,7 @@ if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
 
     rm -rf "$TMPDIR"
 fi
+fi  # end DELTA_APPLIED=0 full-archive path (US014)
 
 # 2026-06-07: post-copy sanity check - confirm the new version.JSON actually
 # landed on disk. Catches a half-applied copy AND a stale CDN tarball (GitHub can
@@ -439,6 +1705,23 @@ elif systemctl is-active --quiet ProxmoxVEx.service 2>/dev/null; then
 else
     echo -e "${YELLOW}No systemd service found${NC}"
     echo "  If running manually, restart with: python3 ProxmoxVEx_multi_cluster.py"
+fi
+
+# spec 093/US016: post-update verification — bounded health window after
+# restart; atomic-mode installs auto-roll back (guarded, logged) when the
+# new release never comes up. VEX_SKIP_POST_VERIFY=1 skips for runbooks.
+if [ "${VEX_SKIP_POST_VERIFY:-0}" != "1" ]; then
+    echo -n "Verifying service health (window ${HEALTH_TIMEOUT:-300}s)... "
+    if wait_for_health "${HEALTH_URL:-http://localhost:8080/api/healthz}" "${HEALTH_TIMEOUT:-300}"; then
+        echo -e "${GREEN}healthy${NC}"
+        log_update "verified $LATEST_VERSION"
+    elif [ "$ATOMIC" = "1" ]; then
+        echo -e "${RED}unhealthy — auto-rolling back${NC}"
+        auto_rollback "$LATEST_VERSION" "post-update health check failed" || true
+    else
+        echo -e "${YELLOW}health check failed — investigate before relying on this install${NC}"
+        log_update "health-failed $LATEST_VERSION (non-atomic install, manual rollback)"
+    fi
 fi
 
 # Done!
