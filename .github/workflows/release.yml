@@ -146,6 +146,10 @@ jobs:
           RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
         run: |
           set -euo pipefail
+          if [ -z "$RELEASE_GPG_KEY" ]; then
+            echo "::error::RELEASE_GPG_KEY secret is not configured — the release cannot be signed"
+            exit 1
+          fi
           printf '%s' "$RELEASE_GPG_KEY" | gpg --batch --import
           gpg --list-secret-keys --keyid-format long
       - name: Build release artifacts
