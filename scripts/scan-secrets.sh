@@ -22,8 +22,11 @@ BASELINE="${VEX_SECRET_BASELINE:-/dev/null}"
 #  - AWS access key ids
 #  - AWS secret assignments
 #  - generic token/password assignments with a long literal value
+# PEM headers are anchored at line start: UI placeholder strings and
+# single-line fixtures embed the header inside quotes — anchoring keeps the
+# high-signal match (a real key file starts its body at column ~0).
 PATTERNS=(
-    'BEGIN [A-Z ]*PRIVATE KEY'
+    '^[[:space:]]*-----BEGIN [A-Z ]*PRIVATE KEY-----'
     'AKIA[0-9A-Z]{16}'
     'aws_secret_access_key[[:space:]]*=[[:space:]]*[A-Za-z0-9/+=]{20,}'
     '(api[_-]?key|secret|token|password)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_+/=-]{32,}'
@@ -45,7 +48,7 @@ while IFS= read -r -d '' f; do
     done
 done < <(find "$ROOT" -type f \
     ! -path '*/.git/*' ! -path '*/node_modules/*' \
-    ! -path '*/.venv/*' ! -path '*/venv/*' ! -path '*/dist/*' \
+    ! -path '*/.venv/*' ! -path '*/venv/*' ! -path '*/.*venv*/*' ! -path '*/dist/*' \
     ! -name '*.pyc' ! -name '*.png' ! -name '*.ico' \
     -size -2M -print0)
 

@@ -11,7 +11,7 @@
 # this repo. Override the identity with VEX_SIGNING_KEY (fingerprint or
 # uid); default is the project's release-signing uid.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 KEY="${VEX_SIGNING_KEY:-releases@proxmoxvex.com}"
 
@@ -59,11 +59,19 @@ done
 
 # spec 093/US022: sign the standalone per-file manifest too — the copy inside
 # the tarball is already covered by the archive signature.
-for f in dist/MANIFEST.sha256; do
-    [ -f "$f" ] || continue
+f=dist/MANIFEST.sha256
+if [ -f "$f" ]; then
     gpg --batch --yes -u "$KEY" --detach-sign --armor -o "$f.asc" "$f"
     echo "signed: $f.asc"
-done
+fi
+
+# spec 093/US044: sign the dependency freeze manifest — auditors trust the
+# dep-diff only if the manifest itself is authenticated.
+f=dist/deps-freeze.json
+if [ -f "$f" ]; then
+    gpg --batch --yes -u "$KEY" --detach-sign --armor -o "$f.asc" "$f"
+    echo "signed: $f.asc"
+fi
 
 # spec 093/US007: re-sign the transparency log after any appends — the
 # log's value is that it's signed history, so an unsigned or stale

@@ -63,6 +63,13 @@
       "type": "string",
       "pattern": "^\\d+\\.\\d+"
     },
+    "platforms": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "US068: allowed uname -m values; absent = x86_64+aarch64"
+    },
+    "platforms_glibc": {"type": "array", "items": {"type": "string"}},
+    "platforms_musl": {"type": "array", "items": {"type": "string"}},
     "download_url": {
       "type": "string"
     },
@@ -102,6 +109,13 @@
           "size_bytes": {
             "type": "integer",
             "minimum": 0
+          },
+          "cohort": {
+            "type": "string",
+            "enum": [
+              "opt-in",
+              "all"
+            ]
           }
         }
       }

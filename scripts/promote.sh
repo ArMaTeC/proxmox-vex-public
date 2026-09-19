@@ -12,9 +12,33 @@
 #   ./scripts/promote.sh <version> --local /path/to/docroot      # local/test
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
-VERSION="${1:?usage: promote.sh <version> [--local <docroot>]}"
+# spec 093/US056: --channel-promote <from> <to> copies a soaked channel's
+# pointer (e.g. canary) onto another (stable) inside version.json, then
+# re-signs — the cohort story is complete only when promotion is one command.
+if [ "${1:-}" = "--channel-promote" ]; then
+    FROM="${2:?usage: --channel-promote <from> <to> [version.json]}"
+    TO="${3:?usage: --channel-promote <from> <to> [version.json]}"
+    DOC="${4:-version.json}"
+    python3 - "$FROM" "$TO" "$DOC" <<'PY'
+import json, sys
+frm, to, doc = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(doc))
+ch = d.get("channels", {})
+assert frm in ch, f"no channel '{frm}' in {doc}"
+ch[to] = dict(ch[frm])
+ch[to].pop("cohort", None)   # promoted release serves everyone
+json.dump(d, open(doc, "w"), indent=2)
+open(doc, "a").write("\n")
+print(f"promoted channel {frm} -> {to} ({ch[to]['version']})")
+PY
+    "$(dirname "$0")/sign-version.sh" "$DOC" 2>/dev/null || \
+        echo "promote: WARNING — $DOC left unsigned (no release key)" >&2
+    exit 0
+fi
+
+VERSION="${1:?usage: promote.sh <version> [--local <docroot>] | --channel-promote <from> <to>}"
 HOST="${PUBLISH_HOST:-}"
 ROOT="${PUBLISH_ROOT:-/var/www/proxmoxvex-dist}"
 LOCAL_ROOT=""

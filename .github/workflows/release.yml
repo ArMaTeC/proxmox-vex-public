@@ -10,6 +10,10 @@ name: Release provenance
 on:
   release:
     types: [published]
+  # spec 093/US051: tag push drives the full release pipeline —
+  # build → sign → stage → verify → promote, no manual steps.
+  push:
+    tags: ["v*"]
   # manual run for re-attesting artifacts already in dist/
   workflow_dispatch:
 
@@ -25,6 +29,31 @@ jobs:
       # it before anything is built or published.
       - name: Schema-check version.json
         run: python3 scripts/validate-version.py version.json
+
+  # spec 093/US061: shell lint gate — update.sh and the maintainer scripts
+  # carry the trust-critical install path, so warnings block the release.
+  shellcheck:
+    name: ShellCheck gate
+    needs: [metadata]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: shellcheck
+        run: shellcheck -S warning update.sh scripts/*.sh
+
+  # spec 093/US086: bats unit tests for the update.sh helpers — a broken
+  # version_ge / in_window / scheme gate must block the release before any
+  # artifact is built.
+  unit-tests:
+    name: update.sh unit tests (bats)
+    needs: [metadata]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install bats
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
+      - name: bats suite
+        run: bats tests/update.bats
 
   reproducibility:
     name: Verify deterministic rebuild
@@ -74,3 +103,96 @@ jobs:
     with:
       base64-subjects: ${{ needs.digests.outputs.digests }}
       upload-assets: true
+
+  # spec 093/US058: release gating — nothing is built until the app repo's
+  # own lint + test suite + frontend build pass on the tagged ref. A red
+  # upstream gate kills the release before a single artifact exists.
+  gate:
+    name: Upstream test-suite gate
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ArMaTeC/ProxmoxVEx
+          ref: ${{ github.ref_name }}
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        with: { python-version: "3.12" }
+      - name: Install deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q -r requirements.txt -r requirements-dev.txt
+      - name: Lint
+        run: .venv/bin/ruff check ProxmoxVEx
+      - name: Full test suite
+        run: .venv/bin/pytest tests -q
+      - name: Frontend build
+        run: bash web/Dev/build.sh
+
+  # spec 093/US051: tag→build→sign→stage→verify→promote. Each job is a
+  # gate — the release can't reach production without passing all of them,
+  # and promotion needs the `production` environment's reviewer approval.
+  build:
+    name: Build, sign, and stage
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [gate, shellcheck, unit-tests]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0   # full history + tags for CHANGELOG generation (US052)
+      - name: Import release signing key
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$RELEASE_GPG_KEY" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format long
+      - name: Build release artifacts
+        # full history needed for changelog generation between tags (US052)
+        run: bash scripts/build-release.sh
+      - name: Sign artifacts + refresh checksums
+        run: bash scripts/sign-release.sh
+      - name: Publish to staging
+        run: bash scripts/publish.sh --staging
+      - name: Upload staged release for audit
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: staged-release
+          path: dist/
+          retention-days: 30
+
+  verify:
+    name: Verify staged release
+    needs: [build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Download staged artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with: { name: staged-release, path: dist/ }
+      - name: Verify signatures + checksums end-to-end
+        run: |
+          set -euo pipefail
+          for t in dist/*.tar.gz; do
+            bash verify-release.sh "$t"
+          done
+      - name: E2E update harness — install→update→health→rollback (US054)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/vex-old/releases/0.9.0
+          cp update.sh /tmp/vex-old/ /tmp/vex-old/releases/0.9.0/
+          echo 0.9.0 > /tmp/vex-old/.active-version
+          ln -sfn /tmp/vex-old/releases/0.9.0 /tmp/vex-old/current
+          VEX_UPDATE_BASE="file://$PWD/dist" \
+            bash scripts/e2e-update-test.sh --workdir /tmp/vex-old
+
+  promote:
+    name: Promote staging to production
+    needs: [verify]
+    environment: production      # reviewer approval required — the human gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Promote the verified staging release
+        run: bash scripts/promote.sh

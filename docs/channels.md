@@ -6,9 +6,24 @@ from `version.json`'s `channels` map; the active channel comes from
 
 | Channel | Source                                | Soak before promotion   | Support window         |
 |---------|---------------------------------------|-------------------------|------------------------|
+| canary  | opt-in cohort (`cohort: "opt-in"`)    | 7 d on canary           | until the next canary  |
 | beta    | every merge train / nightly build     | 0 d (ships immediately) | until the next beta    |
 | stable  | promoted from beta, no criticals open | 14 d on beta            | 90 days from promotion |
 | lts     | quarterly pick from stable            | 30 d on stable          | 12 months              |
+
+## Canary cohort
+
+`channels.canary` carries `"cohort": "opt-in"` — only installs that wrote
+`canary` into `config/update-channel` (or export `VEX_CHANNEL=canary`) ever
+see it. After a ≥7-day soak with <0.5% failure telemetry, promote it in one
+step:
+
+```bash
+scripts/promote.sh --channel-promote canary stable
+```
+
+This copies the canary pointer onto `stable`, drops the cohort marker, and
+re-signs `version.json`.
 
 ## Promotion criteria
 
@@ -19,6 +34,14 @@ from `version.json`'s `channels` map; the active channel comes from
   additionally have soaked ≥30 days on stable and carry no known data-loss
   or security regressions. An LTS release keeps receiving backports until
   its 12-month support window ends.
+
+## Retention policy
+
+`scripts/prune-releases.sh` bounds the on-host release set: keep the last
+**10 stable** releases (`KEEP_STABLE` env to tune), **every LTS**, and the
+rollback pair (`.active-version` + `.previous-version`). It is a dry-run by
+default — pass `--apply` to delete. Run it from cron after promotions so
+rollback targets persist without unbounded growth.
 
 ## Hotfix path
 

@@ -45,14 +45,16 @@ sleep 1
 cat > "$SCRATCH/vj.json" <<JSON
 {"mirrors": ["http://127.0.0.1:$PORT_S", "http://127.0.0.1:$PORT_F"]}
 JSON
-out=$(bash -c "source '$SCRATCH/pm.sh'
+# fixture uses http:// loopback mirrors — only reachable under the armed
+# insecure mode (US041 scheme gate), so the extraction sets INSECURE=1.
+out=$(bash -c "INSECURE=1; source '$SCRATCH/pm.sh'
       pick_mirror_latency '$SCRATCH/vj.json' 'http://127.0.0.1:1'" 2>&1)
 echo "  info - picked: $out"
 [ "$(echo "$out" | head -1)" = "http://127.0.0.1:$PORT_F" ] && ok "fastest mirror picked (not first-listed)" || bad "fastest mirror picked (got: $out)"
 echo "$out" | grep -qi 'latency\|ms' && ok "pick is logged" || bad "pick is logged"
 
 # env override wins regardless of latency
-out=$(VEX_MIRROR="http://127.0.0.1:$PORT_S" bash -c "source '$SCRATCH/pm.sh'
+out=$(VEX_MIRROR="http://127.0.0.1:$PORT_S" bash -c "INSECURE=1; source '$SCRATCH/pm.sh'
       pick_mirror_latency '$SCRATCH/vj.json' 'x'" 2>&1)
 [ "$out" = "http://127.0.0.1:$PORT_S" ] && ok "VEX_MIRROR still wins" || bad "VEX_MIRROR still wins (got: $out)"
 

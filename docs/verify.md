@@ -89,3 +89,15 @@ Exit codes: `0` verified · `1` signature failed · `2` checksum failed ·
 `3` missing files/tools. Without gnupg, `--checksum-only` verifies
 integrity only (fetch `checksums.txt` over a trusted channel in that
 case).
+
+## Reviewing what changed
+
+Each release also publishes `dist/diff-<prev>-to-<ver>.txt` — a flat
+`ADDED` / `CHANGED` / `REMOVED` listing of every file that differs from
+the previous tarball. Review it before updating to spot unexpected file
+changes without extracting both archives:
+
+```bash
+curl -LO https://proxmoxvex.com/dl/diff-1.2.471-to-1.2.472.txt
+grep -v '^#' diff-1.2.471-to-1.2.472.txt
+```

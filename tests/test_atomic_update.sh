@@ -24,6 +24,7 @@ check "--atomic flag wired"                   "grep -q '\-\-atomic' update.sh"
 SCRATCH=$(mktemp -d)
 awk '/^atomic_stage\(\)/,/^}/; /^wire_shared_state\(\)/,/^}/;
      /^atomic_swap\(\)/,/^}/; /^check_disk_space\(\)/,/^}/;
+     /^log_update\(\)/,/^}/;
      /^untar_release\(\)/,/^}/;
      /^atomic_update\(\)/,/^}/' update.sh > "$SCRATCH/atomic.sh"
 grep -A2 '^die()' update.sh > "$SCRATCH/die.sh"

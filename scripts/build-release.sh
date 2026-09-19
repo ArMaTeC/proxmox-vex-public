@@ -14,7 +14,7 @@
 # reproducible-builds convention) so rebuilds of one commit agree.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 # Pinned clock: the commit timestamp, not the wall clock — that's what
 # makes an independent rebuild of the same commit byte-identical.
@@ -127,6 +127,43 @@ if command -v python3 >/dev/null 2>&1; then
         --package-lock "$BUILD_DIR/package-lock.json" \
         --version "$VERSION" --out "$OUT_DIR/sbom.json" || \
         echo "build-release: SBOM generation skipped" >&2
+fi
+
+# spec 093/US052: auto-generated changelog — conventional commits since the
+# previous tag become structured release notes alongside the artifacts.
+if command -v python3 >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+    PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+    python3 scripts/gen-changelog.py --repo . ${PREV_TAG:+--from "$PREV_TAG"} \
+        --to HEAD --version "$VERSION" \
+        --out "$OUT_DIR/changelog.generated.json" || \
+        echo "build-release: changelog generation skipped" >&2
+fi
+
+# spec 093/US044: per-release dependency freeze manifest — auditors diff
+# deps-freeze.json between releases to see exactly which deps changed.
+if command -v python3 >/dev/null 2>&1; then
+    python3 scripts/gen-freeze.py \
+        --requirements "$BUILD_DIR/requirements.txt" \
+        --package-lock "$BUILD_DIR/package-lock.json" \
+        --version "$VERSION" --out "$OUT_DIR/deps-freeze.json" || \
+        echo "build-release: freeze manifest generation skipped" >&2
+fi
+
+# spec 093/US100: published file-diff report — if a previous release
+# tarball sits alongside in OUT_DIR, emit dist/diff-<prev>-to-<ver>.txt
+# with ADDED/CHANGED/REMOVED categories so auditors review without
+# extracting two archives. Best-effort: no prior tarball -> skip.
+PREV_TAR=""
+for _cand in "$OUT_DIR"/ProxmoxVEx-*.tar.gz; do
+    [ -e "$_cand" ] || continue
+    case "$_cand" in *-"${VERSION}".tar.gz) continue ;; esac
+    if [ -z "$PREV_TAR" ] || [ "$_cand" -nt "$PREV_TAR" ]; then PREV_TAR="$_cand"; fi
+done
+if [ -n "$PREV_TAR" ]; then
+    PREV_VER=$(basename "$PREV_TAR" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    bash scripts/gen-diff.sh "$PREV_TAR" "$OUT" \
+        "$OUT_DIR/diff-${PREV_VER}-to-${VERSION}.txt" || \
+        echo "build-release: diff report skipped" >&2
 fi
 
 # spec 093/US020: airgap bundle — one .vexbundle carrying everything an

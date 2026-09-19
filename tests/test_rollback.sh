@@ -21,7 +21,8 @@ check "DB revert attempted when possible"     "grep -qi 'pg_restore\|downgrade\|
 
 # --- functional: extract + run rollback on a scratch layout --------------------
 SCRATCH=$(mktemp -d)
-awk '/^rollback_release\(\)/,/^}/; /^log_rollback\(\)/,/^}/; /^atomic_swap\(\)/,/^}/' update.sh > "$SCRATCH/rb.sh"
+awk '/^rollback_release\(\)/,/^}/; /^log_rollback\(\)/,/^}/; /^atomic_swap\(\)/,/^}/;
+     /^log_update\(\)/,/^}/; /^acquire_update_lock\(\)/,/^}/' update.sh > "$SCRATCH/rb.sh"
 grep -A2 '^die()' update.sh > "$SCRATCH/die.sh"
 
 BASE="$SCRATCH/app"

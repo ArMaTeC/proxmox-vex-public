@@ -1,0 +1,70 @@
+name: hotfix
+
+# spec 093/US060: expedited security hotfix — manual dispatch with a CVE id
+# and written justification; production-env approval still required;
+# reduced gates (smoke instead of full suite, no soak) but signing and
+# post-review are never skipped. See docs/hotfix.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cve:
+        description: "CVE or advisory id being fixed (e.g. CVE-2026-1234)"
+        required: true
+      justification:
+        description: "Why this qualifies for the hotfix path"
+        required: true
+
+permissions: read-all
+
+jobs:
+  hotfix:
+    name: "Hotfix ${{ inputs.cve }}"
+    environment: production        # human approval — expedited ≠ unattended
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write                # files the mandatory post-review issue
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with: { fetch-depth: 0 }
+      - name: Record justification
+        run: |
+          echo "hotfix for ${{ inputs.cve }}"
+          echo "justification: ${{ inputs.justification }}"
+      - name: Import release signing key
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+        run: printf '%s' "$RELEASE_GPG_KEY" | gpg --batch --import
+      - name: Build + sign (signing chain never skipped)
+        run: |
+          set -euo pipefail
+          bash scripts/build-release.sh
+          bash scripts/sign-release.sh
+      - name: Smoke gate (reduced from full suite — see docs/hotfix.md)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/vex-old/releases/0.0.0
+          cp update.sh /tmp/vex-old/ /tmp/vex-old/releases/0.0.0/
+          echo 0.0.0 > /tmp/vex-old/.active-version
+          ln -sfn /tmp/vex-old/releases/0.0.0 /tmp/vex-old/current
+          VEX_UPDATE_BASE="file://$PWD/dist" \
+            bash scripts/e2e-update-test.sh --workdir /tmp/vex-old
+      - name: Publish direct to stable (no channel soak)
+        run: bash scripts/publish.sh --local /srv/dist "$(python3 -c 'import json;print(json.load(open("version.json"))["version"])')"
+      - name: File mandatory post-review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # inputs via env, not inline ${{ }} — avoids script injection and
+          # keeps the multi-line body inside the run block (a column-0
+          # continuation line would end the literal scalar mid-string)
+          HOTFIX_CVE: ${{ inputs.cve }}
+          HOTFIX_JUSTIFICATION: ${{ inputs.justification }}
+        run: |
+          body="Mandatory review within 7 days per docs/hotfix.md.
+
+          Justification recorded: ${HOTFIX_JUSTIFICATION}"
+          gh issue create \
+            --title "Post-hotfix review: ${HOTFIX_CVE}" \
+            --body "$body" \
+            --label "post-review" || echo "issue filing failed — review still required"

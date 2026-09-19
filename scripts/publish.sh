@@ -16,12 +16,32 @@
 #   (dry-run: PUBLISH_HOST= ./scripts/publish.sh <version> ./staged-dist)
 
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
-VERSION="${1:?usage: publish.sh <version> [dist-dir]}"
-DIST_DIR="${2:-dist}"
+# spec 093/US059: --dry-run prints the plan and exits before any change;
+# --local <root> publishes into a local docroot instead of ssh.
+DRY="${DRY_RUN:-0}"
+LOCAL_ROOT=""
+VERSION=""
+DIST_DIR="dist"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) DRY=1; shift ;;
+        --local)   LOCAL_ROOT="$2"; shift 2 ;;
+        -*)        echo "publish: unknown flag $1" >&2; exit 2 ;;
+        *)         [ -z "$VERSION" ] && VERSION="$1" || DIST_DIR="$1"; shift ;;
+    esac
+done
+# dry-run without a version defaults to the metadata's current version —
+# the plan for "what a publish right now would do" is the common case.
+if [ -z "$VERSION" ]; then
+    VERSION=$(python3 -c 'import json;print(json.load(open("version.json"))["version"])' 2>/dev/null || true)
+fi
+VERSION="${VERSION:?usage: publish.sh [--dry-run] [--local root] <version> [dist-dir]}"
 HOST="${PUBLISH_HOST:-}"
 ROOT="${PUBLISH_ROOT:-/var/www/proxmoxvex-dist}"
+
+plan() { echo "[dry-run] $*"; }
 
 die() { echo "publish: FAIL: $*" >&2; exit 1; }
 
@@ -90,6 +110,52 @@ main() {
     [ -f "$tarball" ] || die "no artifact for $VERSION in $DIST_DIR"
     local want
     want=$(sha256sum "$tarball" | awk '{print $1}')
+
+    local sub="releases"
+    [ "${PUBLISH_STAGING:-0}" = "1" ] && sub="staging/releases"
+
+    # US059: --dry-run enumerates every planned mutation, then exits —
+    # operators review the blast radius before the first byte moves.
+    if [ "$DRY" = "1" ]; then
+        local dest="${LOCAL_ROOT:-$HOST:$ROOT}"
+        for f in "$DIST_DIR"/*; do
+            plan "upload $f -> $dest/$sub/$VERSION/"
+        done
+        for f in version.json version.json.asc transparency.log \
+                 transparency.log.asc pubkey.asc; do
+            [ -f "$f" ] && plan "upload $f -> $dest/$sub/$VERSION/"
+        done
+        plan "verify sha256 of remote tarball == $want"
+        if [ "$sub" != "staging/releases" ]; then
+            plan "swap current -> releases/$VERSION (atomic mv -T)"
+            plan "write+upload latest.conf redirect -> ProxmoxVEx-${VERSION}.tar.gz"
+            plan "publish version.json + version.json.asc (live pointer)"
+            plan "CDN purge metadata + latest pointer"
+        else
+            plan "stop at staging — promote.sh owns the swap"
+        fi
+        echo "dry-run complete"
+        return 0
+    fi
+
+    # US059: --local publishes into a docroot dir instead of ssh/rsync —
+    # same staged layout, same atomic swap, no network.
+    if [ -n "$LOCAL_ROOT" ]; then
+        mkdir -p "$LOCAL_ROOT/$sub/$VERSION"
+        cp -a "$DIST_DIR/." "$LOCAL_ROOT/$sub/$VERSION/"
+        for f in version.json version.json.asc transparency.log \
+                 transparency.log.asc pubkey.asc; do
+            [ -f "$f" ] && cp "$f" "$LOCAL_ROOT/$sub/$VERSION/"
+        done
+        if [ "$sub" = "staging/releases" ]; then
+            echo "publish: staged at $LOCAL_ROOT/$sub/$VERSION"
+            return 0
+        fi
+        publish_swap "$LOCAL_ROOT" "$VERSION"
+        write_latest_conf "$LOCAL_ROOT" "$VERSION" 2>/dev/null || true
+        echo "publish: $VERSION live under $LOCAL_ROOT"
+        return 0
+    fi
 
     if [ -z "$HOST" ]; then
         echo "publish: DRY-RUN — would upload $DIST_DIR as releases/$VERSION"

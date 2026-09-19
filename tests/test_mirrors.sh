@@ -22,6 +22,7 @@ check "shipped doc validates"           "python3 scripts/validate-version.py ver
 # --- functional: failover order ---------------------------------------------------
 SCRATCH=$(mktemp -d)
 awk '/^select_mirror\(\)/,/^}/' update.sh > "$SCRATCH/sm.sh"
+awk '/^curl_secret_conf\(\)/,/^}/' update.sh >> "$SCRATCH/sm.sh"
 
 # two fake mirrors: m1 dead (no file), m2 has the archive
 mkdir -p "$SCRATCH/m1" "$SCRATCH/m2" "$SCRATCH/primary"

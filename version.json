@@ -4,6 +4,12 @@
   "release_date": "2026-09-17",
   "changelog": [
     {
+      "type": "feat",
+      "component": "dist",
+      "breaking": false,
+      "text": "Updater hardening + ops tooling: atomic staged swaps with auto-rollback, structured failure records and update-status.json, machine-readable --dry-run plan, --yes non-interactive gate, maintenance-window/proxy/channel support, platform+python+EOL compat gates, stale-version and security advisories, changelog preview, mirror sync/index tooling, fleet Ansible playbook, systemd timer units, airgap bundles, per-release diff reports, and a bats+e2e test suite covering forgery/corruption/concurrency/rollback"
+    },
+    {
       "type": "fix",
       "component": "dist",
       "breaking": false,
@@ -1465,6 +1471,12 @@
       "version": "1.2.472",
       "archive": "ProxmoxVEx-latest.tar.gz",
       "size_bytes": 18413275
+    },
+    "canary": {
+      "version": "1.2.472",
+      "archive": "ProxmoxVEx-1.2.472.tar.gz",
+      "cohort": "opt-in",
+      "size_bytes": 18413275
     }
   },
   "deltas": {},
@@ -1472,7 +1484,15 @@
     "1.2.472": {
       "support_until": "2027-09-17",
       "min_from": "1.0.0",
-      "size_bytes": 18413275
+      "size_bytes": 18413275,
+      "min_python": "3.8",
+      "platforms": [
+        "linux-x86_64",
+        "linux-aarch64"
+      ]
+    },
+    "t": {
+      "size_bytes": 951
     }
   },
   "mirrors": [
@@ -1482,5 +1502,9 @@
   "formats": [
     "tar.gz",
     "tar.zst"
+  ],
+  "platforms": [
+    "x86_64",
+    "aarch64"
   ]
 }
