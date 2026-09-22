@@ -65,3 +65,7 @@ online path:
   explicit target.
 - Rollback after an airgap update is the same `sudo ./update.sh
   --rollback` path documented in `docs/downgrading.md`.
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)

@@ -88,3 +88,7 @@ client pubkey.asc (new) ──► verifies next and future releases
 extracts the shipped `verify_rotation_doc`/`process_key_rotation`
 functions from `update.sh`, and confirms a countersigned rotation is
 accepted while an attacker-signed one is rejected.
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)

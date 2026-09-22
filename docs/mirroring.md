@@ -97,3 +97,7 @@ highest semver as latest, and points the channel at it. Clients still
 verify `version.json.asc` when signatures are published — sign the output
 with the release key (or run an unsigned internal mirror and accept the
 unsigned-metadata warning).
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)

@@ -78,3 +78,7 @@ resolution. Pins/holds don't block it. See `docs/airgap.md`.
 Deeper detail lives in `docs/upgrading.md` (the walkthrough),
 `docs/troubleshooting.md` (symptom→fix), and `docs/channels.md`
 (channels, pins, windows).
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)

@@ -78,3 +78,7 @@ If the health check fails after rollback, check `logs/update.log` and
 `docs/upgrading.md` for the forward path and `docs/channels.md` for
 pinning a release (`config/update-pin`) so the updater does not pull the
 bad version forward again.
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)

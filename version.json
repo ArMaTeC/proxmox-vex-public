@@ -7,6 +7,12 @@
       "type": "feat",
       "component": "dist",
       "breaking": false,
+      "text": "CLI/operator UX round 2: update.sh gains --help/--version/--quiet/--verbose/--json/--no-color flags, color + NO_COLOR + non-TTY handling, staged step banners with durations, success/failure summaries and remediation hints; verify-release.sh rewritten with staged human output, --quiet/--verbose/--json/--strict/--checksum-only modes and distinct exit codes; docs gain a docs/README.md index, generated flag reference, and cross-linking across all operator guides"
+    },
+    {
+      "type": "feat",
+      "component": "dist",
+      "breaking": false,
       "text": "Updater hardening + ops tooling: atomic staged swaps with auto-rollback, structured failure records and update-status.json, machine-readable --dry-run plan, --yes non-interactive gate, maintenance-window/proxy/channel support, platform+python+EOL compat gates, stale-version and security advisories, changelog preview, mirror sync/index tooling, fleet Ansible playbook, systemd timer units, airgap bundles, per-release diff reports, and a bats+e2e test suite covering forgery/corruption/concurrency/rollback"
     },
     {

@@ -10,6 +10,7 @@ python3 scripts/gen_compat.py version.json
 | Version | Python | Arch                        | EOL | Security fix |
 |---------|--------|-----------------------------|-----|--------------|
 | 1.2.472 | 3.8+   | linux-x86_64, linux-aarch64 | —   | —            |
+| t       | 3.8+   | linux-x86_64                | —   | —            |
 
 ## How the gates apply
 
@@ -27,3 +28,7 @@ python3 scripts/gen_compat.py version.json
 The per-release `releases` map in `version.json` is the source of truth;
 this table is a rendering of it. See `docs/versioning.md` for the
 numbering and support policy.
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)

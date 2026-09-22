@@ -96,6 +96,95 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # =============================================================================
+# spec 101: operator-facing output layer.
+# NO_COLOR / non-tty / dumb TERM all disable ANSI so piped logs stay clean
+# (US002/US016/US017). --quiet prints only warnings+errors (US003), --verbose
+# adds trace lines (US004), --json emits one JSON object per event (US007).
+# =============================================================================
+QUIET=0; VERBOSE=0; JSON_OUT=0
+if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ]; then
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; NC=''
+    SYM_OK="OK"; SYM_ERR="FAIL"; SYM_WARN="WARN"
+else
+    SYM_OK="✓"; SYM_ERR="✗"; SYM_WARN="⚠"
+fi
+
+# US027: single point for future i18n of operator strings.
+_() { printf '%s' "$1"; }
+
+# US015: VEX_UPDATE_LOG mirrors console output into an operator-named file —
+# the built-in update.log is an audit trail, this is a human-readable capture.
+if [ -n "${VEX_UPDATE_LOG:-}" ]; then
+    exec > >(tee -a "$VEX_UPDATE_LOG") 2>&1
+fi
+
+# US026: CI runners get no prompts and collapsible log groups where supported.
+CI_MODE=0
+if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+    CI_MODE=1
+    ASSUME_YES="${ASSUME_YES:-1}"
+fi
+ci_group() { [ "${GITHUB_ACTIONS:-}" ] && printf '::group::%s\n' "$1"; return 0; }
+ci_end()   { [ "${GITHUB_ACTIONS:-}" ] && printf '::endgroup::\n'; return 0; }
+
+_stage_start=0
+_json_event() { # US007 — machine-readable stage events for fleet tooling
+    [ "$JSON_OUT" = "1" ] || return 0
+    printf '{"type":"%s","stage":"%s","msg":"%s","ts":"%s"}\n' \
+        "$1" "${STAGE:-init}" "$(printf '%s' "$2" | sed 's/"/\\"/g')" \
+        "$(date -u +%FT%TZ)"
+}
+
+info()  { [ "$QUIET" = "1" ] && return 0; printf '%s[i]%s %s\n' "$BLUE" "$NC" "$(_ "$1")"; _json_event info "$1"; }
+ok()    { [ "$QUIET" = "1" ] && return 0; printf '%s%s%s %s\n' "$GREEN" "$SYM_OK" "$NC" "$(_ "$1")"; _json_event ok "$1"; }
+warn()  { printf '%s%s%s %s\n' "$YELLOW" "$SYM_WARN" "$NC" "$(_ "$1")" >&2; _json_event warn "$1"; }
+err()   { printf '%s%s%s %s\n' "$RED" "$SYM_ERR" "$NC" "$(_ "$1")" >&2; _json_event error "$1"; }
+# US008/US009: stage banners bracket long sections and carry elapsed time.
+step()  {
+    _elapsed=""
+    [ "$_stage_start" != "0" ] && _elapsed=" (+$(( $(date +%s) - _stage_start ))s)"
+    _stage_start=$(date +%s)
+    [ "$QUIET" = "1" ] && return 0
+    [ "$CI_MODE" = "1" ] && ci_group "$1"
+    printf '\n%s==>%s %s%s\n' "$BLUE" "$NC" "$(_ "$1")" "$_elapsed"
+    _json_event stage "$1"
+}
+vlog()  { [ "$VERBOSE" = "1" ] && printf '    %s\n' "$1"; return 0; }
+
+usage() { # US005/US029 — self-documenting flags; exits 0 on --help.
+    cat <<'USAGE'
+update.sh — in-place updater for an existing ProxmoxVEx install.
+
+Usage: ./update.sh [flags]
+
+Flags:
+  --help, -h      this text
+  --version       print the updater version
+  --yes           non-interactive (skip the confirm prompt)
+  --dry-run       print what would change; touch nothing
+  --atomic        stage into releases/<v> then swap `current` atomically
+  --rollback      repoint `current` at the previous release and restart
+  --verify        verify a release archive (see --file)
+  --verify-files  check the installed tree against its file manifest
+  --bundle FILE   update from an offline .vexbundle
+  --insecure      disable signature/TLS checks (requires VEX_I_ACCEPT_RISK=1)
+  --quiet         only warnings, errors and the final result
+  --verbose       extra trace output (commands, byte counts)
+  --json          emit one JSON event per stage on stdout
+
+Env:  ProxmoxVEx_BRANCH, VEX_UPDATE_BASE, VEX_MIRROR, VEX_UPDATE_TOKEN,
+      VEX_PROXY/VEX_NO_PROXY, VEX_CACERT, VEX_UPDATE_HOLD, NO_COLOR
+
+Exit: 0 updated/nothing-to-do · 1 failure · 2 usage error
+USAGE
+}
+# --help/--version short-circuit before any state is touched.
+for _a in "$@"; do
+    [ "$_a" = "--help" ] || [ "$_a" = "-h" ] && { usage; exit 0; }
+    [ "$_a" = "--version" ] && { echo "update.sh (ProxmoxVEx $(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$(dirname "${BASH_SOURCE[0]}")/version.json" 2>/dev/null | head -1 || echo '?'))"; exit 0; }
+done
+
+# =============================================================================
 # GitHub source selector
 # Allow testing branches with:  ProxmoxVEx_BRANCH=Testing sudo ./update.sh
 # Default remains main so existing workflows keep working.
@@ -118,7 +207,11 @@ if [ -n "${VEX_UPDATE_BASE:-}" ]; then
     GITHUB_ARCHIVE="$VEX_UPDATE_BASE/ProxmoxVEx-latest.tar.gz"
 fi
 
-die() { echo -e "${RED}$1${NC}" >&2; [ -n "${BASE_DIR:-}" ] && { fail_record "${STAGE:-unknown}" "$1"; write_status "error"; }; exit 1; }
+# spec 101/US013/US018/US030: failures name the stage and point at the doc
+# section most likely to unblock the operator — not just a bare message.
+# NOTE: kept to a single line — tests extract die() with `grep -A2 '^die()'`
+# and source it standalone, so the fallback echo keeps it working there.
+die() { if command -v err >/dev/null 2>&1; then err "$1"; [ "${STAGE:-init}" != "init" ] && err "  (stage: $STAGE)"; err "  see docs/troubleshooting.md for common fixes"; else echo -e "${RED:-}$1${NC:-}" >&2; fi; [ -n "${BASE_DIR:-}" ] && { fail_record "${STAGE:-unknown}" "$1"; write_status "error"; }; exit 1; }
 
 # =============================================================================
 # spec 093/US001: release signature verification.
@@ -1420,6 +1513,9 @@ for _arg in "$@"; do
     [ "$_arg" = "--yes" ]    && ASSUME_YES=1
     [ "$_arg" = "--insecure" ] && INSECURE=1
     [ "$_arg" = "--dry-run" ]  && DRY_RUN=1
+    [ "$_arg" = "--quiet" ]    && QUIET=1
+    [ "$_arg" = "--verbose" ]  && VERBOSE=1
+    [ "$_arg" = "--json" ]     && JSON_OUT=1
     [ "$_arg" = "--bundle" ] && BUNDLE_MODE=1
     [ "$_prev" = "--bundle" ] && BUNDLE_FILE="$_arg"
     _prev="$_arg"
@@ -1529,6 +1625,7 @@ echo -e "Current version: ${BLUE}$CURRENT_VERSION${NC}"
 
 # Fetch the latest version from the branch's version.json on GitHub.
 STAGE="check"
+step "Check for updates"
 echo -n "Checking for updates... "
 VERSION_DOC=$(mktemp)
 VERSION_SIG=$(mktemp)
@@ -1774,6 +1871,7 @@ run_post_hooks() {
 
 # =============================================================================
 STAGE="download"
+step "Download release"
 # Download the new release
 # The primary path is the branch .tar.gz archive from GitHub. If that is not
 # available, we fall back to the GitHub Trees API to enumerate every blob in the
@@ -1977,6 +2075,7 @@ fi
 # SHA256SUMS file (if any). Missing checksums are treated as a soft warning.
 if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
     STAGE="verify"
+    step "Verify archive"
     echo -n "Verifying archive integrity... "
     SHA_FILE="$TMPDIR/checksums.txt"
     # spec 093/US002: checksums.txt lives beside the archive on the
@@ -2028,6 +2127,7 @@ fi
 # of copying over the live tree.
 if [ "$ATOMIC" = "1" ] && [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
     STAGE="apply"
+    step "Apply release"
     atomic_update "$ARCHIVE" "$LATEST_VERSION"
     # US069: post-swap GC — only after the new release is live can old
     # ones be pruned without risking the rollback pair.
@@ -2185,6 +2285,7 @@ fi
 # new release never comes up. VEX_SKIP_POST_VERIFY=1 skips for runbooks.
 if [ "${VEX_SKIP_POST_VERIFY:-0}" != "1" ]; then
     STAGE="post-verify"
+    step "Verify service health"
     echo -n "Verifying service health (window ${HEALTH_TIMEOUT:-300}s)... "
     if wait_for_health "${HEALTH_URL:-http://localhost:8080/api/healthz}" "${HEALTH_TIMEOUT:-300}"; then
         echo -e "${GREEN}healthy${NC}"
@@ -2201,14 +2302,22 @@ fi
 # Done!
 echo ""
 echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
+# spec 101/US012/US019/US025: the end-of-run box doubles as the runbook —
+# version delta, elapsed time, backup path, rollback + next-step commands.
+_TOTAL=$(( $(date +%s) - ${UPDATE_T0%???} ))
+echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║              Update Complete! ✓                            ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  Updated to version: ${GREEN}$LATEST_VERSION${NC}"
+echo -e "  Took:               ${_TOTAL}s"
 echo -e "  Backup saved to:    ${BLUE}$BACKUP_DIR${NC}"
 echo ""
+echo "Next steps:"
+echo "  • check the version:   curl -sk https://localhost:5000/api/version"
+echo "  • watch the logs:      journalctl -u ProxmoxVEx -f"
 echo "If something went wrong, restore with:"
-echo "  cp -r $BACKUP_DIR/* ."
+echo "  cp -r $BACKUP_DIR/* .          # or: ./update.sh --rollback"
 echo ""
 
 # US071: successful outcome ping — anonymous, opt-in only, best-effort.

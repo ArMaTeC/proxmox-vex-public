@@ -123,3 +123,7 @@ ansible-playbook -i inventory.ini -e serial_batch=5 -e update_window=03:00-05:00
 Each host still runs `update.sh --yes` inside `VEX_UPDATE_WINDOW`, so the
 same signature, atomic-swap and auto-rollback guarantees apply per host;
 the gate only decides whether the *next* host proceeds.
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)

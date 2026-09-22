@@ -47,3 +47,7 @@ Anything not meeting all three goes through the normal channel pipeline.
 
 Within 7 days the post-review confirms or reverts; either way a normal
 release follows the hotfix so stable never sits on an unreviewed base.
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)

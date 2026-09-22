@@ -101,3 +101,7 @@ changes without extracting both archives:
 curl -LO https://proxmoxvex.com/dl/diff-1.2.471-to-1.2.472.txt
 grep -v '^#' diff-1.2.471-to-1.2.472.txt
 ```
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)

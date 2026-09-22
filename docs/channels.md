@@ -65,3 +65,7 @@ If the configured channel has no published pointer, the updater aborts with
 `no release for channel '<name>' published` rather than silently falling
 back — a channel that publishes nothing is a release-engineering bug, not a
 client condition to hide.
+
+---
+
+See also: [documentation index](README.md) · [upgrading](upgrading.md) · [troubleshooting](troubleshooting.md)
