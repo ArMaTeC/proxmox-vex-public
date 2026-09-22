@@ -1,0 +1,57 @@
+name: update-matrix
+
+# spec 093/US055: prove every supported upgrade path — the matrix runs the
+# e2e harness from each of the last N supported versions to the candidate
+# release. A failing cell names its source version.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: "comma-separated source versions (blank = auto from tags)"
+        required: false
+        default: ""
+
+jobs:
+  pick-baselines:
+    runs-on: ubuntu-24.04
+    outputs:
+      from: ${{ steps.pick.outputs.from }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with: { fetch-depth: 0 }
+      - id: pick
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.versions }}" ]; then
+            echo "${{ inputs.versions }}" | tr ',' '\n' > /tmp/from.txt
+          else
+            # last 4 supported baselines: recent release tags, sorted,
+            # excluding the candidate tag itself
+            git tag -l 'v*' | sort -V | tail -5 | head -4 | sed 's/^v//' > /tmp/from.txt
+          fi
+          cat /tmp/from.txt
+          jq -Rsc 'split("\n")|map(select(length>0))' /tmp/from.txt > /tmp/from.json
+          echo "from=$(cat /tmp/from.json)" >> "$GITHUB_OUTPUT"
+
+  update-matrix:
+    name: "update from ${{ matrix.from }}"
+    needs: pick-baselines
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false   # every baseline reports — don't hide later failures
+      matrix:
+        from: ${{ fromJSON(needs.pick-baselines.outputs.from) }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Build the candidate release
+        run: bash scripts/build-release.sh
+      - name: "E2E: ${{ matrix.from }} → ${{ github.ref_name }}"
+        run: |
+          set -euo pipefail
+          VEX_UPDATE_BASE="file://$PWD/dist" \
+            bash scripts/e2e-update-test.sh \
+              --from "${{ matrix.from }}" --workdir "/tmp/vex-${{ matrix.from }}"
+        # failure output above carries the cell's source version
