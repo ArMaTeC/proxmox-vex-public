@@ -3,7 +3,7 @@
 # bounded window, auto-rollback + logged incident on failure. The
 # auto-rollback itself is guarded (max attempts → alert, don't loop).
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

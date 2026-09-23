@@ -3,7 +3,7 @@
 # plaintext http:// base before any request; file:// is allowed only for
 # airgap/bundle mode. Optional VEX_CACERT for private CAs.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

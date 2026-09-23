@@ -2,7 +2,7 @@
 # Spec 093/US005: version.json ships a detached signature over canonical
 # (sorted-key) JSON; update.sh verifies it before trusting the contents.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

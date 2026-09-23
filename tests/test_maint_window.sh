@@ -2,7 +2,7 @@
 # Spec 093/US019: maintenance-window gate — updates only apply inside the
 # configured window; outside, defer cleanly with the window info.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

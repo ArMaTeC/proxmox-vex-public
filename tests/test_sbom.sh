@@ -2,7 +2,7 @@
 # Spec 093/US009: every release ships a CycloneDX SBOM generated from
 # lockfiles (not hand-edits), signed alongside the artifacts.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

@@ -3,7 +3,7 @@
 # renders the matrix from version.json releases metadata and
 # docs/compatibility.md publishes it.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 source tests/lib.sh 2>/dev/null || true
 
 PASS=0; FAIL=0

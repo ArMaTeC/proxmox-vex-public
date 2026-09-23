@@ -56,6 +56,7 @@ check "activated as service user"   "readlink $A/install/current | grep -q 'rele
 # B: root-owned install — clear error, live release untouched
 B="$SCRATCH/B"; build_fixture "$B"
 chmod -R a+rX "$B/dist"
+# shellcheck disable=SC2034
 out=$(as_nobody "$B/install" "$B/dist"); rc=$?
 check "root-owned run fails"        "test $rc -ne 0"
 check "names the fix"               "echo \"\$out\" | grep -qi 'write access\|owner\|sudo'"

@@ -3,7 +3,7 @@
 # (check, download, verify, swap, rollback) lands a timestamped line in
 # logs/update.log (or shared/logs/), rotated at >1MB.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

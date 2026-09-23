@@ -5,7 +5,7 @@
 # confirm verification fails. Runs the real shipped signature + key
 # against gpg in a scratch keyring — no repo state is touched.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

@@ -3,7 +3,7 @@
 # build → sign → stage → verify → promote with a production environment
 # gate; repeatable and auditable, no manual steps.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 WF=".github/workflows/release.yml"
 PASS=0; FAIL=0

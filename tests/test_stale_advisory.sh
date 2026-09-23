@@ -3,7 +3,7 @@
 # many published releases are newer than the installed version and how
 # many of those carry security fixes.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

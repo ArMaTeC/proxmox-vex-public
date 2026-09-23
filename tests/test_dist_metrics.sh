@@ -2,7 +2,7 @@
 # Spec 093/US039: dist-host download metrics — structured access log +
 # rollup to Prometheus textfile: per-version downloads and error rates.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

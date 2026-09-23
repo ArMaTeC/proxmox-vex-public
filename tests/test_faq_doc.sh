@@ -2,7 +2,7 @@
 # Spec 093/US085: update-mechanism FAQ — docs/faq-updates.md answers the
 # recurring admin questions and links to the detailed docs.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

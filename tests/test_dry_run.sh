@@ -3,7 +3,7 @@
 # version, archive, size, step list) and makes ZERO changes: no lock, no
 # staging dir, no backup, no swap.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -33,13 +33,13 @@ cat > "$SCRATCH/dist/version.json" <<JSON
  "mirrors":["file://$SCRATCH/dist"]}
 JSON
 
-cd "$SCRATCH/install"
+cd "$SCRATCH/install" || exit
 # HEALTH_URL stub: a scratch install has no live app — same hook the
 # e2e harness uses; a real deploy leaves it alone.
 out=$(VEX_UPDATE_BASE="file://$SCRATCH/dist" VEX_I_ACCEPT_RISK=1 \
       HEALTH_URL="file:///dev/null" \
       bash update.sh --dry-run --insecure --atomic --yes 2>&1); rc=$?
-cd - >/dev/null
+cd - >/dev/null || exit
 
 [ $rc -eq 0 ] && ok "dry-run exits 0" || bad "dry-run exits 0 (rc=$rc: $(echo "$out"|tail -3))"
 echo "$out" | grep -q 'dry-run' && ok "plan printed" || bad "plan printed"

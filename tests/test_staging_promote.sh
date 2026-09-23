@@ -2,7 +2,7 @@
 # Spec 093/US035: staging area + promote workflow — releases land in
 # staging/, pass an e2e verification, then promote to public.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

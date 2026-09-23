@@ -3,7 +3,7 @@
 # pipeless shell; without --yes and without a TTY the updater refuses with
 # a message naming --yes instead of silently cancelling.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -36,11 +36,11 @@ JSON
 
 # (a) pipeless shell WITHOUT --yes → refuses, names --yes, changes nothing
 mk_inst "$SCRATCH/inst-a" a
-cd "$SCRATCH/inst-a"
+cd "$SCRATCH/inst-a" || exit
 out=$(VEX_UPDATE_BASE="file://$SCRATCH/dist-a" VEX_I_ACCEPT_RISK=1 \
       HEALTH_URL="file:///dev/null" \
       bash update.sh --insecure --atomic </dev/null 2>&1); rc=$?
-cd - >/dev/null
+cd - >/dev/null || exit
 [ $rc -ne 0 ] && ok "no-TTY without --yes refuses" || bad "no-TTY without --yes refuses (rc=$rc)"
 echo "$out" | grep -q '\-\-yes' && ok "refusal names --yes" || bad "refusal names --yes"
 [ "$(cat "$SCRATCH/inst-a/.active-version")" = "1.0.0" ] \
@@ -48,11 +48,11 @@ echo "$out" | grep -q '\-\-yes' && ok "refusal names --yes" || bad "refusal name
 
 # (b) pipeless shell WITH --yes → full update completes, no prompt
 mk_inst "$SCRATCH/inst-b" b
-cd "$SCRATCH/inst-b"
+cd "$SCRATCH/inst-b" || exit
 out=$(VEX_UPDATE_BASE="file://$SCRATCH/dist-b" VEX_I_ACCEPT_RISK=1 \
       HEALTH_URL="file:///dev/null" VEX_SKIP_POST_VERIFY=1 \
       bash update.sh --insecure --atomic --yes </dev/null 2>&1); rc=$?
-cd - >/dev/null
+cd - >/dev/null || exit
 [ $rc -eq 0 ] && ok "--yes completes without TTY" || bad "--yes completes without TTY (rc=$rc: $(echo "$out"|tail -3))"
 [ "$(cat "$SCRATCH/inst-b/.active-version")" = "2.0.0" ] \
     && ok "update applied (2.0.0 active)" || bad "update applied"

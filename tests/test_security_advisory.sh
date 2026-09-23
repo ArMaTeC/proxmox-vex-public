@@ -3,7 +3,7 @@
 # fix vulnerabilities surface a distinct SECURITY UPDATE notice with the
 # advisory URL/severity.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

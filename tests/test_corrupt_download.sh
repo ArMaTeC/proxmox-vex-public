@@ -3,7 +3,7 @@
 # for the fixture archive, flip one byte in the download, and prove the
 # updater rejects it at the verify stage with the live release untouched.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -37,6 +37,7 @@ JSON
 # flip one byte mid-archive — a truncated/corrupted transfer
 printf 'X' | dd of="$SCRATCH/dist/ProxmoxVEx-2.0.0.tar.gz" bs=1 seek=1024 conv=notrunc 2>/dev/null
 
+# shellcheck disable=SC2034
 out=$(cd "$SCRATCH/install" && \
       VEX_UPDATE_BASE="file://$SCRATCH/dist" \
       VEX_I_ACCEPT_RISK=1 HEALTH_URL="file:///dev/null" HEALTH_TIMEOUT=5 \

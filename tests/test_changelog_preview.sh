@@ -3,7 +3,7 @@
 # changelog entries newer than the installed version before the confirm
 # prompt, flagging breaking ones.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -32,6 +32,7 @@ EOF
 awk '/^show_changelog\(\)/,/^}/' update.sh > "$SCRATCH/fn.sh"
 check "extraction non-empty"      "test -s $SCRATCH/fn.sh"
 
+# shellcheck disable=SC2034
 OUT=$(bash -c ". $SCRATCH/fn.sh; show_changelog $SCRATCH/v.json 1.2.472" 2>&1)
 check "shows newer entries"       "echo \"\$OUT\" | grep -q '1.2.475'"
 check "includes all newer"        "echo \"\$OUT\" | grep -q '1.2.474' && echo \"\$OUT\" | grep -q '1.2.473'"

@@ -2,7 +2,7 @@
 # Spec 093/US012: `update.sh --rollback` reactivates the previous release
 # symlink, reverts DB state when possible, and logs the rollback.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

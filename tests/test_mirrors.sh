@@ -2,7 +2,7 @@
 # Spec 093/US027: mirror list in release metadata — when the primary host is
 # unreachable, the updater tries listed mirrors in order.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

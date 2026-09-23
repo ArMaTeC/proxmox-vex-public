@@ -6,7 +6,7 @@
 # properly countersigned rotation installs the new key and a forged
 # rotation is rejected.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

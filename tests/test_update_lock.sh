@@ -2,7 +2,7 @@
 # Spec 093/US017: exclusive update lock via flock — concurrent runs abort
 # with the holder's info; killed holders release automatically (kernel).
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

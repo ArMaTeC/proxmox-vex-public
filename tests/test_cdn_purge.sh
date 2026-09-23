@@ -2,7 +2,7 @@
 # Spec 093/US036: CDN invalidation on publish — metadata paths are purged so
 # edges can't serve a stale trust root after a release goes live.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

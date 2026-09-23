@@ -4,7 +4,7 @@
 # NO_PROXY with a localhost default, and the proxy value is never logged
 # (it may embed credentials).
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -52,14 +52,14 @@ cp update.sh "$SCRATCH/inst/"
 ln -sfn "$SCRATCH/inst/releases/1.0.0" "$SCRATCH/inst/current"
 echo '1.0.0' > "$SCRATCH/inst/.active-version"
 
-cd "$SCRATCH/inst"
+cd "$SCRATCH/inst" || exit
 # VEX_NO_PROXY overrides the localhost default so 127.0.0.1 routes via the
 # proxy — otherwise the (correct) loopback bypass hides the CONNECT.
 VEX_UPDATE_BASE="https://127.0.0.1:9" VEX_PROXY="http://127.0.0.1:$PPORT" \
     VEX_NO_PROXY="example.invalid" \
     VEX_I_ACCEPT_RISK=1 timeout 20 bash update.sh --insecure --yes </dev/null \
     >"$SCRATCH/run.log" 2>&1
-cd - >/dev/null
+cd - >/dev/null || exit
 wait $PROXY_PID 2>/dev/null || true
 
 if [ -f "$SCRATCH/connect.log" ] && grep -qi 'CONNECT\|127.0.0.1' "$SCRATCH/connect.log"; then
@@ -72,7 +72,7 @@ fi
 # NO_PROXY functional: localhost bypass honored
 out=$(NO_PROXY="127.0.0.1" VEX_PROXY="http://127.0.0.1:1" \
       bash -c 'export HTTPS_PROXY="$VEX_PROXY" NO_PROXY; curl -s --max-time 2 -o /dev/null -w "%{http_code}" file:///dev/null 2>/dev/null; echo done')
-echo "$out" | grep -q done && ok "NO_PROXY exported" || bad "NO_PROXY exported"
+echo "$out" | grep -q "done" && ok "NO_PROXY exported" || bad "NO_PROXY exported"
 
 rm -rf "$SCRATCH"
 

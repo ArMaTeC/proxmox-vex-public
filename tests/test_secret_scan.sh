@@ -2,7 +2,7 @@
 # Spec 093/US043: pre-publish secret scan — a planted credential in the build
 # tree or the packaged tarball must abort the release, naming the file.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

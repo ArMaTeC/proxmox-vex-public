@@ -2,7 +2,7 @@
 # Spec 093/US010: release pubkey bundled inside releases, published on
 # multiple channels, fingerprint documented, update.sh fallback chain.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

@@ -3,7 +3,7 @@
 # first-time admin through preflight, update, verify, and rollback using
 # the real flags the updater supports.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

@@ -57,6 +57,7 @@ A="$SCRATCH/A"; build_fixture "$A"
 canon "$A/dist/version.json"
 gpg --batch --quiet --homedir "$EVIL" --armor \
     --detach-sign -o "$A/dist/version.json.asc" "$A/dist/version.json.canon"
+# shellcheck disable=SC2034
 out=$(run_update "$A/install" "$A/dist"); rc=$?
 check "forged metadata rejected"      "test $rc -ne 0"
 check "untrusted metadata named"      "echo \"\$out\" | grep -qi 'untrusted\|signature FAILED'"
@@ -67,6 +68,7 @@ B="$SCRATCH/B"; build_fixture "$B"
 env -u GNUPGHOME bash scripts/sign-version.sh "$B/dist/version.json" >/dev/null 2>&1
 gpg --batch --quiet --homedir "$EVIL" --armor \
     --detach-sign -o "$B/dist/ProxmoxVEx-2.0.0.tar.gz.asc" "$B/dist/ProxmoxVEx-2.0.0.tar.gz"
+# shellcheck disable=SC2034
 out=$(run_update "$B/install" "$B/dist"); rc=$?
 check "forged archive sig rejected"   "test $rc -ne 0"
 check "archive sig failure named"     "echo \"\$out\" | grep -qi 'signature verification FAILED\|does not verify'"
@@ -79,7 +81,7 @@ env -u GNUPGHOME bash scripts/sign-version.sh "$C/dist/version.json" >/dev/null 
 env -u GNUPGHOME gpg --batch --quiet --armor --detach-sign \
     -u "ProxmoxVEx Release Signing <releases@proxmoxvex.com>" \
     -o "$C/dist/ProxmoxVEx-2.0.0.tar.gz.asc" "$C/dist/ProxmoxVEx-2.0.0.tar.gz"
-out=$(run_update "$C/install" "$C/dist"); rc=$?
+run_update "$C/install" "$C/dist" >/dev/null; rc=$?
 check "control: real sig accepted"    "test $rc -eq 0"
 
 echo ""

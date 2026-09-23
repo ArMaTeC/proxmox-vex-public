@@ -3,7 +3,7 @@
 # current health, required tools — aborts BEFORE any download;
 # --force overrides with a logged warning.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

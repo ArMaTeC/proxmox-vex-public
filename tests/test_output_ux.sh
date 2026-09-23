@@ -3,7 +3,7 @@
 # non-tty strip ANSI, --quiet suppresses info lines, verify-release.sh
 # supports --version/--strict/--json.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -25,7 +25,7 @@ POUT=$(./update.sh --help | cat)
 printf '%s' "$POUT" | grep -q $'\033' && bad "piped output has ANSI" || ok "non-tty strips ANSI"
 
 # verify-release.sh flags
-V=$(./verify-release.sh --version 2>&1); RC=$?
+./verify-release.sh --version >/dev/null 2>&1; RC=$?
 [ $RC -eq 0 ] && ok "verify --version" || bad "verify --version rc=$RC"
 ./verify-release.sh 2>/dev/null; RC=$?
 [ $RC -eq 3 ] && ok "verify no-args exits 3" || bad "verify no-args rc=$RC"

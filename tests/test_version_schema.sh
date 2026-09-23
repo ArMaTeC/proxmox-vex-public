@@ -2,7 +2,7 @@
 # Spec 093/US021: version.json JSON schema + validator — malformed metadata
 # fails CI with the offending field named.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

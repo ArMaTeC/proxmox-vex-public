@@ -3,7 +3,7 @@
 # combining download counts, telemetry outcomes, and failure stages,
 # emitted by deploy/metrics.sh --dashboard for the internal vhost.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

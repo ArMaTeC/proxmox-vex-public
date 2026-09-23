@@ -2,7 +2,7 @@
 # Spec 093/US040: parallel .tar.zst artifacts — zstd-capable hosts get the
 # faster/smaller format; others transparently fall back to .tar.gz.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

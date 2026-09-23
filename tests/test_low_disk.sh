@@ -38,6 +38,7 @@ cat > "$SCRATCH/dist/version.json" <<JSON
  "mirrors":["file://$SCRATCH/dist"]}
 JSON
 
+# shellcheck disable=SC2034
 out=$(cd "$SCRATCH/install" && \
       VEX_UPDATE_BASE="file://$SCRATCH/dist" \
       VEX_I_ACCEPT_RISK=1 HEALTH_URL="file:///dev/null" HEALTH_TIMEOUT=5 \

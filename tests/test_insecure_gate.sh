@@ -2,7 +2,7 @@
 # Spec 093/US042: --insecure requires VEX_I_ACCEPT_RISK=1 — a copied command
 # line alone can never disable signature/TLS verification.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

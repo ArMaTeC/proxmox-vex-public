@@ -3,7 +3,7 @@
 # permissive host must not land world-writable or over-open modes: dirs 755,
 # files 644, executables 755, config secrets 600.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

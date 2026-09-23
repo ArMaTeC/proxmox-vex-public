@@ -2,7 +2,7 @@
 # Spec 093/US037: latency-based mirror selection — among reachable mirrors
 # the updater picks the fastest (measured), not just the first listed.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

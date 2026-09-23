@@ -3,7 +3,7 @@
 # backups/pre-update-*/state.tgz captures config/, ssl/ and data/ before
 # the swap; the last 5 state backups are retained.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -38,7 +38,7 @@ tar -tzf "$SCRATCH/inst"/backups/pre-update-*/state.tgz 2>/dev/null | grep -q 's
     && ok "ssl keys captured" || bad "ssl keys captured"
 
 # retention: 7 runs (sleep for distinct timestamps) → at most 5 dirs
-for i in 1 2 3 4 5 6 7; do
+for _ in 1 2 3 4 5 6 7; do
     BASE_DIR="$SCRATCH/inst" bash -c "source '$SCRATCH/fn.sh'; backup_state" >/dev/null 2>&1
     sleep 1.1
 done

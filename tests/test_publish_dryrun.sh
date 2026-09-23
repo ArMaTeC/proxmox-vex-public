@@ -2,7 +2,7 @@
 # Spec 093/US059: publish --dry-run — lists the planned uploads/swaps and
 # makes ZERO changes (no ssh, no rsync, no symlink writes).
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

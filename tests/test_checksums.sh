@@ -5,7 +5,7 @@
 # update.sh must verify the downloaded archive against the published
 # manifest (matching the real archive name, not a placeholder).
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

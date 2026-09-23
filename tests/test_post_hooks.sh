@@ -3,7 +3,7 @@
 # hooks.d/ run after the swap with (old,new) version args; a failing hook
 # warns but never aborts the update; non-executables are skipped.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

@@ -42,7 +42,7 @@ echo 'marker-rb' > "$SCRATCH/install/shared/data/marker.txt" 2>/dev/null \
 echo 'post-update' >> "$SCRATCH/install/config/app.conf"
 
 # 3. rollback
-out=$(cd "$SCRATCH/install" && bash update.sh --rollback 2>&1); rc=$?
+(cd "$SCRATCH/install" && bash update.sh --rollback) >/dev/null 2>&1; rc=$?
 check "rollback exits clean"          "test $rc -eq 0"
 check "prior version serving"         "readlink $SCRATCH/install/current | grep -q 'releases/1.0.0$'"
 check "active version reverted"       "grep -q '^1.0.0$' $SCRATCH/install/.active-version"

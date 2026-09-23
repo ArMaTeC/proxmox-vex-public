@@ -3,7 +3,7 @@
 # rollback, in one command. Runs locally against file:// artifacts; --docker
 # uses a clean container when docker is available.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

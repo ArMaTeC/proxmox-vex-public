@@ -3,7 +3,7 @@
 # immediately on mid-pipe failures and unbound variables, not continue on
 # half-broken state. Expected-failure sites carry explicit `|| true`.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

@@ -38,6 +38,7 @@ run_update() {
 # case 1: truncated JSON
 A="$SCRATCH/A"; build_install "$A"
 echo '{"version":"2.0.0","channels":{"stable":{"vers' > "$A/dist/version.json"
+# shellcheck disable=SC2034
 out=$(run_update "$A/install" "$A/dist"); rc=$?
 check "truncated aborts"              "test $rc -ne 0"
 check "parse failure named"           "echo \"\$out\" | grep -qi 'malformed\|invalid\|required keys'"
@@ -47,6 +48,7 @@ check "install untouched (truncated)" "readlink $A/install/current | grep -q 're
 # case 2: wrong types (version is an array)
 B="$SCRATCH/B"; build_install "$B"
 echo '{"version":[2,0,0],"channels":{}}' > "$B/dist/version.json"
+# shellcheck disable=SC2034
 out=$(run_update "$B/install" "$B/dist"); rc=$?
 check "wrong-typed aborts"            "test $rc -ne 0"
 check "type failure named"            "echo \"\$out\" | grep -qi 'malformed\|invalid\|required keys\|version'"
@@ -54,6 +56,7 @@ check "type failure named"            "echo \"\$out\" | grep -qi 'malformed\|inv
 # case 3: missing channels
 C="$SCRATCH/C"; build_install "$C"
 echo '{"version":"2.0.0"}' > "$C/dist/version.json"
+# shellcheck disable=SC2034
 out=$(run_update "$C/install" "$C/dist"); rc=$?
 check "missing-keys aborts"           "test $rc -ne 0"
 check "missing keys named"            "echo \"\$out\" | grep -qi 'malformed\|missing\|required keys\|channels'"
@@ -62,6 +65,7 @@ check "missing keys named"            "echo \"\$out\" | grep -qi 'malformed\|mis
 D="$SCRATCH/D"; build_install "$D"
 { echo '{"version":"2.0.0","channels":{},"pad":"'; head -c 2200000 /dev/zero | tr '\0' 'x'; echo '"}'; } \
     > "$D/dist/version.json"
+# shellcheck disable=SC2034
 out=$(run_update "$D/install" "$D/dist"); rc=$?
 check "oversized aborts"              "test $rc -ne 0"
 check "size named"                    "echo \"\$out\" | grep -qi 'too large\|size'"
@@ -76,7 +80,7 @@ cat > "$E/dist/version.json" <<JSON
  "channels":{"stable":{"version":"2.0.0","archive":"ProxmoxVEx-2.0.0.tar.gz"}},
  "mirrors":["file://$E/dist"]}
 JSON
-out=$(run_update "$E/install" "$E/dist"); rc=$?
+run_update "$E/install" "$E/dist" >/dev/null; rc=$?
 check "valid doc accepted"            "test $rc -eq 0"
 
 echo ""

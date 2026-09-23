@@ -4,7 +4,7 @@
 # The release workflow must emit SLSA3 provenance via the official
 # generator, and docs/verify.md must tell operators how to verify it.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

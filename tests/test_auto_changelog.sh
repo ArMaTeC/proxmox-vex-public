@@ -3,7 +3,7 @@
 # tags become structured changelog entries (matching version.json's
 # object shape from US026): feat→feature, fix→fix, BREAKING→breaking.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -27,7 +27,7 @@ git commit -qm "feat(api): add delta endpoint" --allow-empty
 git commit -qm "fix(updater): resume off-by-one" --allow-empty
 git commit -qm "feat!: drop legacy config format" --allow-empty
 git commit -qm "docs: tweak readme" --allow-empty
-cd - >/dev/null
+cd - >/dev/null || exit
 
 python3 scripts/gen-changelog.py --repo "$SCRATCH" --from v1.0.0 --to HEAD \
     --version 9.9.9 --out "$SCRATCH/cl.json" >/dev/null 2>&1

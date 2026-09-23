@@ -3,7 +3,7 @@
 # manifest consistency, scriptable exit codes, human-readable output.
 # Exit codes: 0 ok, 1 sig fail, 2 checksum fail, 3 missing files.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

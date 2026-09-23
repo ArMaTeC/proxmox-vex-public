@@ -3,7 +3,7 @@
 # token comes from a mode-0600 file or the env, is handed to curl via a -K
 # config file (never a -H cmdline arg → /proc/cmdline), and never logged.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

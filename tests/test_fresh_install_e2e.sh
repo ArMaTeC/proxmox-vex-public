@@ -24,6 +24,7 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 # the real install path on a clean OS: extract → deps + postgres → boot → healthz
+# shellcheck disable=SC2034
 out=$(timeout 600 docker run --rm -v "$PWD:/src:ro" debian:stable-slim bash -c '
     set -e
     export DEBIAN_FRONTEND=noninteractive

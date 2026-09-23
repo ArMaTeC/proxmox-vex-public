@@ -3,7 +3,7 @@
 # host's cert pubkey so a valid-CA MITM can't intercept; VEX_TLS_PIN_BACKUP
 # keeps updates working through a cert rotation.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

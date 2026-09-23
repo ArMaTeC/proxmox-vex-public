@@ -3,7 +3,7 @@
 # emits dist/deps-freeze.json with every pinned dep + hash; auditors diff
 # manifests between releases to see exactly what changed.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

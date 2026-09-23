@@ -3,7 +3,7 @@
 # test suite + frontend build BEFORE any artifact is built; a red upstream
 # gate kills the release.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 WF=".github/workflows/release.yml"
 PASS=0; FAIL=0

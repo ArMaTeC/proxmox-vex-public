@@ -2,7 +2,7 @@
 # Spec 093/US038: -latest pointer consistency — the quick-start URL redirects
 # to the versioned artifact via a generated conf include written by publish.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

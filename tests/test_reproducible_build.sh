@@ -2,7 +2,7 @@
 # Spec 093/US006: deterministic release tarballs — normalized mtimes,
 # ordering, ownership; two builds of one tree produce identical sha256.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

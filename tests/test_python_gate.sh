@@ -2,7 +2,7 @@
 # Spec 093/US029: python version gate — releases declare min/max python and
 # the updater refuses incompatible targets before downloading.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

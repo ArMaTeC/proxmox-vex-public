@@ -3,7 +3,7 @@
 # appends {version,sha256,ts}; the log is detached-signed; update.sh
 # warns (not blocks) when an artifact diverges from the log.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

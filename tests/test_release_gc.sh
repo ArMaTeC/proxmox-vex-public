@@ -3,7 +3,7 @@
 # (default 3) plus always the active + previous (rollback) release; the
 # rest are pruned and logged. Stage dirs and non-release files untouched.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

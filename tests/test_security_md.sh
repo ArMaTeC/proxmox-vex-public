@@ -2,7 +2,7 @@
 # Spec 093/US082: SECURITY.md disclosure policy at repo root — contact,
 # PGP key pointer, scope, and SLA commitments.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

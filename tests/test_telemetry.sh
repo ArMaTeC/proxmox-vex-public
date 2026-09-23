@@ -3,7 +3,7 @@
 # anonymous outcome ping (from,to,result,ms) to the telemetry endpoint;
 # unset/disabled sends nothing. Best-effort: a failed POST never aborts.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -32,10 +32,10 @@ SH
 chmod +x "$SCRATCH/bin/curl"
 
 # (a) opted IN → POST fires with anonymous fields
-out=$(SCRATCH_OUT="$SCRATCH" PATH="$SCRATCH/bin:$PATH" \
+SCRATCH_OUT="$SCRATCH" PATH="$SCRATCH/bin:$PATH" \
       VEX_TELEMETRY=1 VEX_TELEMETRY_URL="https://t.example/x" \
       CURRENT_VERSION=1.0.0 LATEST_VERSION=2.0.0 \
-      bash -c "source '$SCRATCH/fn.sh'; report_outcome ok 1234" 2>&1)
+      bash -c "source '$SCRATCH/fn.sh'; report_outcome ok 1234" >/dev/null 2>&1
 [ -f "$SCRATCH/curl-body.txt" ] && ok "ping sent when opted in" || bad "ping sent when opted in"
 grep -q '"from":"1.0.0"' "$SCRATCH/curl-body.txt" 2>/dev/null && ok "from version sent" || bad "from version sent"
 grep -q '"to":"2.0.0"'   "$SCRATCH/curl-body.txt" 2>/dev/null && ok "to version sent"   || bad "to version sent"

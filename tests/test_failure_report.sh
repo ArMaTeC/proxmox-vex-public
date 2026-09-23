@@ -3,7 +3,7 @@
 # {stage, error, from, to, ts} to logs/update-failure.json with paths and
 # secrets stripped; opted-in telemetry POSTs it. The ERR trap feeds it.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -24,8 +24,8 @@ SCRATCH=$(mktemp -d)
 awk '/^fail_record\(\)/,/^}/' update.sh > "$SCRATCH/fn.sh"
 
 BASE="$SCRATCH/app"; mkdir -p "$BASE"
-out=$(BASE_DIR="$BASE" CURRENT_VERSION=1.0.0 LATEST_VERSION=2.0.0 \
-      bash -c "source '$SCRATCH/fn.sh'; fail_record download 'curl failed /tmp/secret/creds.pem badly'" 2>&1); rc=$?
+(BASE_DIR="$BASE" CURRENT_VERSION=1.0.0 LATEST_VERSION=2.0.0 \
+      bash -c "source '$SCRATCH/fn.sh'; fail_record download 'curl failed /tmp/secret/creds.pem badly'") >/dev/null 2>&1; rc=$?
 [ $rc -eq 0 ] && ok "records without crashing" || bad "records without crashing (rc=$rc)"
 
 F="$BASE/shared/logs/update-failure.json"

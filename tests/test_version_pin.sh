@@ -2,7 +2,7 @@
 # Spec 093/US018: version pinning & update hold — operators can freeze the
 # install on an exact version or hold all updates during change freezes.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

@@ -3,7 +3,7 @@
 # job matches published freeze manifests against a vuln feed; a known-vuln
 # dep produces an advisory naming the CVE id.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
@@ -32,7 +32,7 @@ cat > "$SCRATCH/feed.json" <<'JSON'
 JSON
 
 out=$(bash scripts/cve-check.sh --feed-file "$SCRATCH/feed.json" \
-      "$SCRATCH/deps-freeze.json" 2>&1); rc=$?
+      "$SCRATCH/deps-freeze.json" 2>&1)
 [ -s cve-report.txt ] || out=$(bash scripts/cve-check.sh --feed-file "$SCRATCH/feed.json" \
       --report "$SCRATCH/cve-report.txt" "$SCRATCH/deps-freeze.json" 2>&1)
 REPORT="${SCRATCH}/cve-report.txt"

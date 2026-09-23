@@ -3,7 +3,7 @@
 # (stale metadata = stale trust root); versioned tarballs are immutable;
 # the -latest pointer may cache only briefly.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

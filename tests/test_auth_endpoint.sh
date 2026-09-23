@@ -3,7 +3,7 @@
 # requires a bearer token; unauthenticated fetches 401, token fetches pass.
 # update.sh forwards VEX_UPDATE_TOKEN as the Authorization header.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

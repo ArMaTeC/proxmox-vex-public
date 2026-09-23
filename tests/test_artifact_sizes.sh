@@ -2,7 +2,7 @@
 # Spec 093/US028: artifact sizes in version.json — preflight can size the
 # download without a network HEAD probe.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }

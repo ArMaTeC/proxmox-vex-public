@@ -2,7 +2,7 @@
 # Spec 093/US034: optional bandwidth cap — VEX_DOWNLOAD_LIMIT throttles
 # artifact downloads so updates don't saturate a shared link.
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); echo "  ok   - $1"; }
