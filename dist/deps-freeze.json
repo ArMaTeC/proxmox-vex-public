@@ -10,11 +10,11 @@
     "requests-toolbelt": ">=1.0.0",
     "urllib3": ">=2.7.0",
     "dnspython": ">=2.7.0",
-    "cryptography": ">=49.0.0,<52",
+    "cryptography": ">=50.0.0,<52",
     "pyopenssl": ">=26.0.0",
     "argon2-cffi": ">=23.0.0",
     "pyasn1": ">=0.6.4",
-    "paramiko": ">=4.0.0",
+    "paramiko": ">=5.0.0",
     "websockets": ">=11.0",
     "websocket-client": ">=1.6.0",
     "h11": ">=0.16.0",
@@ -36,10 +36,10 @@
     "idna": ">=3.15",
     "psycopg2-binary": ">=2.9.9,<3",
     "kubernetes": ">=29.0.0,<37.0.0",
-    "scapy": ">=2.5.0",
+    "scapy": ">=2.7.0",
     "scikit-learn": ">=1.5.0",
     "pandas": ">=2.1.0"
   },
   "npm": {},
-  "deps_sha256": "cad804bc8dda83c264c63c965607fad4b9eab528c119640abc0a40969c875cfb"
+  "deps_sha256": "834a0ade916bb3a089092047725cfaf664e3558a17c5ebb89bf5a05e16e580c6"
 }
