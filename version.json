@@ -3,7 +3,13 @@
   "build": "2026.09.17",
   "release_date": "2026-09-17",
   "changelog": [
+    
     {
+     "type": "chore",
+     "component": "ci",
+     "breaking": false,
+     "text": "spec 103: release workflow runs on Python 3.14 (project floor >=3.14)"
+    },{
       "type": "feat",
       "component": "dist",
       "breaking": false,
