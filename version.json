@@ -3,13 +3,72 @@
   "build": "2026.09.24",
   "release_date": "2026-09-24",
   "changelog": [
-    "1.2.500 (2026-09-24) - Build and serve",
-    "1.2.500 (2026-09-24) - spec 103: Python 3.14.7 runtime upgrade \u2014 `requires-python` floor raised `>=3.8`\u2192`>=3.14` (`version.json min_python` likewise). Compatibility: `datetime.utcnow()`/`utcfromtimestamp()` migrated to `datetime.now(UTC)`/`fromtimestamp(ts, UTC)` in core/manager.py, api/pbs.py, api/site_recovery.py, background/site_recovery.py; removed-API battery clean (no PEP 594/dead-battery/imp/distutils usage); all 77 plugins verified loadable on 3.14.7 via the spec_from_file_location loader path.",
-    "1.2.500 (2026-09-24) - spec 103: dependency floors bumped to the 3.14-verified resolution \u2014 websockets>=17.0, gevent>=26.9.0, cryptography>=50.0.1 (<52 kept: fido2 ceiling), paramiko>=5.0.0, kubernetes>=36.0.0,<37, scikit-learn>=1.9.1, pandas>=3.0.6, mypy>=2.3.1 (<2.0 cap lifted); all CVE-rationale comments preserved. `pip-audit --strict` on the resolved tree: zero known vulnerabilities.",
-    "1.2.500 (2026-09-24) - spec 103: runtime surfaces on 3.14 \u2014 Dockerfile base `python:3.12-alpine`\u2192`3.14-alpine` (both stages; added `libgomp` for sklearn's musllinux OpenMP wheel), operator Dockerfile.multi\u2192`3.14-slim`; GitHub workflows test.yml/e2e.yml/security.yml provision 3.14 via setup-python (ubuntu-24.04 ships 3.12, below the new floor); gitlab-ci images `python:3.11`\u2192`3.14` (5 sites).",
-    "1.2.500 (2026-09-24) - spec 103: appliance .deb now bundles a self-contained standalone CPython 3.14.7 (pinned python-build-standalone 20260901, sha256-verified in debian/rules) with all Python deps pip-installed into `/usr/lib/ProxmoxVEx/python` \u2014 every `python3-*` Depends removed (only ca-certificates/openssh-client/sshpass/postgresql remain), gyptazy apt source dropped from release-images.yml LXC/VM builds (it only existed for python3-flask-sock/python3-xenapi), Architecture `all`\u2192`amd64`. dh_dwz/dh_strip/dh_shlibdeps are excluded/skipped for the vendored interpreter+wheels (stripped .so files, $ORIGIN RPATH, manylinux quirks). RPM spec gains the same bundled-interpreter treatment; chart specs/base-chart floors bumped to >=3.14.",
-    "1.2.500 (2026-09-24) - spec 103: 3.14 feature adoption \u2014 `timezone.utc`\u2192`datetime.UTC` swept repo-wide (271 sites, 136 files); tomli fallback dropped in update_headers.py (stdlib tomllib unconditional); `suggest_on_error`+`color` enabled on all script argparse CLIs; converter/constants.py enums moved `(str, Enum)`\u2192`StrEnum`. compression.zstd not adopted \u2014 the codebase only shells out to remote `zstd` binaries; no Python zstd dependency exists.",
-    "1.2.500 (2026-09-24) - `scripts/update_headers.py`: generated headers are richer \u2014 `Description:` now uses the full first docstring paragraph (via `ast`, was the first line truncated at 58 chars) or a joined leading comment block, wrapping onto up to three aligned lines; a new `Usage:` field is emitted when inferable (docstring `Usage:` section, `pytest tests/\u2026`, `python3 <script>` for argparse/`__main__` files, `import <dotted.module>` for libraries, `bash <script>` for shells). The module docstring was expanded into full documentation (behaviors, metadata/date resolution, config files, exit codes) with a Usage section, and `--help` now prints an examples epilog."
+    {
+      "type": "chore",
+      "component": "app",
+      "breaking": false,
+      "text": "1.2.500 (2026-09-24) - Build and serve"
+    },
+    {
+      "type": "chore",
+      "component": "app",
+      "breaking": false,
+      "text": "1.2.500 (2026-09-24) - spec 103: Python 3.14.7 runtime upgrade \u2014 `requires-python` floor raised `>=3.8`\u2192`>=3.14` (`version.json min_python` likewise). Compatibility: `datetime.utcnow()`/`utcfromtimestamp()` migrated to `datetime.now(UTC)`/`fromtimestamp(ts, UTC)` in core/manager.py, api/pbs.py, api/site_recovery.py, background/site_recovery.py; removed-API battery clean (no PEP 594/dead-battery/imp/distutils usage); all 77 plugins verified loadable on 3.14.7 via the spec_from_file_location loader path."
+    },
+    {
+      "type": "chore",
+      "component": "app",
+      "breaking": false,
+      "text": "1.2.500 (2026-09-24) - spec 103: dependency floors bumped to the 3.14-verified resolution \u2014 websockets>=17.0, gevent>=26.9.0, cryptography>=50.0.1 (<52 kept: fido2 ceiling), paramiko>=5.0.0, kubernetes>=36.0.0,<37, scikit-learn>=1.9.1, pandas>=3.0.6, mypy>=2.3.1 (<2.0 cap lifted); all CVE-rationale comments preserved. `pip-audit --strict` on the resolved tree: zero known vulnerabilities."
+    },
+    {
+      "type": "chore",
+      "component": "app",
+      "breaking": false,
+      "text": "1.2.500 (2026-09-24) - spec 103: runtime surfaces on 3.14 \u2014 Dockerfile base `python:3.12-alpine`\u2192`3.14-alpine` (both stages; added `libgomp` for sklearn's musllinux OpenMP wheel), operator Dockerfile.multi\u2192`3.14-slim`; GitHub workflows test.yml/e2e.yml/security.yml provision 3.14 via setup-python (ubuntu-24.04 ships 3.12, below the new floor); gitlab-ci images `python:3.11`\u2192`3.14` (5 sites)."
+    },
+    {
+      "type": "chore",
+      "component": "app",
+      "breaking": false,
+      "text": "1.2.500 (2026-09-24) - spec 103: appliance .deb now bundles a self-contained standalone CPython 3.14.7 (pinned python-build-standalone 20260901, sha256-verified in debian/rules) with all Python deps pip-installed into `/usr/lib/ProxmoxVEx/python` \u2014 every `python3-*` Depends removed (only ca-certificates/openssh-client/sshpass/postgresql remain), gyptazy apt source dropped from release-images.yml LXC/VM builds (it only existed for python3-flask-sock/python3-xenapi), Architecture `all`\u2192`amd64`. dh_dwz/dh_strip/dh_shlibdeps are excluded/skipped for the vendored interpreter+wheels (stripped .so files, $ORIGIN RPATH, manylinux quirks). RPM spec gains the same bundled-interpreter treatment; chart specs/base-chart floors bumped to >=3.14."
+    },
+    {
+      "type": "chore",
+      "component": "app",
+      "breaking": false,
+      "text": "1.2.500 (2026-09-24) - spec 103: 3.14 feature adoption \u2014 `timezone.utc`\u2192`datetime.UTC` swept repo-wide (271 sites, 136 files); tomli fallback dropped in update_headers.py (stdlib tomllib unconditional); `suggest_on_error`+`color` enabled on all script argparse CLIs; converter/constants.py enums moved `(str, Enum)`\u2192`StrEnum`. compression.zstd not adopted \u2014 the codebase only shells out to remote `zstd` binaries; no Python zstd dependency exists."
+    },
+    {
+      "type": "chore",
+      "component": "app",
+      "breaking": false,
+      "text": "1.2.500 (2026-09-24) - `scripts/update_headers.py`: generated headers are richer \u2014 `Description:` now uses the full first docstring paragraph (via `ast`, was the first line truncated at 58 chars) or a joined leading comment block, wrapping onto up to three aligned lines; a new `Usage:` field is emitted when inferable (docstring `Usage:` section, `pytest tests/\u2026`, `python3 <script>` for argparse/`__main__` files, `import <dotted.module>` for libraries, `bash <script>` for shells). The module docstring was expanded into full documentation (behaviors, metadata/date resolution, config files, exit codes) with a Usage section, and `--help` now prints an examples epilog."
+    },
+    {
+      "type": "feat",
+      "component": "dist",
+      "breaking": false,
+      "text": "CLI/operator UX round 2: update.sh gains --help/--version/--quiet/--verbose/--json/--no-color flags, color + NO_COLOR + non-TTY handling, staged step banners with durations, success/failure summaries and remediation hints; verify-release.sh rewritten with staged human output, --quiet/--verbose/--json/--strict/--checksum-only modes and distinct exit codes; docs gain a docs/README.md index, generated flag reference, and cross-linking across all operator guides"
+    },
+    {
+      "type": "feat",
+      "component": "dist",
+      "breaking": false,
+      "text": "Updater hardening + ops tooling: atomic staged swaps with auto-rollback, structured failure records and update-status.json, machine-readable --dry-run plan, --yes non-interactive gate, maintenance-window/proxy/channel support, platform+python+EOL compat gates, stale-version and security advisories, changelog preview, mirror sync/index tooling, fleet Ansible playbook, systemd timer units, airgap bundles, per-release diff reports, and a bats+e2e test suite covering forgery/corruption/concurrency/rollback"
+    },
+    {
+      "type": "fix",
+      "component": "dist",
+      "breaking": false,
+      "text": "1.2.472 (2026-09-19) - Distribution integrity: GPG-signed release tarballs with pubkey.asc, SHA256 checksums manifest, SLSA provenance release workflow, and countersigned signing-key rotation (update.sh verifies signatures/checksums before extraction)"
+    },
+    {
+      "type": "fix",
+      "component": "dist",
+      "breaking": false,
+      "text": "1.2.472 (2026-09-17) - Fix API token persistence and idempotent custom_scripts migration"
+    }
   ],
   "min_python": "3.14",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
