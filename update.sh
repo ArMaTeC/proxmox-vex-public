@@ -219,10 +219,11 @@ die() { if command -v err >/dev/null 2>&1; then err "$1"; [ "${STAGE:-init}" != 
 # Every published tarball carries a detached armored GPG signature
 # (<file>.asc) made by the release-signing key. The public half ships in
 # this repo as pubkey.asc; verification runs in a scratch keyring so an
-# operator's own keyring is never touched. A BAD signature is fatal —
-# a missing signature/tooling warns and proceeds (same posture as the
-# SHA256SUMS check) so pre-signing-era installs keep working.
-# VEX_SKIP_SIG_VERIFY=1 opts out explicitly.
+# operator's own keyring is never touched. A BAD signature is fatal, and
+# SEC-008: a MISSING signature/tooling is now fatal too (a mirror
+# compromise could previously win by simply not serving the .asc) —
+# VEX_ALLOW_UNSIGNED=1 is the explicit escape hatch, and
+# VEX_SKIP_SIG_VERIFY=1 opts out of verification entirely.
 # =============================================================================
 # SCRIPT_DIR is resolved again below for the install path; it is computed
 # here too because --verify can exit before that point is reached.
@@ -245,17 +246,21 @@ resolve_pubkey() {
     return 1
 }
 
-# verify_signature <archive> <sig>: returns 0 good / 1 bad / 2 unavailable.
+# verify_signature <archive> <sig>: returns 0 good / 1 bad /
+# 2 explicitly skipped (VEX_SKIP_SIG_VERIFY=1) / 3 unavailable (no gpg,
+# no .asc, no pubkey). SEC-008: unavailable must NOT be confused with an
+# operator's explicit opt-out — callers treat 3 as fatal unless
+# VEX_ALLOW_UNSIGNED=1.
 verify_signature() {
     local archive="$1" sig="$2"
     if [ "${VEX_SKIP_SIG_VERIFY:-0}" = "1" ]; then
         return 2
     fi
     if ! command -v gpg >/dev/null 2>&1 || [ ! -f "$sig" ]; then
-        return 2
+        return 3
     fi
     local KEYFILE
-    KEYFILE=$(resolve_pubkey) || return 2
+    KEYFILE=$(resolve_pubkey) || return 3
     local KR
     KR=$(mktemp -d)
     gpg --batch --quiet --homedir "$KR" --import "$KEYFILE" >/dev/null 2>&1
@@ -1000,11 +1005,16 @@ apply_bundle() {
     done
     [ -n "$tarball" ] || die "bundle contains no release tarball"
 
-    # Verify with the bundled verifier; --checksum-only when the bundle
-    # carries no detached signature (unsigned/airgapped builds).
+    # Verify with the bundled verifier. SEC-008: --checksum-only is only
+    # allowed when the operator explicitly accepts unsigned artifacts —
+    # a bundle without a detached signature is otherwise fatal.
     if [ -x "$BUNDLE_DIR/verify-release.sh" ]; then
         local vargs=""
-        [ -f "$tarball.asc" ] || vargs="--checksum-only"
+        if [ ! -f "$tarball.asc" ]; then
+            [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ] \
+                || die "bundle carries no signature: $tarball.asc missing — set VEX_ALLOW_UNSIGNED=1 to proceed"
+            vargs="--checksum-only"
+        fi
         (cd "$BUNDLE_DIR" && ./verify-release.sh "$(basename "$tarball")" $vargs) \
             || die "bundle verification failed"
     else
@@ -1486,7 +1496,7 @@ if [ "${1:-}" = "--verify" ]; then
     verify_signature "$VERIFY_FILE" "$VERIFY_FILE.asc"
     case $? in
         0) echo -e "${GREEN}signature OK${NC}: $VERIFY_FILE"; exit 0 ;;
-        2) die "verify: gpg or pubkey.asc unavailable (VEX_SKIP_SIG_VERIFY set?)" ;;
+        2|3) die "verify: signature check unavailable (gpg/pubkey.asc missing, or VEX_SKIP_SIG_VERIFY set)" ;;
         *) die "signature verification FAILED: $VERIFY_FILE" ;;
     esac
 fi
@@ -2059,7 +2069,19 @@ if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
                 echo -e "${GREEN}OK (signature verified)${NC}"
                 ;;
             2)
-                echo -e "${YELLOW}skipped (gpg/pubkey.asc unavailable or VEX_SKIP_SIG_VERIFY=1)${NC}"
+                # Explicit operator opt-out — VEX_SKIP_SIG_VERIFY=1 was set.
+                echo -e "${YELLOW}skipped (VEX_SKIP_SIG_VERIFY=1)${NC}"
+                ;;
+            3)
+                # SEC-008: verification *unavailable* is fatal for signed-era
+                # releases unless the operator explicitly accepts unsigned
+                # artifacts. A mirror compromise wins by omitting the .asc or
+                # stripping gpg otherwise.
+                if [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ]; then
+                    echo -e "${YELLOW}skipped (gpg/pubkey.asc unavailable; VEX_ALLOW_UNSIGNED=1)${NC}"
+                else
+                    die "Cannot verify archive signature (gpg or pubkey.asc unavailable). Set VEX_ALLOW_UNSIGNED=1 to proceed anyway."
+                fi
                 ;;
             *)
                 echo -e "${RED}signature verification FAILED${NC}"
@@ -2067,7 +2089,13 @@ if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
                 ;;
         esac
     else
-        echo -e "${YELLOW}no signature published at $SIG_URL (skipping)${NC}"
+        # SEC-008: a published release is expected to carry a detached
+        # signature; its absence is fatal unless explicitly waived.
+        if [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ]; then
+            echo -e "${YELLOW}no signature published at $SIG_URL (VEX_ALLOW_UNSIGNED=1)${NC}"
+        else
+            die "No signature published at $SIG_URL — refusing unsigned archive. Set VEX_ALLOW_UNSIGNED=1 to proceed anyway."
+        fi
     fi
 fi
 
