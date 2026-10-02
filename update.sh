@@ -2196,10 +2196,18 @@ elif [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
         else
             # Fallback: cp + tar (works without rsync)
             cd "$CONTENT_DIR" || die "cannot enter extracted content dir"
+            # ISS-030: exclude update.sh here and swap it atomically below —
+            # tar extracts by truncating the destination inode, which would
+            # corrupt the currently-running script mid-apply.
             tar cf - --exclude='config' --exclude='ssl' --exclude='logs' \
                      --exclude='backups' --exclude='cert.pem' --exclude='key.pem' \
                      --exclude='.git' --exclude='.gitignore' \
+                     --exclude='update.sh' \
                      . | tar xf - -C "$SCRIPT_DIR"
+            if [ -f "$CONTENT_DIR/update.sh" ]; then
+                cp "$CONTENT_DIR/update.sh" "$SCRIPT_DIR/update.sh.new"
+                mv "$SCRIPT_DIR/update.sh.new" "$SCRIPT_DIR/update.sh"
+            fi
             cd "$SCRIPT_DIR" || die "cannot return to install dir"
         fi
         echo -e "${GREEN}OK${NC}"
