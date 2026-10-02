@@ -1,2 +1,2 @@
-ff04ef6fb10cf1f9ad7662360207ed646efd6c1e49dc01fc8538a2e2eaf02b30  ProxmoxVEx-1.2.591.tar.gz
-ff04ef6fb10cf1f9ad7662360207ed646efd6c1e49dc01fc8538a2e2eaf02b30  ProxmoxVEx-latest.tar.gz
+a5435b6d60a4d99cda6342e01386a9aa5ea4448cb2c033b157bd0c7b8da017d1  ProxmoxVEx-1.2.595.tar.gz
+a5435b6d60a4d99cda6342e01386a9aa5ea4448cb2c033b157bd0c7b8da017d1  ProxmoxVEx-latest.tar.gz
