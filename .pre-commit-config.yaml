@@ -1,0 +1,11 @@
+# SEC-021: staged-diff secret scan for every commit. A committed secret is
+# a finding even after rotation — catch it before it lands (SEC-019/020
+# shipped real credentials through exactly this gap).
+#
+# Install once:  pip install pre-commit && pre-commit install
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks

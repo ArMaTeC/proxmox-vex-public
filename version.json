@@ -4,6 +4,12 @@
   "release_date": "2026-10-02",
   "changelog": [
     {
+      "type": "security",
+      "component": "repo-hygiene",
+      "breaking": false,
+      "text": "SEC-021: added .pre-commit-config.yaml with gitleaks staged-diff secret scan"
+    },
+    {
       "type": "chore",
       "component": "release",
       "breaking": false,
