@@ -1,0 +1,28 @@
+# deploy/proxmoxvex-public.service — static download site (:8099).
+# Replaces the ad-hoc `python3 -m http.server` so the site participates
+# in the central auth-IDS report+enforce loop.
+#   install -m 0644 proxmoxvex-public.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now proxmoxvex-public
+[Unit]
+Description=ProxmoxVEx public download site (static, :8099)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Serve from the repo's dist/ tree (release artifacts + signatures).
+WorkingDirectory=/var/www/proxmox-vex-public
+ExecStart=/usr/bin/python3 /var/www/proxmox-vex-public/deploy/server.py
+# Central IDS (proxmoxvex-auth): request events are forwarded to
+# IDS_EVENTS_URL and the blocklist polled from IDS_BLOCKLIST_URL.
+# IDS_KEY MUST equal the auth service's AUTH_INTERNAL_KEY. Unset =
+# reporting/enforcement off (plain static server behaviour).
+# Environment=IDS_EVENTS_URL=http://127.0.0.1:8021/v1/internal/ids/events
+# Environment=IDS_BLOCKLIST_URL=http://127.0.0.1:8021/v1/internal/ids/blocklist
+# Environment=IDS_KEY=
+# Environment=IDS_SITE_ID=public
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
