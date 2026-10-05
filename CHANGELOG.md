@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Docs: README gained a "Serving the site" section covering
+  `deploy/server.py` + `proxmoxvex-public.service`, the `IDS_*` env
+  contract, and retirement of the ad-hoc `http.server`.
+
 - Central IDS wiring (proxmoxvex-auth): new `deploy/server.py` — a
   `ThreadingHTTPServer` static file server that replaces the ad-hoc
   `python3 -m http.server` on :8099 and adds the report+enforce loop:

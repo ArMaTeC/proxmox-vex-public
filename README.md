@@ -63,3 +63,24 @@ web-server config with the required Cache-Control rules (no-cache metadata,
 immutable versioned artifacts) lives in `deploy/nginx.conf`, alongside
 `deploy/metrics.sh`, which rolls the JSON access log into a Prometheus
 textfile (per-version downloads, error counts) for node_exporter.
+
+## Serving the site
+
+`deploy/server.py` is the production static server for `:8099` — a
+`ThreadingHTTPServer` run by `deploy/proxmoxvex-public.service`
+(systemd unit; install steps are in the unit's header comments).
+Beyond plain file serving it participates in the central auth-IDS
+report+enforce loop:
+
+- Every served response (200/404) and early-403 is queued and posted to
+  `IDS_EVENTS_URL` as `{site_id: IDS_SITE_ID, events[]}` with
+  `Authorization: Bearer IDS_KEY` (`IDS_KEY` = the auth service's
+  `AUTH_INTERNAL_KEY`).
+- A daemon thread polls `IDS_BLOCKLIST_URL` (default cadence 60 s) and
+  matching client IPs get an early `403`.
+
+All four knobs are env vars (`IDS_EVENTS_URL`, `IDS_BLOCKLIST_URL`,
+`IDS_KEY`, `IDS_SITE_ID`; see the unit file). Unset = plain static
+serving; the loop is fail-open — a dead IDS keeps the last good
+blocklist and never breaks downloads. The previous ad-hoc
+`python3 -m http.server 8099` had none of this and is retired.
