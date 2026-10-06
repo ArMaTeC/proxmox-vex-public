@@ -4,6 +4,12 @@
   "release_date": "2026-10-02",
   "changelog": [
     {
+      "type": "security",
+      "component": "server",
+      "breaking": false,
+      "text": "Unreleased - SEC-034/036/038: TRUSTED_PROXY_CIDRS gates forwarded-header trust (default loopback); dot-paths except .well-known + *.py 404; directory listing removed; XFO/HSTS/Permissions-Policy/CSP added"
+    },
+    {
       "type": "docs",
       "component": "docs",
       "breaking": false,

@@ -84,3 +84,12 @@ All four knobs are env vars (`IDS_EVENTS_URL`, `IDS_BLOCKLIST_URL`,
 serving; the loop is fail-open — a dead IDS keeps the last good
 blocklist and never breaks downloads. The previous ad-hoc
 `python3 -m http.server 8099` had none of this and is retired.
+
+Hardening (SEC-034/036/038): the docroot is a live git checkout, so
+dot-paths other than `/.well-known/` (`.git/`, `.github/`, …) and
+`*.py` return 404, index-less directories return 404 instead of a
+listing, and responses carry CSP/`X-Frame-Options`/HSTS/
+Permissions-Policy headers. Forwarded-client headers are honoured
+only when the socket peer is inside `TRUSTED_PROXY_CIDRS` (default
+`127.0.0.0/8,::1` — cloudflared terminates on-host); a LAN/VM/container
+peer is the client itself and cannot forge the reported IP.

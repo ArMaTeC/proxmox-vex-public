@@ -20,6 +20,7 @@ Configuration (env):
 """
 
 import io
+import ipaddress
 import json
 import mimetypes
 import os
@@ -34,6 +35,30 @@ from urllib.parse import unquote
 ROOT = Path(os.getcwd()).resolve()
 PORT = int(os.environ.get("PORT", "8099"))
 HOST = os.environ.get("HOST", "0.0.0.0")
+
+
+def _parse_nets(raw_list: str):
+    """CIDR set allowed to carry forwarded-client headers (SEC-034)."""
+    nets = []
+    for raw in raw_list.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(raw, strict=False))
+        except ValueError:
+            continue
+    return tuple(nets)
+
+
+# Socket peers inside these ranges may speak for a client IP via
+# CF-Connecting-IP / True-Client-IP / X-Forwarded-For. Default is loopback
+# only — cloudflared terminates on this host. A peer outside the set (LAN
+# host, VM, docker container) IS the client; honouring forwarded headers
+# from it would enable source-IP spoofing for blocklist evasion and IDS
+# framing (SEC-034).
+TRUSTED_PROXY_CIDRS = os.environ.get("TRUSTED_PROXY_CIDRS", "127.0.0.0/8,::1")
+_TRUSTED_PROXY_NETS = _parse_nets(TRUSTED_PROXY_CIDRS)
 
 IDS_EVENTS_URL = os.environ.get("IDS_EVENTS_URL", "").strip()
 IDS_BLOCKLIST_URL = os.environ.get("IDS_BLOCKLIST_URL", "").strip()
@@ -153,10 +178,44 @@ class PublicHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header(
+            "Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload"
+        )
+        self.send_header(
+            "Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=()"
+        )
+        # SEC-038: parity with the landing host — the mirror serves only
+        # static docs/artifacts, so a self-contained CSP suffices.
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; "
+            "font-src 'self'; "
+            "connect-src 'self'; "
+            "frame-ancestors 'self'; "
+            "base-uri 'self'; "
+            "form-action 'self'",
+        )
         super().end_headers()
 
     def _client_ip(self):
+        # Forwarded headers are honoured only from a trusted proxy peer
+        # (loopback by default — cloudflared terminates on this host).
+        # A direct LAN/VM/container peer is the client itself and may not
+        # forge an IP via headers (SEC-034).
+        peer = self.client_address[0] if self.client_address else ""
+        try:
+            peer_ip = ipaddress.ip_address(peer) if peer else None
+        except ValueError:
+            peer_ip = None
+        if peer_ip is not None and not any(
+            peer_ip in net for net in _TRUSTED_PROXY_NETS
+        ):
+            return peer
         # Same trust order as the landing server: the CDN-stamped headers
         # win; the LAST X-Forwarded-For hop is the one our edge appended.
         for header in ("CF-Connecting-IP", "True-Client-IP"):
@@ -168,7 +227,7 @@ class PublicHandler(SimpleHTTPRequestHandler):
             hops = [h.strip() for h in fwd.split(",") if h.strip()]
             if hops:
                 return hops[-1][:45]
-        return self.client_address[0] if self.client_address else ""
+        return peer
 
     def _ids_report(self, status):
         if not IDS_REPORT_ENABLED:
@@ -197,19 +256,44 @@ class PublicHandler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
         return True
 
+    def _not_found(self):
+        """Local 404 — SimpleHTTPRequestHandler.list_directory must never
+        run on this docroot (it is a live git checkout; SEC-036)."""
+        body = b"Not found"
+        self.send_response(404)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        return io.BytesIO(body)
+
     def send_head(self):
         # Translate to a path under ROOT first — SimpleHTTPRequestHandler's
         # send_head returns the 404 body itself on misses, which we can't
         # observe to report, so pre-check existence like the landing server.
         path = unquote(self.path.split("?", 1)[0].split("#", 1)[0])
-        words = [w for w in path.split("/") if w and not w.startswith("..")]
+        raw_words = [w for w in path.split("/") if w]
+        # Deny dot-paths (except .well-known) and interpreter source: the
+        # docroot is a live git checkout exposing .git/, .github/, and
+        # deploy/server.py if requested directly (SEC-036).
+        if any(
+            (w.startswith(".") and w != ".well-known") or w.endswith(".py")
+            for w in raw_words
+        ):
+            self._ids_report(404)
+            return self._not_found()
+        words = [w for w in raw_words if not w.startswith("..")]
         target = (ROOT / Path(*words)).resolve() if words else ROOT
         if not str(target).startswith(str(ROOT)):
             target = ROOT
         if target.is_dir():
             index = target / "index.html"
-            target = index if index.exists() else target
-        if not target.exists() or target.is_dir():
+            if index.exists():
+                target = index
+            else:
+                # No directory listing — index-less dirs 404 (SEC-036).
+                self._ids_report(404)
+                return self._not_found()
+        if not target.exists():
             self._ids_report(404)
             return super().send_head()
         self._ids_report(200)
