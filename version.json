@@ -689,7 +689,6 @@
     "docs/plugins/README.md",
     "docs/plugins/alert-correlator.md",
     "docs/plugins/ansible-runner.md",
-    "docs/plugins/apc-ups.md",
     "docs/plugins/api-token-manager.md",
     "docs/plugins/audit-search-enhanced.md",
     "docs/plugins/backup-retention-guard.md",
@@ -1090,10 +1089,6 @@
     "web/i18n/locales/ansible/en.json",
     "web/i18n/locales/ansible/es.json",
     "web/i18n/locales/ansible/fr.json",
-    "web/i18n/locales/apc-ups/de.json",
-    "web/i18n/locales/apc-ups/en.json",
-    "web/i18n/locales/apc-ups/es.json",
-    "web/i18n/locales/apc-ups/fr.json",
     "web/i18n/locales/api-token-manager/de.json",
     "web/i18n/locales/api-token-manager/en.json",
     "web/i18n/locales/api-token-manager/es.json",
@@ -1463,5 +1458,6 @@
     "web/sw.js"
   ],
   "prev_changelog": [],
-  "breaking_changes": []
+  "breaking_changes": [],
+  "files": []
 }
