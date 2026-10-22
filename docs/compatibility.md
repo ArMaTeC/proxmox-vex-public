@@ -7,10 +7,9 @@ Which ProxmoxVEx releases run where. The matrix is generated from
 python3 scripts/gen_compat.py version.json
 ```
 
-| Version | Python | Arch                        | EOL | Security fix |
-|---------|--------|-----------------------------|-----|--------------|
-| 1.2.472 | 3.8+   | linux-x86_64, linux-aarch64 | —   | —            |
-| t       | 3.8+   | linux-x86_64                | —   | —            |
+| Version | Python | Arch                        | EOL        | Security fix |
+|---------|--------|-----------------------------|------------|--------------|
+| 1.2.677 | 3.14+  | linux-x86_64, linux-aarch64 | 2027-10-21 | —            |
 
 ## How the gates apply
 

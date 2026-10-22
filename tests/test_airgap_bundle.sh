@@ -34,9 +34,18 @@ echo '{"version":"9.9.9"}' > "$SCRATCH/parts/version.json"
 cp verify-release.sh "$SCRATCH/parts/"
 (cd "$SCRATCH/parts" && tar -czf "$SCRATCH/test.vexbundle" .)
 
+# SEC-008: an unsigned bundle is refused unless the operator explicitly
+# waives signature checks — the fixture carries no .asc, so set the
+# waiver and also assert refusal without it.
+bash -c "
+    source '$SCRATCH/die.sh'; source '$SCRATCH/ab.sh'
+    apply_bundle '$SCRATCH/test.vexbundle' '$SCRATCH/refused'
+" >/dev/null 2>&1
+[ $? -ne 0 ] && ok "unsigned bundle refused without waiver" || bad "unsigned bundle refused without waiver"
+
 out=$(bash -c "
     source '$SCRATCH/die.sh'; source '$SCRATCH/ab.sh'
-    apply_bundle '$SCRATCH/test.vexbundle' '$SCRATCH/out'
+    VEX_ALLOW_UNSIGNED=1 apply_bundle '$SCRATCH/test.vexbundle' '$SCRATCH/out'
     echo \"ARCHIVE=\$ARCHIVE VER=\$LATEST_VERSION DIR=\$BUNDLE_DIR\"
 " 2>&1); rc=$?
 [ $rc -eq 0 ] && ok "bundle applies (rc 0)" || bad "bundle applies (rc=$rc: $out)"

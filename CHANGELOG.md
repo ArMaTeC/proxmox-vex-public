@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Fix (SEC-008 regression): `--insecure` + `VEX_I_ACCEPT_RISK=1` did not
+  actually waive a missing archive/bundle signature — `update.sh` still
+  died on the SEC-008 "no signature published" / "bundle carries no
+  signature" paths, breaking every unsigned-fixture update. The
+  confirmed insecure gate (`VEX_SKIP_SIG_VERIFY`, exported by
+  `enforce_insecure_gate`) is now honoured alongside
+  `VEX_ALLOW_UNSIGNED`.
+- Restored publish metadata in `version.json` that release syncs had
+  dropped: `channels` (stable + `cohort: opt-in` canary), `deltas`,
+  `mirrors`, `platforms`, `formats`, and a real `releases` entry for
+  1.2.677 (`min_from`, `support_until`/`eol`, `size_bytes`,
+  `min_python`, `platforms`) replacing the leftover `"t"` stub.
+  `docs/compatibility.md` regenerated from `scripts/gen_compat.py`.
+- `tests/test_airgap_bundle.sh` updated for SEC-008: an unsigned bundle
+  is now refused unless `VEX_ALLOW_UNSIGNED=1` — the test asserts both
+  the refusal and the waived apply path.
 - Docs: README gained a "Serving the site" section covering
   `deploy/server.py` + `proxmoxvex-public.service`, the `IDS_*` env
   contract, and retirement of the ad-hoc `http.server`.

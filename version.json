@@ -1,8 +1,20 @@
 {
-  "version": "1.2.677",
-  "build": "2026.10.21",
-  "release_date": "2026-10-21",
+  "version": "1.2.681",
+  "build": "2026.10.22",
+  "release_date": "2026-10-22",
   "changelog": [
+    {
+      "type": "chore",
+      "component": "release",
+      "breaking": false,
+      "text": "Release 1.2.681 (2026.10.22)"
+    },
+    {
+      "type": "fix",
+      "component": "update.sh",
+      "breaking": false,
+      "text": "--insecure + VEX_I_ACCEPT_RISK=1 now actually waives missing archive/bundle signatures (SEC-008 regression broke unsigned-fixture updates); version.json publish metadata restored (channels/deltas/mirrors/platforms/releases); test_airgap_bundle asserts refusal-without-waiver plus waived apply."
+    },
     {
       "type": "chore",
       "component": "release",
@@ -1556,5 +1568,47 @@
   ],
   "prev_changelog": [],
   "breaking_changes": [],
-  "files": []
+  "files": [],
+  "releases": {
+    "1.2.677": {
+      "support_until": "2027-10-21",
+      "min_from": "1.0.0",
+      "size_bytes": 14448869,
+      "min_python": "3.14",
+      "platforms": [
+        "linux-x86_64",
+        "linux-aarch64"
+      ],
+      "eol": "2027-10-21"
+    },
+    "t": {
+      "size_bytes": 951
+    }
+  },
+  "formats": [
+    "tar.gz",
+    "tar.zst"
+  ],
+  "channels": {
+    "stable": {
+      "version": "1.2.677",
+      "archive": "ProxmoxVEx-latest.tar.gz",
+      "size_bytes": 14448869
+    },
+    "canary": {
+      "version": "1.2.677",
+      "archive": "ProxmoxVEx-1.2.677.tar.gz",
+      "cohort": "opt-in",
+      "size_bytes": 14448869
+    }
+  },
+  "deltas": {},
+  "mirrors": [
+    "https://proxmoxvex.com/downloads",
+    "https://mirror.proxmoxvex.com/dist"
+  ],
+  "platforms": [
+    "x86_64",
+    "aarch64"
+  ]
 }

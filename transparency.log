@@ -21,3 +21,9 @@
 {"version":"1.2.670","artifact":"ProxmoxVEx-latest.tar.gz","sha256":"e578bd424efa43e11590a5cb06139910b32e0451e1c949957fff961daa3b0b3d","ts":"2026-10-21T11:24:11Z"}
 {"version":"1.2.677","artifact":"ProxmoxVEx-1.2.677.tar.gz","sha256":"723b156786147be2d9e2fb045af9892b5a665522f33a3f662e079b5d63205b2f","ts":"2026-10-21T21:47:33Z"}
 {"version":"1.2.677","artifact":"ProxmoxVEx-latest.tar.gz","sha256":"723b156786147be2d9e2fb045af9892b5a665522f33a3f662e079b5d63205b2f","ts":"2026-10-21T21:47:33Z"}
+{"version":"t","artifact":"ProxmoxVEx-t.tar.gz","sha256":"b8b873e4ae8a6917ff0b3d5aa9b9cd83b6d1430181d0aa402d249adf686e61d1","ts":"2026-10-22T04:30:23Z"}
+{"version":"t","artifact":"ProxmoxVEx-t.tar.gz","sha256":"b8b873e4ae8a6917ff0b3d5aa9b9cd83b6d1430181d0aa402d249adf686e61d1","ts":"2026-10-22T04:30:23Z"}
+{"version":"t","artifact":"ProxmoxVEx-t.tar.gz","sha256":"b8b873e4ae8a6917ff0b3d5aa9b9cd83b6d1430181d0aa402d249adf686e61d1","ts":"2026-10-22T04:35:20Z"}
+{"version":"t","artifact":"ProxmoxVEx-t.tar.gz","sha256":"b8b873e4ae8a6917ff0b3d5aa9b9cd83b6d1430181d0aa402d249adf686e61d1","ts":"2026-10-22T04:35:21Z"}
+{"version":"1.2.681","artifact":"ProxmoxVEx-1.2.681.tar.gz","sha256":"5167a7de39bdb9becdb58b2fe1215210552619bc96246943890a09885b183615","ts":"2026-10-22T05:17:36Z"}
+{"version":"1.2.681","artifact":"ProxmoxVEx-latest.tar.gz","sha256":"5167a7de39bdb9becdb58b2fe1215210552619bc96246943890a09885b183615","ts":"2026-10-22T05:17:36Z"}

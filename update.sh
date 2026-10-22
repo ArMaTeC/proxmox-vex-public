@@ -1011,7 +1011,11 @@ apply_bundle() {
     if [ -x "$BUNDLE_DIR/verify-release.sh" ]; then
         local vargs=""
         if [ ! -f "$tarball.asc" ]; then
+            # An unsigned bundle is fatal unless waived — VEX_ALLOW_UNSIGNED
+            # or the confirmed --insecure gate (VEX_SKIP_SIG_VERIFY, exported
+            # by enforce_insecure_gate only after VEX_I_ACCEPT_RISK=1).
             [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ] \
+                || [ "${VEX_SKIP_SIG_VERIFY:-0}" = "1" ] \
                 || die "bundle carries no signature: $tarball.asc missing — set VEX_ALLOW_UNSIGNED=1 to proceed"
             vargs="--checksum-only"
         fi
@@ -2090,9 +2094,15 @@ if [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
         esac
     else
         # SEC-008: a published release is expected to carry a detached
-        # signature; its absence is fatal unless explicitly waived.
+        # signature; its absence is fatal unless explicitly waived —
+        # VEX_ALLOW_UNSIGNED, or the confirmed --insecure double-gate
+        # (enforce_insecure_gate exports VEX_SKIP_SIG_VERIFY=1 only after
+        # VEX_I_ACCEPT_RISK=1). SEC-008 previously ignored --insecure here,
+        # which broke every unsigned-fixture update run.
         if [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ]; then
             echo -e "${YELLOW}no signature published at $SIG_URL (VEX_ALLOW_UNSIGNED=1)${NC}"
+        elif [ "${VEX_SKIP_SIG_VERIFY:-0}" = "1" ]; then
+            echo -e "${YELLOW}no signature published at $SIG_URL (skipped via --insecure)${NC}"
         else
             die "No signature published at $SIG_URL — refusing unsigned archive. Set VEX_ALLOW_UNSIGNED=1 to proceed anyway."
         fi
