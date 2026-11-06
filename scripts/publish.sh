@@ -38,6 +38,10 @@ if [ -z "$VERSION" ]; then
     VERSION=$(python3 -c 'import json;print(json.load(open("version.json"))["version"])' 2>/dev/null || true)
 fi
 VERSION="${VERSION:?usage: publish.sh [--dry-run] [--local root] <version> [dist-dir]}"
+# audit SEC-037: VERSION lands inside single-quoted remote ssh commands —
+# reject anything that isn't a semver token before it can break quoting.
+[[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){0,3}([-+][A-Za-z0-9._-]+)?$ ]] \
+    || { echo "publish: FAIL: malformed version: $VERSION" >&2; exit 1; }
 HOST="${PUBLISH_HOST:-}"
 ROOT="${PUBLISH_ROOT:-/var/www/proxmoxvex-dist}"
 
@@ -167,7 +171,9 @@ main() {
     # PUBLISH_STAGING=1 lands it in staging/releases/ for the promote gate.
     local sub="releases"
     [ "${PUBLISH_STAGING:-0}" = "1" ] && sub="staging/releases"
-    ssh "$HOST" "mkdir -p '$ROOT/$sub/$VERSION'"
+    # printf %q: quote every remote-side expansion — a hostile or malformed
+    # ROOT/VERSION must never break out of single-quoting on the dist host.
+    ssh "$HOST" "$(printf 'mkdir -p %q' "$ROOT/$sub/$VERSION")"
     rsync -a --delete "$DIST_DIR/" "$HOST:$ROOT/$sub/$VERSION/"
     # metadata + signatures go in the same staged set
     for f in version.json version.json.asc transparency.log transparency.log.asc \
@@ -177,7 +183,8 @@ main() {
 
     # 2) verify what actually landed — compare remote sha256 to local
     local got
-    got=$(ssh "$HOST" "sha256sum '$ROOT/$sub/$VERSION/ProxmoxVEx-${VERSION}.tar.gz' | awk '{print \$1}'")
+    got=$(ssh "$HOST" "$(printf 'sha256sum %q | awk %q' \
+        "$ROOT/$sub/$VERSION/ProxmoxVEx-${VERSION}.tar.gz" '{print $1}')")
     [ "$got" = "$want" ] || die "remote checksum mismatch: $got != $want"
 
     # staging stops here — promote.sh owns the swap after its own e2e verify
@@ -187,14 +194,17 @@ main() {
     fi
 
     # 3) atomic swap on the host (remote runs publish_swap's equivalent)
-    ssh "$HOST" "ln -sfn 'releases/$VERSION' '$ROOT/current.tmp' && mv -T '$ROOT/current.tmp' '$ROOT/current'"
+    ssh "$HOST" "$(printf 'ln -sfn %q %q && mv -T %q %q' \
+        "releases/$VERSION" "$ROOT/current.tmp" \
+        "$ROOT/current.tmp" "$ROOT/current")"
     echo "publish: $HOST current -> releases/$VERSION (previous release retained)"
 
     # 4) US038: regenerate the -latest redirect include and ship it
     # atomically (tmp upload + mv -T on the host).
     write_latest_conf deploy "$VERSION"
     scp -q deploy/latest.conf "$HOST:$ROOT/latest.conf.tmp"
-    ssh "$HOST" "mv -T '$ROOT/latest.conf.tmp' '$ROOT/latest.conf'"
+    ssh "$HOST" "$(printf 'mv -T %q %q' \
+        "$ROOT/latest.conf.tmp" "$ROOT/latest.conf")"
     echo "publish: latest.conf -> ProxmoxVEx-${VERSION}.tar.gz"
 
     # 5) LAST: publish the new pointer metadata where clients poll it

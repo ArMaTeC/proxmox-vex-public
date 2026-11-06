@@ -63,8 +63,11 @@ from this repository — do not install it.
 
 `version.json` ships a detached signature (`version.json.asc`) over its
 canonical sorted-key serialization. `update.sh` verifies it before
-trusting the contents — a tampered version field aborts the update. To
-check it by hand:
+trusting the contents — a tampered version field aborts the update. The
+check is **fail-closed**: a missing `.asc`, missing gpg, or missing
+`pubkey.asc` aborts the update as well, unless the operator explicitly
+waives verification with `VEX_ALLOW_UNSIGNED=1` (or the confirmed
+`--insecure`/`VEX_SKIP_SIG_VERIFY` path). To check it by hand:
 
 ```bash
 python3 -c "import json; print(json.dumps(json.load(open('version.json')),

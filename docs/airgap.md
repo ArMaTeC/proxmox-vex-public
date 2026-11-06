@@ -44,8 +44,9 @@ sudo ./update.sh --bundle ProxmoxVEx-1.2.473.vexbundle
 The updater then runs its normal pipeline with no network access:
 
 1. extracts the bundle into a private temp dir,
-2. verifies the release tarball's checksum AND GPG signature against the
-   bundled `pubkey.asc` — the same trust chain as an online update,
+2. verifies the release tarball's checksum AND GPG signature with the
+   repo's own `verify-release.sh` + trusted `pubkey.asc` — nothing
+   executable inside the untrusted bundle ever runs (audit SEC-003),
 3. stages `releases/<ver>/`, flips `current`, restarts, health-checks,
 4. auto-rolls back on health failure (see `docs/upgrading.md`).
 

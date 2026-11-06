@@ -436,6 +436,7 @@ resolve_update_target() {
     PINNED=0
     pin="${VEX_PIN_VERSION:-$(cat "$BASE_DIR/config/update-pin" 2>/dev/null || true)}"
     if [ -n "$pin" ]; then
+        assert_semver "$pin" "update-pin version"
         VERSION="$pin"
         ARCHIVE_NAME="ProxmoxVEx-$pin.tar.gz"
         DELTA_NAME=""
@@ -474,15 +475,36 @@ in_window() {
 # a broken jump. Comparison is real semver, not lexicographic (1.10 > 1.9).
 # =============================================================================
 
+# assert_semver <value> <what>: die unless value is a semver-ish token.
+# Audit SEC-001: every version string read from remote metadata or local
+# config must pass this gate before reaching comparisons or python helpers —
+# values are always passed to python via argv, never interpolated into code.
+assert_semver() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+){0,3}([-+][A-Za-z0-9._-]+)?$ ]] \
+        || die "malformed ${2:-version} in metadata: $1"
+}
+
+# assert_safe_name <value> <what>: die unless value is a safe basename —
+# metadata-supplied archive/delta names must not carry path separators or
+# spaces before being appended to URLs or handed to tar/curl.
+assert_safe_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._+-]+$ ]] \
+        || die "malformed ${2:-filename} in metadata: $1"
+}
+
 # version_ge <a> <b>: 0 when a >= b (semver).
 version_ge() {
-    python3 -c "
-import sys
-pa = [int(x) for x in '$1'.split('.')]
-pb = [int(x) for x in '$2'.split('.')]
+    assert_semver "$1" "version"
+    assert_semver "$2" "version"
+    python3 - "$1" "$2" <<'PY' 2>/dev/null
+import re, sys
+def parts(v):
+    base = re.split(r"[-+]", v, maxsplit=1)[0]
+    return [int(x) for x in base.split(".")]
+pa, pb = parts(sys.argv[1]), parts(sys.argv[2])
 n = max(len(pa), len(pb)); pa += [0]*(n-len(pa)); pb += [0]*(n-len(pb))
 sys.exit(0 if pa >= pb else 1)
-" 2>/dev/null
+PY
 }
 
 # check_min_from <current> <target> <version.json>: refuse when current is
@@ -490,19 +512,24 @@ sys.exit(0 if pa >= pb else 1)
 check_min_from() {
     local cur="$1" target="$2" doc="$3"
     [ -f "$doc" ] || return 0
+    assert_semver "$target" "release version"
     local min via
-    min=$(python3 -c "
-import json
-r = json.load(open('$doc')).get('releases', {})
-print(r.get('$target', {}).get('min_from', ''))
-" 2>/dev/null || echo "")
+    min=$(python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1])).get("releases", {})
+print(r.get(sys.argv[2], {}).get("min_from", ""))
+' "$doc" "$target" 2>/dev/null || echo "")
     [ -n "$min" ] || return 0   # no constraint declared → nothing to gate
+    assert_semver "$min" "min_from"
+    via=$(python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1])).get("releases", {})
+print(r.get(sys.argv[2], {}).get("via", ""))
+' "$doc" "$target" 2>/dev/null || true)
+    [ -z "$via" ] || assert_semver "$via" "via"
+    [[ "$cur" =~ ^[0-9]+(\.[0-9]+){0,3}([-+][A-Za-z0-9._-]+)?$ ]] \
+        || die "cannot verify installed version '$cur' against min_from $min; update to ${via:-$min} first"
     version_ge "$cur" "$min" && return 0
-    via=$(python3 -c "
-import json
-r = json.load(open('$doc')).get('releases', {})
-print(r.get('$target', {}).get('via', ''))
-" 2>/dev/null || true)
     die "cannot jump $cur -> $target; update to ${via:-$min} first"
 }
 
@@ -520,12 +547,12 @@ check_security_advisory() {
     local target="$1" doc="$2"
     [ -f "$doc" ] || return 0
     local sec
-    sec=$(python3 -c "
-import json
-s = json.load(open('$doc')).get('releases', {}).get('$target', {}).get('security') or {}
+    sec=$(python3 -c '
+import json, sys
+s = json.load(open(sys.argv[1])).get("releases", {}).get(sys.argv[2], {}).get("security") or {}
 if s:
-    print(s.get('severity', '') + '\t' + s.get('advisory', ''))
-" 2>/dev/null || true)
+    print(s.get("severity", "") + "\t" + s.get("advisory", ""))
+' "$doc" "$target" 2>/dev/null || true)
     [ -n "$sec" ] || return 0
     local sev="${sec%%	*}" adv="${sec##*	}"
     echo "*** SECURITY UPDATE ($sev) — $adv ***" >&2
@@ -633,12 +660,12 @@ pick_mirror_latency() {
         return 0
     fi
     local mirrors base ms best="" bestms=999999
-    mirrors=$(python3 -c "
-import json
+    mirrors=$(python3 -c '
+import json, sys
 try:
-    for m in json.load(open('$doc')).get('mirrors', []): print(m)
+    for m in json.load(open(sys.argv[1])).get("mirrors", []): print(m)
 except Exception: pass
-" 2>/dev/null)
+' "$doc" 2>/dev/null)
     for base in $mirrors "$default"; do
         [ -n "$base" ] || continue
         # US041: https/file only — http mirrors allowed solely under the
@@ -781,14 +808,14 @@ PY
 declared_size() {
     local doc="$1" ver="$2"
     [ -f "$doc" ] || return 0
-    python3 -c "
-import json
-d = json.load(open('$doc'))
-rel = d.get('releases', {}).get('$ver', {})
-ch = next((c for c in d.get('channels', {}).values() if c.get('version') == '$ver'), {})
-sz = rel.get('size_bytes') or ch.get('size_bytes') or ''
+    python3 - "$doc" "$ver" <<'PY' 2>/dev/null || true
+import json, sys
+d = json.load(open(sys.argv[1]))
+rel = d.get("releases", {}).get(sys.argv[2], {})
+ch = next((c for c in d.get("channels", {}).values() if c.get("version") == sys.argv[2]), {})
+sz = rel.get("size_bytes") or ch.get("size_bytes") or ""
 print(sz)
-" 2>/dev/null || true
+PY
 }
 
 # =============================================================================
@@ -804,12 +831,12 @@ print(sz)
 select_mirror() {
     local doc="$1" archive="$2" default_base="$3"
     local mirrors base
-    mirrors=$(python3 -c "
-import json
+    mirrors=$(python3 -c '
+import json, sys
 try:
-    for m in json.load(open('$doc')).get('mirrors', []): print(m)
+    for m in json.load(open(sys.argv[1])).get("mirrors", []): print(m)
 except Exception: pass
-" 2>/dev/null)
+' "$doc" 2>/dev/null)
     for base in ${VEX_MIRROR:-} $mirrors "$default_base"; do
         [ -n "$base" ] || continue
         # US041: https/file only — http mirrors allowed solely under the
@@ -942,11 +969,11 @@ check_eol() {
     local ver="$1" doc="$2"
     [ -f "$doc" ] || return 0
     local eol
-    eol=$(python3 -c "
+    eol=$(python3 -c '
 import json, sys
-r = json.load(open('$doc')).get('releases', {})
-print(r.get('$ver', {}).get('support_until', ''))
-" 2>/dev/null || true)
+r = json.load(open(sys.argv[1])).get("releases", {})
+print(r.get(sys.argv[2], {}).get("support_until", ""))
+' "$doc" "$ver" 2>/dev/null || true)
     [ -n "$eol" ] || return 0
     local today="${TODAY_OVERRIDE:-$(date +%F)}"
     if [ "$today" \> "$eol" ]; then
@@ -1005,25 +1032,42 @@ apply_bundle() {
     done
     [ -n "$tarball" ] || die "bundle contains no release tarball"
 
-    # Verify with the bundled verifier. SEC-008: --checksum-only is only
-    # allowed when the operator explicitly accepts unsigned artifacts —
-    # a bundle without a detached signature is otherwise fatal.
-    if [ -x "$BUNDLE_DIR/verify-release.sh" ]; then
-        local vargs=""
-        if [ ! -f "$tarball.asc" ]; then
-            # An unsigned bundle is fatal unless waived — VEX_ALLOW_UNSIGNED
-            # or the confirmed --insecure gate (VEX_SKIP_SIG_VERIFY, exported
-            # by enforce_insecure_gate only after VEX_I_ACCEPT_RISK=1).
-            [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ] \
-                || [ "${VEX_SKIP_SIG_VERIFY:-0}" = "1" ] \
-                || die "bundle carries no signature: $tarball.asc missing — set VEX_ALLOW_UNSIGNED=1 to proceed"
-            vargs="--checksum-only"
-        fi
-        (cd "$BUNDLE_DIR" && ./verify-release.sh "$(basename "$tarball")" $vargs) \
+    # Verify with THIS repo's verifier — never content shipped inside the
+    # unverified bundle. audit SEC-003: a bundled verify-release.sh /
+    # checksums.txt is attacker-controlled until the payload signature
+    # passes, so executing it hands the bundle root code execution before
+    # any trust decision. SEC-008: unsigned stays fatal unless waived.
+    local verifier
+    verifier="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify-release.sh"
+    local vargs=""
+    local _pk
+    _pk=$(resolve_pubkey 2>/dev/null || echo "${PUBKEY_FILE:-pubkey.asc}")
+    [ -n "$_pk" ] && vargs="--pubkey $_pk"
+    if [ ! -f "$tarball.asc" ]; then
+        # An unsigned bundle is fatal unless waived — VEX_ALLOW_UNSIGNED
+        # or the confirmed --insecure gate (VEX_SKIP_SIG_VERIFY, exported
+        # by enforce_insecure_gate only after VEX_I_ACCEPT_RISK=1).
+        [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ] \
+            || [ "${VEX_SKIP_SIG_VERIFY:-0}" = "1" ] \
+            || die "bundle carries no signature: $tarball.asc missing — set VEX_ALLOW_UNSIGNED=1 to proceed"
+        vargs="$vargs --checksum-only"
+    fi
+    if [ -x "$verifier" ]; then
+        (cd "$BUNDLE_DIR" && "$verifier" "$(basename "$tarball")" $vargs) \
             || die "bundle verification failed"
     else
-        (cd "$BUNDLE_DIR" && sha256sum -c checksums.txt) >/dev/null 2>&1 \
-            || die "bundle checksum verification failed"
+        # No repo-side verifier: verify_signature() is this script's own
+        # trust anchor — the bundled checksums.txt is not.
+        local vsig_rc=0
+        verify_signature "$tarball" "$tarball.asc" || vsig_rc=$?
+        case $vsig_rc in
+            0|2) ;;
+            1) die "bundle tarball signature verification FAILED" ;;
+            *) # 3 unavailable → fatal unless waived
+                [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ] \
+                    || die "bundle tarball signature unverifiable (gpg/pubkey missing) — set VEX_ALLOW_UNSIGNED=1 to proceed"
+                echo -e "${YELLOW}!!! bundle signature unverifiable — proceeding on explicit waiver${NC}" ;;
+        esac
     fi
 
     # Hand the verified artifacts to the normal pipeline via file:// — the
@@ -1031,8 +1075,12 @@ apply_bundle() {
     GITHUB_RAW="file://$BUNDLE_DIR"
     GITHUB_ARCHIVE="file://$tarball"
     ARCHIVE="$tarball"
-    LATEST_VERSION=$(python3 -c "import json;print(json.load(open('$BUNDLE_DIR/version.json'))['version'])" 2>/dev/null || true)
+    LATEST_VERSION=$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["version"])
+' "$BUNDLE_DIR/version.json" 2>/dev/null || true)
     [ -n "$LATEST_VERSION" ] || die "bundle version.json unreadable"
+    assert_semver "$LATEST_VERSION" "bundle version"
     DECLARED_SIZE=$(declared_size "$BUNDLE_DIR/version.json" "$LATEST_VERSION")
 }
 
@@ -1402,14 +1450,14 @@ PY
 check_platform() {
     local doc="$1" arch supported
     arch=$(uname -m)
-    supported=$(python3 -c "
-import json
+    supported=$(python3 -c '
+import json, sys
 try:
-    d = json.load(open('$doc'))
-    for p in d.get('platforms', ['x86_64', 'aarch64']): print(p)
+    d = json.load(open(sys.argv[1]))
+    for p in d.get("platforms", ["x86_64", "aarch64"]): print(p)
 except Exception:
-    print('x86_64'); print('aarch64')
-" 2>/dev/null)
+    print("x86_64"); print("aarch64")
+' "$doc" 2>/dev/null)
     if ! echo "$supported" | grep -qx "$arch"; then
         die "unsupported architecture $arch (supported: $(echo $supported | tr '\n' ' '))"
     fi
@@ -1417,11 +1465,11 @@ except Exception:
     # not a refusal.
     local libc=glibc
     [ -f /etc/alpine-release ] && libc=musl
-    python3 -c "
-import json,sys
-d=json.load(open('$doc'))
-sys.exit(0 if d.get('platforms_$libc') else 1)
-" 2>/dev/null || echo "  note: no ${libc}-specific build metadata; assuming compatible"
+    python3 - "$doc" "$libc" <<'PY' 2>/dev/null || echo "  note: no ${libc}-specific build metadata; assuming compatible"
+import json, sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if d.get("platforms_" + sys.argv[2]) else 1)
+PY
 }
 
 # spec 093/US015: pre-update preflight — runs BEFORE any artifact download.
@@ -1655,12 +1703,24 @@ if curl -sfL "$GITHUB_RAW/version.json.asc" -o "$VERSION_SIG" 2>/dev/null; then
     vmd_rc=0; verify_version_metadata "$VERSION_DOC" "$VERSION_SIG" || vmd_rc=$?
     case $vmd_rc in
         0) ;;
-        2) echo -e "${YELLOW}(metadata signature unverifiable — gpg/pubkey missing)${NC} " ;;
-        *) rm -f "$VERSION_DOC" "$VERSION_SIG"
+        1) rm -f "$VERSION_DOC" "$VERSION_SIG"
            die "untrusted version metadata — version.json signature FAILED" ;;
+        *) # audit SEC-002: unverifiable (gpg/pubkey missing) is fatal unless
+           # waived — same fail-closed posture as the archive signature gate.
+           if [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ] || [ "${VEX_SKIP_SIG_VERIFY:-0}" = "1" ]; then
+               echo -e "${YELLOW}!!! metadata signature unverifiable — proceeding on explicit waiver${NC}"
+           else
+               rm -f "$VERSION_DOC" "$VERSION_SIG"
+               die "version.json signature unverifiable (rc=$vmd_rc) — set VEX_ALLOW_UNSIGNED=1 to proceed"
+           fi ;;
     esac
 else
-    echo -e "${YELLOW}(no version.json.asc published — unverified)${NC} "
+    if [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ] || [ "${VEX_SKIP_SIG_VERIFY:-0}" = "1" ]; then
+        echo -e "${YELLOW}!!! no version.json.asc published — proceeding on explicit waiver${NC}"
+    else
+        rm -f "$VERSION_DOC" "$VERSION_SIG"
+        die "no version.json.asc published — refusing untrusted metadata (VEX_ALLOW_UNSIGNED=1 to waive)"
+    fi
 fi
 # spec 093/US094: parse+shape check before any consumer reads the doc —
 # a hostile or truncated payload dies here with a named validation error.
@@ -1677,11 +1737,16 @@ RESOLVED=$(resolve_channel_release "$VERSION_DOC" "$CHANNEL") \
     || { rm -f "$VERSION_DOC" "$VERSION_SIG"; die "no release for channel '$CHANNEL' published"; }
 LATEST_VERSION="${RESOLVED%%	*}"
 CHANNEL_ARCHIVE="${RESOLVED##*	}"
+# audit SEC-001: the channel-selected version is remote metadata — it must be
+# a semver token before any gate, comparison, or python helper consumes it.
+assert_semver "$LATEST_VERSION" "release version"
 if [ -n "$CHANNEL_ARCHIVE" ]; then
+    assert_safe_name "$CHANNEL_ARCHIVE" "archive name"
     GITHUB_ARCHIVE="${GITHUB_ARCHIVE%/*}/$CHANNEL_ARCHIVE"
 fi
 # spec 093/US014: is there a published delta for the installed version?
 DELTA_NAME=$(resolve_delta "$VERSION_DOC" "$CURRENT_VERSION" 2>/dev/null || true)
+[ -z "$DELTA_NAME" ] || assert_safe_name "$DELTA_NAME" "delta name"
 
 # spec 093/US023: warn if the installed release is past its support window.
 check_eol "$CURRENT_VERSION" "$VERSION_DOC"
@@ -1718,12 +1783,13 @@ DECLARED_SIZE=$(declared_size "$VERSION_DOC" "$LATEST_VERSION")
 # spec 093/US040: prefer .tar.zst when the host has zstd AND the release
 # advertises one; otherwise stay on .tar.gz.
 if [ "$BUNDLE_MODE" != "1" ] && [ "$(pick_archive_ext)" = ".tar.zst" ] \
-        && python3 -c "
-import json,sys
-d=json.load(open('$VERSION_DOC'))
-fmts=d.get('formats',[])
-sys.exit(0 if any('zst' in f for f in fmts) else 1)
-" 2>/dev/null; then
+        && python3 - "$VERSION_DOC" <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+fmts = d.get("formats", [])
+sys.exit(0 if any("zst" in f for f in fmts) else 1)
+PY
+then
     GITHUB_ARCHIVE="${GITHUB_ARCHIVE%.tar.gz}.tar.zst"
     ARCHIVE_NAME="${ARCHIVE_NAME%.tar.gz}.tar.zst"
 fi
@@ -1781,6 +1847,14 @@ if [ "$CURRENT_VERSION" == "$LATEST_VERSION" ]; then
     RESYNC=1
     echo -e "${GREEN}✓ Already on $LATEST_VERSION${NC} — re-syncing all files anyway so nothing can be left stale."
     echo ""
+elif [ "$CURRENT_VERSION" != "unknown" ] && version_ge "$CURRENT_VERSION" "$LATEST_VERSION"; then
+    # audit SEC-010: downgrade — only allowed via an explicit pin/force.
+    # Silently accepting LATEST<CURRENT lets a mirror replay old signed
+    # releases onto every client (rollback to known-vulnerable builds).
+    if [ "${PINNED:-0}" != "1" ] && [ "${FORCE:-0}" != "1" ]; then
+        die "refusing downgrade $CURRENT_VERSION -> $LATEST_VERSION (use VEX_PIN_VERSION or --force to override)"
+    fi
+    echo -e "${YELLOW}Downgrade to $LATEST_VERSION explicitly requested${NC}"
 fi
 
 # Confirm only for an actual version change. A same-version re-sync just proceeds
@@ -1961,6 +2035,26 @@ if fetch_resume "$GITHUB_ARCHIVE" "$ARCHIVE"; then
     log_update "download: $(basename "$ARCHIVE") from $GITHUB_ARCHIVE"
 else
     echo -e "${YELLOW}Archive not found, falling back to individual files...${NC}"
+    # audit SEC-028: the per-file path must not apply unsigned code — try a
+    # SIGNED per-file manifest (MANIFEST.sha256 + .asc, published beside the
+    # archive) first; without it only an explicit unsigned waiver proceeds.
+    FALLBACK_MANIFEST=""
+    if curl -sfL "${GITHUB_ARCHIVE%/*}/MANIFEST.sha256" -o "$TMPDIR/fallback-MANIFEST.sha256" 2>/dev/null \
+        && curl -sfL "${GITHUB_ARCHIVE%/*}/MANIFEST.sha256.asc" -o "$TMPDIR/fallback-MANIFEST.sha256.asc" 2>/dev/null; then
+        fman_rc=0
+        verify_signature "$TMPDIR/fallback-MANIFEST.sha256" "$TMPDIR/fallback-MANIFEST.sha256.asc" || fman_rc=$?
+        if [ "$fman_rc" = "0" ]; then
+            FALLBACK_MANIFEST="$TMPDIR/fallback-MANIFEST.sha256"
+            echo -e "${GREEN}signed file manifest verified — applying only listed files${NC}"
+        fi
+    fi
+    if [ -z "$FALLBACK_MANIFEST" ]; then
+        if [ "${VEX_ALLOW_UNSIGNED:-0}" = "1" ] || [ "${VEX_SKIP_SIG_VERIFY:-0}" = "1" ]; then
+            echo -e "${YELLOW}!!! per-file fallback proceeding UNSIGNED on explicit waiver${NC}"
+        else
+            die "archive unavailable and no signed MANIFEST.sha256 published — refusing unsigned update (VEX_ALLOW_UNSIGNED=1 to waive)"
+        fi
+    fi
     # Fallback: download individual files (for repos without releases)
     download_file() {
         local file=$1
@@ -1968,11 +2062,30 @@ else
         case "$file" in
             config/*|ssl/*|logs/*|backups/*|.git/*|*.db|*.pem|*.key|*.crt|*.enc) return 0 ;;
         esac
+        # SEC-028: with a verified manifest only listed files may be applied —
+        # anything else is unverifiable, so it is skipped rather than fetched.
+        local want=""
+        if [ -n "$FALLBACK_MANIFEST" ]; then
+            want=$(awk -v f="$file" '{n=$2; sub(/^\*/, "", n)} n == f {print $1}' "$FALLBACK_MANIFEST" 2>/dev/null)
+            if [ -z "$want" ]; then
+                echo -e "  $file... ${YELLOW}skipped (not in signed manifest)${NC}"
+                return 0
+            fi
+        fi
         local dir
         dir=$(dirname "$file")
         [ "$dir" != "." ] && mkdir -p "$dir"
         echo -n "  $file... "
         if curl -sfL "$GITHUB_RAW/$file" -o "$file.tmp" 2>/dev/null; then
+            if [ -n "$want" ]; then
+                local got
+                got=$(sha256sum "$file.tmp" | awk '{print $1}')
+                if [ "$got" != "$want" ]; then
+                    rm -f "$file.tmp"
+                    echo -e "${RED}HASH MISMATCH${NC}"
+                    return 1
+                fi
+            fi
             mv "$file.tmp" "$file"
             echo -e "${GREEN}OK (mirror)${NC}"
             return 0

@@ -39,6 +39,9 @@ PY
 fi
 
 VERSION="${1:?usage: promote.sh <version> [--local <docroot>] | --channel-promote <from> <to>}"
+# audit SEC-037: VERSION lands inside remote ssh commands — semver-shape it.
+[[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){0,3}([-+][A-Za-z0-9._-]+)?$ ]] \
+    || { echo "promote: FAIL: malformed version: $VERSION" >&2; exit 1; }
 HOST="${PUBLISH_HOST:-}"
 ROOT="${PUBLISH_ROOT:-/var/www/proxmoxvex-dist}"
 LOCAL_ROOT=""
@@ -56,7 +59,11 @@ staging_verify() {
     curl -fsSL "$base/version.json" -o "$work/version.json" 2>/dev/null \
         || { rm -rf "$work"; echo "no staged version.json" >&2; return 1; }
     local docver
-    docver=$(python3 -c "import json;print(json.load(open('$work/version.json'))['version'])" 2>/dev/null)
+    docver=$(python3 - "$work/version.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['version'])
+PY
+ 2>/dev/null)
     [ "$docver" = "$ver" ] || { rm -rf "$work"; echo "staged version.json is '$docver', expected '$ver'" >&2; return 1; }
     # verify every artifact listed in checksums.txt
     curl -fsSL "$base/checksums.txt" -o "$work/checksums.txt" 2>/dev/null \
@@ -64,6 +71,12 @@ staging_verify() {
     local name rc=0
     while read -r _hash name; do
         [ -n "$name" ] || continue
+        name="${name#\*}"   # sha256sum binary-marker prefix
+        # audit SEC-037: manifest filenames are remote data — reject
+        # traversal/absolute paths before they become curl -o targets.
+        case "$name" in
+            *..*|/*|*/*) echo "unsafe manifest filename: $name" >&2; rc=1; break ;;
+        esac
         curl -fsSL "$base/$name" -o "$work/$name" 2>/dev/null \
             || { echo "missing staged artifact: $name" >&2; rc=1; break; }
     done < "$work/checksums.txt"
@@ -102,11 +115,16 @@ main() {
     [ -n "$HOST" ] || die "set PUBLISH_HOST or use --local"
     staging_verify "https://staging.proxmoxvex.com/releases/$VERSION" "$VERSION" \
         || die "staging verification failed; not promoting"
-    ssh "$HOST" "mv '$ROOT/staging/releases/$VERSION' '$ROOT/releases/$VERSION' \
-        && ln -sfn 'releases/$VERSION' '$ROOT/current.tmp' \
-        && mv -T '$ROOT/current.tmp' '$ROOT/current' \
-        && cp '$ROOT/releases/$VERSION/version.json' '$ROOT/version.json' \
-        && cp '$ROOT/releases/$VERSION/version.json.asc' '$ROOT/version.json.asc' 2>/dev/null || true"
+    ssh "$HOST" "$(printf 'mv %q %q \
+        && ln -sfn %q %q \
+        && mv -T %q %q \
+        && cp %q %q \
+        && cp %q %q 2>/dev/null || true' \
+        "$ROOT/staging/releases/$VERSION" "$ROOT/releases/$VERSION" \
+        "releases/$VERSION" "$ROOT/current.tmp" \
+        "$ROOT/current.tmp" "$ROOT/current" \
+        "$ROOT/releases/$VERSION/version.json" "$ROOT/version.json" \
+        "$ROOT/releases/$VERSION/version.json.asc" "$ROOT/version.json.asc")"
     echo "promote: $VERSION live on $HOST"
 }
 

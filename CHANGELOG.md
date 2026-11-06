@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Security (codebase audit 2026-11-06, spec 130): hardened the update
+  trust chain end to end.
+  - SEC-001 (P0): all `python3 -c` call sites in `update.sh` now pass
+    metadata values via argv/stdin instead of interpolating them into
+    program text; every version token read from remote `version.json`,
+    `config/update-pin`, or the local install is semver-gated
+    (`assert_semver`) and archive/delta names basename-gated
+    (`assert_safe_name`) before use — closes a root code-execution sink
+    on every update client.
+  - SEC-002: a missing `version.json.asc` or unavailable gpg/pubkey is
+    now fatal (same posture as the archive signature gate) unless
+    `VEX_ALLOW_UNSIGNED=1`/`VEX_SKIP_SIG_VERIFY=1` is set; bad signatures
+    remain unconditional `die`.
+  - SEC-003: `.vexbundle` updates no longer execute the bundled
+    `verify-release.sh` — the bundle is untrusted until its payload
+    signature passes; the repo's own `verify-release.sh` (or
+    `verify_signature` fallback) verifies instead.
+  - SEC-010: `LATEST < CURRENT` is refused as a downgrade unless pinned
+    or `--force` — a mirror can no longer replay older signed releases
+    onto clients.
+  - SEC-028: the per-file fallback path requires a signed
+    `MANIFEST.sha256` + `.asc` beside the archive and hash-verifies every
+    file before apply; without a verified manifest only
+    `VEX_ALLOW_UNSIGNED`/`VEX_SKIP_SIG_VERIFY` proceeds.
+  - SEC-037: `publish.sh`/`promote.sh` quote remote ssh arguments with
+    `printf %q`, semver-gate `$VERSION`, and reject `..`/absolute paths
+    in staged manifest filenames.
+  - NC-010: `/downloads/enterprise/` nginx block now uses `^~` so
+    versioned-artifact regex locations can't bypass the token gate.
 - Fix (SEC-008 regression): `--insecure` + `VEX_I_ACCEPT_RISK=1` did not
   actually waive a missing archive/bundle signature — `update.sh` still
   died on the SEC-008 "no signature published" / "bundle carries no
