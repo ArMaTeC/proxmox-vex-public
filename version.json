@@ -1,8 +1,14 @@
 {
-  "version": "1.2.692",
-  "build": "2026.11.06",
-  "release_date": "2026-11-06",
+  "version": "1.2.698",
+  "build": "2026.11.17",
+  "release_date": "2026-11-17",
   "changelog": [
+    {
+      "type": "chore",
+      "component": "release",
+      "breaking": false,
+      "text": "Release 1.2.698 (2026.11.17)"
+    },
     {
       "type": "chore",
       "component": "release",
@@ -290,6 +296,7 @@
     "ProxmoxVEx/core/cache.py",
     "ProxmoxVEx/core/compliance_mapping.py",
     "ProxmoxVEx/core/config.py",
+    "ProxmoxVEx/core/cve_enrich.py",
     "ProxmoxVEx/core/db.py",
     "ProxmoxVEx/core/db_pg.py",
     "ProxmoxVEx/core/dbcrypto.py",
@@ -298,6 +305,7 @@
     "ProxmoxVEx/core/manager.py",
     "ProxmoxVEx/core/pbs.py",
     "ProxmoxVEx/core/plugin_tasks.py",
+    "ProxmoxVEx/core/scan_import.py",
     "ProxmoxVEx/core/v2p.py",
     "ProxmoxVEx/core/vmware.py",
     "ProxmoxVEx/demo/__init__.py",
