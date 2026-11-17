@@ -1,8 +1,14 @@
 {
-  "version": "1.2.704",
+  "version": "1.2.705",
   "build": "2026.11.17",
   "release_date": "2026-11-17",
   "changelog": [
+    {
+      "type": "chore",
+      "component": "release",
+      "breaking": false,
+      "text": "Release 1.2.705 (2026.11.17)"
+    },
     {
       "type": "chore",
       "component": "release",
