@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Tests: new `tests/test_no_introspect.sh` (ID-0134) — FR-012
+  regression guard asserting `deploy/`, `scripts/` and `update.sh`
+  never reference auth's `/v1/internal/introspect`, and that the
+  `/v1/internal/ids/*` feeds remain the only internal surface this
+  site touches. Audit confirmed zero introspect calls today;
+  revocation rides the short access-TTL + optional
+  `/v1/internal/ids/session-denylist` feed (site-integration.md §5).
+
 - Security: `deploy/server.py` blocklist hardening (ID-0182,
   mirrors landing ID-0170) — feed entries are validated as real
   IPs/CIDRs, feeds larger than 50,000 entries are rejected outright

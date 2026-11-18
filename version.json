@@ -4,6 +4,12 @@
   "release_date": "2026-11-17",
   "changelog": [
     {
+      "type": "chore",
+      "component": "tests",
+      "breaking": false,
+      "text": "ID-0134: tests/test_no_introspect.sh — FR-012 regression guard asserting no /v1/internal/introspect references in deploy/, scripts/ or update.sh; /v1/internal/ids/* remains the only internal surface. Revocation model: short access-TTL + optional session-denylist feed (site-integration.md §5)."
+    },
+    {
       "type": "security",
       "component": "deploy",
       "breaking": false,
