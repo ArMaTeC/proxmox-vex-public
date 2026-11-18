@@ -127,6 +127,41 @@ class _IdsQueue:
 _ids = _IdsQueue()
 
 
+# Feed sanity bounds (ID-0182, mirrors proxmoxvex-landing ID-0170): a
+# corrupted or hostile feed must not be able to brick the site. Feeds
+# larger than the cap are rejected wholesale (caller keeps last good —
+# fail-open); entries broader than the prefix floors are treated as
+# corrupt rather than "broad".
+_BLOCKLIST_MAX_ENTRIES = 50_000
+_V4_MIN_PREFIX = 8
+_V6_MIN_PREFIX = 32
+
+
+def _parse_blocklist(raw):
+    """Validate feed entries. Returns (frozenset[ip_address],
+    tuple[ip_network]). Oversized feeds raise ValueError (fail-open:
+    caller keeps last-good); malformed or implausibly broad entries are
+    dropped individually."""
+    entries = [str(e) for e in raw]
+    if len(entries) > _BLOCKLIST_MAX_ENTRIES:
+        raise ValueError(
+            f"blocklist feed too large: {len(entries)} entries")
+    addrs, nets = set(), []
+    for e in entries:
+        try:
+            net = ipaddress.ip_network(e, strict=False)
+        except ValueError:
+            continue
+        if net.prefixlen == net.max_prefixlen:
+            addrs.add(net.network_address)
+        elif (net.version == 4 and net.prefixlen >= _V4_MIN_PREFIX) or \
+                (net.version == 6 and net.prefixlen >= _V6_MIN_PREFIX):
+            nets.append(net)
+        # else: suspiciously broad (e.g. 0.0.0.0/0) — would 403 the
+        # entire site if honoured; drop it.
+    return frozenset(addrs), tuple(nets)
+
+
 class _Blocklist:
     """Polls the central IDS blocklist for early-403 checks."""
 
@@ -134,12 +169,19 @@ class _Blocklist:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._ips = frozenset()
+        self._addrs = frozenset()
+        self._nets = ()
+        self._size = 0
         self._thread = None
 
     def contains(self, ip) -> bool:
+        try:
+            addr = ipaddress.ip_address(str(ip))
+        except ValueError:
+            return False
         with self._lock:
-            return ip in self._ips
+            addrs, nets = self._addrs, self._nets
+        return addr in addrs or any(addr in n for n in nets)
 
     def _loop(self):
         while True:
@@ -150,9 +192,12 @@ class _Blocklist:
                 )
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     data = json.loads(resp.read() or b"{}")
-                ips = data.get("data", {}).get("ips", [])
+                addrs, nets = _parse_blocklist(
+                    data.get("data", {}).get("ips", []))
                 with self._lock:
-                    self._ips = frozenset(str(i) for i in ips)
+                    self._addrs = addrs
+                    self._nets = nets
+                    self._size = len(addrs) + len(nets)
             except Exception:
                 pass  # keep the last good list
             time.sleep(self.INTERVAL)

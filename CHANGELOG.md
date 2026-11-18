@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Security: `deploy/server.py` blocklist hardening (ID-0182,
+  mirrors landing ID-0170) — feed entries are validated as real
+  IPs/CIDRs, feeds larger than 50,000 entries are rejected outright
+  (fail-open keeps the last good list), and any entry broader than
+  IPv4 /8 or IPv6 /32 (e.g. `0.0.0.0/0`) is dropped rather than
+  honoured, so a corrupted or hostile feed can no longer 403 the
+  entire site. CIDR entries are now enforced via containment checks
+  (previously stored as strings and never matched).
+
 - Security (codebase audit 2026-11-06, spec 130): hardened the update
   trust chain end to end.
   - SEC-001 (P0): all `python3 -c` call sites in `update.sh` now pass
