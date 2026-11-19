@@ -55,3 +55,5 @@
 {"version":"1.2.716","artifact":"ProxmoxVEx-latest.tar.gz","sha256":"28ba6b9c5303e86d7988afdab041e28c40031f31ae9d398e6a80661c39980ae8","ts":"2026-11-19T17:10:41Z"}
 {"version":"1.2.716","artifact":"ProxmoxVEx-1.2.716.tar.gz","sha256":"bd878b24dcc3ed4b7fcbfaab1a539d6746ecda0279584a6c495ac856155cb581","ts":"2026-11-19T17:16:08Z"}
 {"version":"1.2.716","artifact":"ProxmoxVEx-latest.tar.gz","sha256":"bd878b24dcc3ed4b7fcbfaab1a539d6746ecda0279584a6c495ac856155cb581","ts":"2026-11-19T17:16:08Z"}
+{"version":"1.2.718","artifact":"ProxmoxVEx-1.2.718.tar.gz","sha256":"2fa51cbb6ec6b2fab53ce95c0cd4b989a681d2c1b6176ca8e6a6dc80725f35e3","ts":"2026-11-19T18:51:29Z"}
+{"version":"1.2.718","artifact":"ProxmoxVEx-latest.tar.gz","sha256":"2fa51cbb6ec6b2fab53ce95c0cd4b989a681d2c1b6176ca8e6a6dc80725f35e3","ts":"2026-11-19T18:51:29Z"}
