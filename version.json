@@ -5,6 +5,12 @@
   "changelog": [
     {
       "type": "security",
+      "component": "update",
+      "breaking": false,
+      "text": "ID-0475: client-side version.json validation hardened \u2014 update.sh now enforces version.schema.json's load-bearing shape (release_date, changelog, semver channels) before any consumer reads the doc"
+    },
+    {
+      "type": "security",
       "component": "update.sh",
       "breaking": false,
       "text": "ID-0176: python3 -c eval surface closed \u2014 all bodies now single-quoted argv/stdin-only (three double-quoted sites normalized); test_no_python_eval.sh bans eval, double-quoted -c, unquoted heredocs."

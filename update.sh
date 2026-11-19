@@ -935,6 +935,11 @@ PY
 # before any consumer parses the doc.
 #
 # validate_version_doc <version.json>
+# ID-0475: mirror version.schema.json's load-bearing rules client-side —
+# the publish gate (release.yml) runs scripts/validate-version.py, and the
+# updater must refuse a doc that violates the fields it consumes BEFORE
+# any gate, comparison, or helper reads them. Kept as an inline check so
+# update.sh stays a single self-contained file.
 validate_version_doc() {
     local doc="$1"
     [ -f "$doc" ] || return 0
@@ -942,12 +947,37 @@ validate_version_doc() {
     size=$(stat -c %s "$doc" 2>/dev/null || stat -f %z "$doc" 2>/dev/null || echo 0)
     [ "${size:-0}" -lt 1048576 ] || die "version.json too large (${size} bytes) — refusing untrusted metadata"
     python3 - "$doc" <<'PY' || die "version.json malformed or missing required keys"
-import json, sys
+import json, re, sys
+SEMVER = re.compile(r"^\d+\.\d+\.\d+")
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 try:
     d = json.load(open(sys.argv[1]))
     assert isinstance(d, dict), "not an object"
+    # schema required keys
     assert isinstance(d.get("version"), str) and d["version"], "version"
+    assert SEMVER.match(d["version"]), "version not semver"
+    assert isinstance(d.get("release_date"), str) and DATE.match(
+        d["release_date"]), "release_date"
+    assert isinstance(d.get("changelog"), list), "changelog"
     assert isinstance(d.get("channels"), dict), "channels"
+    # channel entries the resolver consumes
+    for name, ch in d["channels"].items():
+        assert isinstance(ch, dict), f"channels.{name} not an object"
+        assert isinstance(ch.get("version"), str) and SEMVER.match(
+            ch["version"]), f"channels.{name}.version"
+        if "archive" in ch:
+            assert isinstance(ch["archive"], str), f"channels.{name}.archive"
+    # release-map entries the EOL/min_from gates consume
+    rel = d.get("releases", {})
+    assert isinstance(rel, dict), "releases"
+    for ver, r in rel.items():
+        assert isinstance(r, dict), f"releases.{ver} not an object"
+        if "support_until" in r:
+            assert isinstance(r["support_until"], str) and DATE.match(
+                r["support_until"]), f"releases.{ver}.support_until"
+        if "min_from" in r:
+            assert isinstance(r["min_from"], str) and SEMVER.match(
+                r["min_from"]), f"releases.{ver}.min_from"
 except SystemExit:
     raise
 except Exception as e:

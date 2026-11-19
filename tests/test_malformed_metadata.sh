@@ -66,7 +66,35 @@ out=$(run_update "$D/install" "$D/dist"); rc=$?
 check "oversized aborts"              "test $rc -ne 0"
 check "size named"                    "echo \"\$out\" | grep -qi 'too large\|size'"
 
-# case 5: valid doc still works (control)
+# case 5: ID-0475 — doc structurally parseable but violating schema shape
+# rules the updater consumes (non-semver channel version, missing
+# release_date) must be refused the same as outright malformed JSON.
+F="$SCRATCH/F"; build_install "$F"
+cat > "$F/dist/version.json" <<JSON
+{"version":"2.0.0","release_date":"2026-01-01","changelog":[],
+ "channels":{"stable":{"version":"latest","archive":"a.tgz"}}}
+JSON
+out=$(run_update "$F/install" "$F/dist"); rc=$?
+check "non-semver channel refused"     "test $rc -ne 0"
+check "channel shape named"            "echo \"\$out\" | grep -qi 'malformed\|invalid\|required keys'"
+
+G="$SCRATCH/G"; build_install "$G"
+cat > "$G/dist/version.json" <<JSON
+{"version":"2.0.0","changelog":[],
+ "channels":{"stable":{"version":"2.0.0","archive":"a.tgz"}}}
+JSON
+out=$(run_update "$G/install" "$G/dist"); rc=$?
+check "missing release_date refused"   "test $rc -ne 0"
+
+H="$SCRATCH/H"; build_install "$H"
+cat > "$H/dist/version.json" <<JSON
+{"version":"2.0.0","release_date":"2026-01-01","changelog":[],
+ "channels":{"stable":"2.0.0"}}
+JSON
+out=$(run_update "$H/install" "$H/dist"); rc=$?
+check "non-object channel refused"     "test $rc -ne 0"
+
+# case 6: valid doc still works (control)
 E="$SCRATCH/E"; build_install "$E"
 mkdir -p "$E/pkg/install"; echo 'v2' > "$E/pkg/install/app.txt"
 tar -czf "$E/dist/ProxmoxVEx-2.0.0.tar.gz" -C "$E/pkg" install
