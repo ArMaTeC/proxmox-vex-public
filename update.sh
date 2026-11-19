@@ -777,7 +777,7 @@ check_python_compat() {
     local doc="$1" pyv="${2:-}"
     [ -f "$doc" ] || return 0
     if [ -z "$pyv" ]; then
-        pyv=$(python3 -c "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo 0.0)
+        pyv=$(python3 -c 'import sys;print("{}.{}".format(*sys.version_info[:2]))' 2>/dev/null || echo 0.0)
     fi
     python3 - "$doc" "$pyv" <<'PY'
 import json, sys
@@ -2117,28 +2117,28 @@ else
     # it (e.g. a freshly-added sponsor logo). update_files is now only the
     # degraded-degraded path when the Trees API itself is unreachable.
     echo "Fetching file list (full tree)..."
-    PACKAGE_FILES=$(curl -s "https://api.github.com/repos/ArMaTeC/proxmox-vex-public/git/trees/${GITHUB_BRANCH}?recursive=1" 2>/dev/null | python3 -c "
+    PACKAGE_FILES=$(curl -s "https://api.github.com/repos/ArMaTeC/proxmox-vex-public/git/trees/${GITHUB_BRANCH}?recursive=1" 2>/dev/null | python3 -c '
 import sys, json
 try:
     data = json.load(sys.stdin)
-    for it in data.get('tree', []):
-        if it.get('type') == 'blob':
-            print(it['path'])
-except:
+    for it in data.get("tree", []):
+        if it.get("type") == "blob":
+            print(it["path"])
+except Exception:
     pass
-" 2>/dev/null)
+' 2>/dev/null)
 
     if [ -z "$PACKAGE_FILES" ]; then
         # Trees API unreachable → fall back to version.json's update_files list
-        PACKAGE_FILES=$(curl -s "$GITHUB_RAW/version.json" 2>/dev/null | python3 -c "
+        PACKAGE_FILES=$(curl -s "$GITHUB_RAW/version.json" 2>/dev/null | python3 -c '
 import sys, json
 try:
     data = json.load(sys.stdin)
-    for f in data.get('update_files', []):
+    for f in data.get("update_files", []):
         print(f)
-except:
+except Exception:
     pass
-" 2>/dev/null)
+' 2>/dev/null)
     fi
 
     # Track fallback-download failures so a partial/mixed update aborts and

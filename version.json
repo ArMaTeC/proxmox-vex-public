@@ -7,6 +7,12 @@
       "type": "security",
       "component": "update.sh",
       "breaking": false,
+      "text": "ID-0176: python3 -c eval surface closed \u2014 all bodies now single-quoted argv/stdin-only (three double-quoted sites normalized); test_no_python_eval.sh bans eval, double-quoted -c, unquoted heredocs."
+    },
+    {
+      "type": "security",
+      "component": "update.sh",
+      "breaking": false,
       "text": "ID-0177: apply path auto-verifies MANIFEST.sha256 \u2014 atomic stages verify pre-swap (drift removes stage), classic verifies post-copy (drift restores backup); verify_installed_files now honors sha256sum -c exit code (malformed manifests no longer false-pass)."
     },
     {
