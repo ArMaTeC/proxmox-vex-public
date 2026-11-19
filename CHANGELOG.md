@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Signature-chain negative corpus completed (roadmap ID-0661): `test_forgery_rejection.sh` case D now proves a mirror serving validly-signed metadata but **withholding** the tarball `.asc` is refused (SEC-008 fail-closed), with the install untouched — alongside the existing forged-metadata, forged-archive-sig, and real-sig control cases.
+
 - Tests: new `tests/test_no_introspect.sh` (ID-0134) — FR-012
   regression guard asserting `deploy/`, `scripts/` and `update.sh`
   never reference auth's `/v1/internal/introspect`, and that the

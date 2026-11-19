@@ -82,6 +82,16 @@ env -u GNUPGHOME gpg --batch --quiet --armor --detach-sign \
 out=$(run_update "$C/install" "$C/dist"); rc=$?
 check "control: real sig accepted"    "test $rc -eq 0"
 
+# --- D: missing archive signature — SEC-008 fail-closed --------------------
+# A mirror compromise that serves validly-signed metadata but withholds the
+# tarball's .asc must be refused, not treated as "nothing to verify".
+D="$SCRATCH/D"; build_fixture "$D"
+env -u GNUPGHOME bash scripts/sign-version.sh "$D/dist/version.json" >/dev/null 2>&1
+out=$(run_update "$D/install" "$D/dist"); rc=$?
+check "missing .asc rejected"         "test $rc -ne 0"
+check "missing sig named"             "echo \"$out\" | grep -qi 'signature\|unsigned'"
+check "install untouched (D)"         "readlink $D/install/current | grep -q 'releases/1.0.0$'"
+
 echo ""
 echo "result: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
