@@ -4,6 +4,12 @@
   "release_date": "2026-11-17",
   "changelog": [
     {
+      "type": "security",
+      "component": "deploy/server.py",
+      "breaking": false,
+      "text": "ID-0181: docroot confinement hardened \u2014 is_relative_to replaces startswith prefix check, index.html symlinks re-resolved, misses no longer delegate to cwd-relative SimpleHTTPRequestHandler.send_head; test_traversal.sh pins 16 cases."
+    },
+    {
       "type": "test",
       "component": "tests",
       "breaking": false,

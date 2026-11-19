@@ -328,19 +328,29 @@ class PublicHandler(SimpleHTTPRequestHandler):
             return self._not_found()
         words = [w for w in raw_words if not w.startswith("..")]
         target = (ROOT / Path(*words)).resolve() if words else ROOT
-        if not str(target).startswith(str(ROOT)):
-            target = ROOT
+        # resolve() collapses .. and follows symlinks; is_relative_to is a
+        # real containment check — startswith() would let a sibling whose
+        # name shares the prefix (ROOT=/x/root, /x/rootevil/) escape
+        # through a symlink inside the docroot (ID-0181).
+        if not target.is_relative_to(ROOT):
+            self._ids_report(404)
+            return self._not_found()
         if target.is_dir():
             index = target / "index.html"
-            if index.exists():
-                target = index
+            if index.exists() and index.resolve().is_relative_to(ROOT):
+                target = index.resolve()
             else:
-                # No directory listing — index-less dirs 404 (SEC-036).
+                # No directory listing — index-less dirs 404 (SEC-036);
+                # an index that symlinks outside the docroot is denied too.
                 self._ids_report(404)
                 return self._not_found()
-        if not target.exists():
+        if not target.exists() or not target.is_file():
             self._ids_report(404)
-            return super().send_head()
+            # Never delegate misses to SimpleHTTPRequestHandler.send_head:
+            # it re-resolves self.path against self.directory (cwd), a
+            # second resolution path that escapes ROOT the moment cwd and
+            # ROOT diverge (ID-0181).
+            return self._not_found()
         self._ids_report(200)
         ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
         data = target.read_bytes()

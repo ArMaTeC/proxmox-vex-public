@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Static-serving confinement hardened (roadmap ID-0181): `deploy/server.py` now rejects resolved targets outside the docroot with `is_relative_to` (the old `startswith` let a sibling sharing the prefix escape through an in-tree symlink), re-resolves `index.html` so a symlinked index can't leak outside, and no longer delegates misses to `SimpleHTTPRequestHandler.send_head` — its cwd-relative resolution was a second path that would escape ROOT the moment cwd and the docroot diverged. New `tests/test_traversal.sh` drives 16 confinement cases (encoded, absolute, dot-files, .py, symlink escapes) live against a scratch docroot.
+
 - Signature-chain negative corpus completed (roadmap ID-0661): `test_forgery_rejection.sh` case D now proves a mirror serving validly-signed metadata but **withholding** the tarball `.asc` is refused (SEC-008 fail-closed), with the install untouched — alongside the existing forged-metadata, forged-archive-sig, and real-sig control cases.
 
 - Tests: new `tests/test_no_introspect.sh` (ID-0134) — FR-012
