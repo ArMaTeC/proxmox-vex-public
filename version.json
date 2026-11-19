@@ -1,8 +1,14 @@
 {
-  "version": "1.2.705",
-  "build": "2026.11.17",
-  "release_date": "2026-11-17",
+  "version": "1.2.715",
+  "build": "2026.11.19",
+  "release_date": "2026-11-19",
   "changelog": [
+    {
+      "type": "chore",
+      "component": "release",
+      "breaking": false,
+      "text": "Release 1.2.715 (2026.11.19)"
+    },
     {
       "type": "security",
       "component": "update",
@@ -413,6 +419,7 @@
     "ProxmoxVEx/ids/reports.py",
     "ProxmoxVEx/ids/rules.py",
     "ProxmoxVEx/ids/ruleset.json",
+    "ProxmoxVEx/ids/ruleset.sha256",
     "ProxmoxVEx/ids/scheduler.py",
     "ProxmoxVEx/integrations/__init__.py",
     "ProxmoxVEx/integrations/active_directory.py",
@@ -799,6 +806,7 @@
     "ProxmoxVEx/utils/qemu_guest_agent.py",
     "ProxmoxVEx/utils/rbac.py",
     "ProxmoxVEx/utils/realtime.py",
+    "ProxmoxVEx/utils/safe_tar.py",
     "ProxmoxVEx/utils/sanitization.py",
     "ProxmoxVEx/utils/scopes.py",
     "ProxmoxVEx/utils/server_control.py",
@@ -929,6 +937,7 @@
     "docs/product/README.md",
     "docs/product/deprecation-policy.md",
     "docs/product/icp.md",
+    "docs/product/licence-lifecycle.md",
     "docs/product/personas.md",
     "docs/security/mutual-tls.md",
     "docs/security/threat-model.md",
@@ -1210,6 +1219,8 @@
     "systemd/proxmoxVEx-ha-rollback.service",
     "systemd/proxmoxVEx-ha-upgrade.path",
     "systemd/proxmoxVEx-ha-upgrade.service",
+    "systemd/proxmoxvex-restore-drill.service",
+    "systemd/proxmoxvex-restore-drill.timer",
     "tests/e2e/test_storage_health.py",
     "todo_work.md",
     "update.sh",
