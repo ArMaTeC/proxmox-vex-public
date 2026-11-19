@@ -1,8 +1,14 @@
 {
-  "version": "1.2.719",
+  "version": "1.2.720",
   "build": "2026.11.19",
   "release_date": "2026-11-19",
   "changelog": [
+    {
+      "type": "chore",
+      "component": "release",
+      "breaking": false,
+      "text": "Release 1.2.720 (2026.11.19)"
+    },
     {
       "type": "chore",
       "component": "release",
@@ -289,7 +295,7 @@
   "min_python": "3.14",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
   "docs_url": "https://proxmoxvex.com/docs",
-  "update_archive": "https://proxmoxvex.com/downloads/ProxmoxVEx-1.2.719.tar.gz",
+  "update_archive": "https://proxmoxvex.com/downloads/ProxmoxVEx-1.2.720.tar.gz",
   "update_files": [
     "Dockerfile",
     "LICENSE",
@@ -1744,5 +1750,5 @@
     "x86_64",
     "aarch64"
   ],
-  "docker_image": "ghcr.io/armatec/proxmox-vex-public:1.2.719"
+  "docker_image": "ghcr.io/armatec/proxmox-vex-public:1.2.720"
 }
