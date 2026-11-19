@@ -1,0 +1,14 @@
+# ID-0199/0691 baseline — pre-existing findings triaged as test
+# fixtures or false positives (see docs/secrets-matrix.md).
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:ProxmoxVEx/native/opnsense/config.json:generic-api-key:6
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:ProxmoxVEx/native/opnsense/config.json:generic-api-key:7
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:ProxmoxVEx/native/proxmox_backup_server/config.json:generic-api-key:7
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:ProxmoxVEx/native/proxmox_backup_server/config.json:generic-api-key:9
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:ProxmoxVEx/native/vmware_vcenter/config.json:generic-api-key:8
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:plugins/status_page/config.json:generic-api-key:2
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:static/js/xterm.min.js:generic-api-key:18
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:web/app.bundle.js.map:private-key:1
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:web/app.bundle.js:private-key:1839
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:web/app.bundle.js:private-key:2148
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:web/src/create_modals.js:private-key:2249
+b5e182e487fe0cd3ef9fe591e0ac8fdc5b042dc3:web/src/node_modals.js:private-key:557
