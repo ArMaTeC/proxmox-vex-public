@@ -995,11 +995,14 @@ verify_installed_files() {
     local dir="${1:-${SCRIPT_DIR:-.}}"
     local manifest="$dir/MANIFEST.sha256"
     [ -f "$manifest" ] || die "no MANIFEST.sha256 in $dir — release predates manifests"
-    local bad
-    bad=$(cd "$dir" && sha256sum -c MANIFEST.sha256 2>/dev/null | grep -v ': OK$' || true)
-    if [ -n "$bad" ]; then
-        echo "DRIFTED FILES:"
-        echo "$bad"
+    # rc is the real verdict: a manifest whose lines don't parse prints
+    # nothing to stdout and would otherwise look clean (ID-0177).
+    local out rc
+    out=$(cd "$dir" && sha256sum -c MANIFEST.sha256 2>&1)
+    rc=$?
+    if [ "$rc" != "0" ]; then
+        echo "DRIFTED/UNVERIFIABLE FILES:"
+        echo "$out" | grep -v ': OK$' || true
         return 1
     fi
     echo "all files verified against MANIFEST.sha256"
@@ -1202,6 +1205,18 @@ atomic_update() {
     echo -n "Staging release $version... "
     atomic_stage "$archive" "$version" || die "failed to stage $version"
     echo -e "${GREEN}OK${NC}"
+    # ID-0177: manifest verify is mandatory on the apply path, not just
+    # the opt-in --verify-files — every staged file must hash-match the
+    # release's signed manifest before the swap. On drift the stage is
+    # deleted; nothing has been activated, so that IS the rollback.
+    if [ -f "$BASE_DIR/releases/$version/MANIFEST.sha256" ]; then
+        if ! verify_installed_files "$BASE_DIR/releases/$version"; then
+            log_update "stage: manifest verify FAILED for $version — stage removed, swap aborted"
+            rm -rf "$BASE_DIR/releases/$version"
+            die "staged release fails manifest verification — swap aborted"
+        fi
+        log_update "stage: manifest verify ok ($version)"
+    fi
     wire_shared_state "$BASE_DIR/releases/$version"
     # spec 093/US088: fault-injection hook — pause between staging and the
     # swap so tests can SIGKILL at exactly the staged-not-swapped point.
@@ -2340,6 +2355,20 @@ elif [ -n "$ARCHIVE" ] && [ -f "$ARCHIVE" ]; then
         echo "Restoring from backup..."
         cp "$BACKUP_DIR/ProxmoxVEx_multi_cluster.py" . 2>/dev/null || true
         die "archive missing ProxmoxVEx_multi_cluster.py — backup restored"
+    fi
+
+    # ID-0177: post-apply manifest verify is mandatory, not just the
+    # opt-in --verify-files — every installed file must hash-match the
+    # release's manifest. Drift means a partial/tampered install; roll
+    # back the backed-up files and fail loudly.
+    if [ -f "$SCRIPT_DIR/MANIFEST.sha256" ]; then
+        if ! verify_installed_files "$SCRIPT_DIR"; then
+            log_update "apply: post-install manifest verify FAILED ($LATEST_VERSION) — backup restored"
+            echo -e "${RED}Post-install manifest verification FAILED — restoring backup${NC}"
+            cp -r "$BACKUP_DIR/." "$SCRIPT_DIR/" 2>/dev/null || true
+            die "applied tree fails manifest verification — backup restored"
+        fi
+        log_update "apply: post-install manifest verify ok ($LATEST_VERSION)"
     fi
 
     rm -rf "$TMPDIR"

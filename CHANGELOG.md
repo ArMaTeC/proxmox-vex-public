@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Apply-path manifest verification is mandatory (roadmap ID-0177): `--verify-files` used to be the only drift check — opt-in only. The atomic path now verifies the staged tree against the embedded `MANIFEST.sha256` **before** the swap (drift deletes the stage — nothing was activated, so that is the rollback), and the classic path verifies the installed tree post-copy and restores the file backup on mismatch. Also fixed: `verify_installed_files` ignored `sha256sum -c`'s exit code, so a malformed manifest produced zero `: OK` lines and passed silently — rc is now the verdict. New `tests/test_apply_manifest_verify.sh` proves tampered members fail pre-swap, legacy manifest-less archives still apply, and matching manifests swap cleanly.
+
 - Static-serving confinement hardened (roadmap ID-0181): `deploy/server.py` now rejects resolved targets outside the docroot with `is_relative_to` (the old `startswith` let a sibling sharing the prefix escape through an in-tree symlink), re-resolves `index.html` so a symlinked index can't leak outside, and no longer delegates misses to `SimpleHTTPRequestHandler.send_head` — its cwd-relative resolution was a second path that would escape ROOT the moment cwd and the docroot diverged. New `tests/test_traversal.sh` drives 16 confinement cases (encoded, absolute, dot-files, .py, symlink escapes) live against a scratch docroot.
 
 - Signature-chain negative corpus completed (roadmap ID-0661): `test_forgery_rejection.sh` case D now proves a mirror serving validly-signed metadata but **withholding** the tarball `.asc` is refused (SEC-008 fail-closed), with the install untouched — alongside the existing forged-metadata, forged-archive-sig, and real-sig control cases.
