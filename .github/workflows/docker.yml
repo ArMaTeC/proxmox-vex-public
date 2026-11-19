@@ -31,10 +31,15 @@ jobs:
           mkdir -p /tmp/vex-build
           tar -xzf "dist/ProxmoxVEx-${{ steps.ver.outputs.version }}.tar.gz" -C /tmp/vex-build
           if [ -f "/tmp/vex-build/ProxmoxVEx-${{ steps.ver.outputs.version }}/Dockerfile" ]; then
-            echo "BUILD_CTX=/tmp/vex-build/ProxmoxVEx-${{ steps.ver.outputs.version }}" >> "$GITHUB_ENV"
+            CTX="/tmp/vex-build/ProxmoxVEx-${{ steps.ver.outputs.version }}"
           else
-            echo "BUILD_CTX=/tmp/vex-build" >> "$GITHUB_ENV"
+            CTX="/tmp/vex-build"
           fi
+          # Ensure optional Dockerfile COPY directories/scripts exist (paid plugins
+          # are already stripped from the public release tarball).
+          mkdir -p "$CTX/qemu_iso" "$CTX/fixtures" "$CTX/scripts" "$CTX/static" "$CTX/images" "$CTX/plugins"
+          [ -f "$CTX/scripts/filter_free_plugins_for_image.py" ] || printf '#!/usr/bin/env python3\npass\n' > "$CTX/scripts/filter_free_plugins_for_image.py"
+          echo "BUILD_CTX=$CTX" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
