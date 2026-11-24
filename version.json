@@ -1,8 +1,14 @@
 {
-  "version": "1.2.727",
-  "build": "2026.11.23",
-  "release_date": "2026-11-23",
+  "version": "1.2.731",
+  "build": "2026.11.24",
+  "release_date": "2026-11-24",
   "changelog": [
+    {
+      "type": "chore",
+      "component": "release",
+      "breaking": false,
+      "text": "Release 1.2.731 (2026.11.24)"
+    },
     {
       "type": "chore",
       "component": "release",
@@ -319,7 +325,7 @@
   "min_python": "3.14",
   "download_url": "https://github.com/ArMaTeC/proxmox-vex-public",
   "docs_url": "https://proxmoxvex.com/docs",
-  "update_archive": "https://proxmoxvex.com/downloads/ProxmoxVEx-1.2.727.tar.gz",
+  "update_archive": "https://proxmoxvex.com/downloads/ProxmoxVEx-1.2.731.tar.gz",
   "update_files": [
     "Dockerfile",
     "LICENSE",
@@ -450,6 +456,7 @@
     "ProxmoxVEx/demo/cluster_mock.py",
     "ProxmoxVEx/demo/guard.py",
     "ProxmoxVEx/demo/integration_mocks.py",
+    "ProxmoxVEx/demo/resetter.py",
     "ProxmoxVEx/demo/seed.py",
     "ProxmoxVEx/demo/token.py",
     "ProxmoxVEx/globals.py",
@@ -850,6 +857,7 @@
     "ProxmoxVEx/utils/json_logging.py",
     "ProxmoxVEx/utils/ldap.py",
     "ProxmoxVEx/utils/log_handler.py",
+    "ProxmoxVEx/utils/mfa_gate.py",
     "ProxmoxVEx/utils/oidc.py",
     "ProxmoxVEx/utils/path_security.py",
     "ProxmoxVEx/utils/qemu_guest_agent.py",
@@ -1018,6 +1026,7 @@
     "plugins/.gitkeep",
     "plugins/client_portal/__init__.py",
     "plugins/client_portal/config.json",
+    "plugins/client_portal/config.json.predemo",
     "plugins/client_portal/i18n/de.json",
     "plugins/client_portal/i18n/en.json",
     "plugins/client_portal/i18n/es.json",
@@ -1081,6 +1090,7 @@
     "plugins/maintenance-windows/i18n/es.json",
     "plugins/maintenance-windows/i18n/fr.json",
     "plugins/maintenance-windows/manifest.json",
+    "plugins/maintenance-windows/state.json",
     "plugins/maintenance-windows/ui.css",
     "plugins/maintenance-windows/ui.html",
     "plugins/maintenance-windows/ui.js",
@@ -1244,6 +1254,7 @@
     "static/js/novnc/vendor/pako/lib/zlib/trees.js",
     "static/js/novnc/vendor/pako/lib/zlib/zstream.js",
     "static/js/plugin-config.js",
+    "static/js/plugin-demo.js",
     "static/js/plugin-events.js",
     "static/js/plugin-theme.js",
     "static/js/plugin-ux.js",
@@ -1775,5 +1786,5 @@
     "x86_64",
     "aarch64"
   ],
-  "docker_image": "ghcr.io/armatec/proxmox-vex-public:1.2.727"
+  "docker_image": "ghcr.io/armatec/proxmox-vex-public:1.2.731"
 }
